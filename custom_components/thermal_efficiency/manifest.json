@@ -1,0 +1,11 @@
+{
+  "domain": "thermal_efficiency",
+  "name": "Thermal Efficiency",
+  "codeowners": [],
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/igor/climate-pro-x",
+  "integration_type": "hub",
+  "iot_class": "calculated",
+  "requirements": [],
+  "version": "0.1.0"
+}

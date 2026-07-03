@@ -1,0 +1,29 @@
+# Map your HA entities here. `discover` generates a draft of this file.
+
+# Worcester Bosch rated output in kW (model plate / manual). Used to convert
+# Tado heating-power % into an absolute heat input. If you later add a real
+# gas meter entity, set `gas_kwh_entity` instead and this is ignored.
+boiler_output_kw: 28
+
+# Optional: cumulative or daily gas energy sensor (kWh), e.g. from a smart
+# meter integration. Leave null to estimate input from Tado heating power.
+gas_kwh_entity: null
+
+outdoor_entity: sensor.outdoor_temperature
+loft_entity: sensor.loft_temperature
+weather_entity: weather.home   # used later for wind/solar corrections
+
+# Night window used for cooling-curve fits (heating normally off/setback).
+night_start: "23:30"
+night_end: "06:30"
+
+rooms:
+  living_room:
+    temperature: sensor.living_room_temperature
+    # Tado exposes per-zone heating power as sensor.<zone>_heating (0-100 %).
+    # Optional but recommended: lets us verify heating was truly off during
+    # cooling windows and drives the HLC heat-input estimate.
+    heating_power: sensor.living_room_heating
+  bedroom:
+    temperature: sensor.bedroom_temperature
+    heating_power: sensor.bedroom_heating

@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import numpy, pandas, scipy, requests\")",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(rm -rf .venv)",
+      "Bash(uv --version)",
+      "Bash(pip3 install *)",
+      "Bash(python3 -c \"import numpy, pandas, scipy, requests, yaml; print\\('ok'\\)\")",
+      "Bash(curl -LsSf https://astral.sh/uv/install.sh)",
+      "Bash(sh)",
+      "Bash(~/.local/bin/uv --version)",
+      "Bash(~/.local/bin/uv venv *)",
+      "Bash(~/.local/bin/uv pip *)",
+      "Bash(.venv/bin/python -c \"import numpy, pandas, scipy, requests, yaml; print\\('ok'\\)\")"
+    ]
+  }
+}
