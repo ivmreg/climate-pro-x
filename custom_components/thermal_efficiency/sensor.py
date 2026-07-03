@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
@@ -18,18 +18,16 @@ HLC_BANDS = (
 )
 
 
-async def async_setup_platform(
+async def async_setup_entry(
     hass: HomeAssistant,
-    config: ConfigType,
+    entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
-    discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    conf = hass.data[DOMAIN]
-    coordinator = ThermalCoordinator(hass, conf)
-    await coordinator.async_refresh()
-
+    coordinator: ThermalCoordinator = entry.runtime_data
     entities: list[SensorEntity] = [HlcSensor(coordinator), LoftSensor(coordinator)]
-    entities += [RoomTauSensor(coordinator, room) for room in conf["rooms"]]
+    entities += [
+        RoomTauSensor(coordinator, room) for room in coordinator.conf["rooms"]
+    ]
     async_add_entities(entities)
 
 
@@ -71,6 +69,11 @@ class HlcSensor(ThermalSensor):
             "days_used": fit["days_used"],
             "window_days": fit["window_days"],
             "free_gains_kwh_per_day": round(fit["free_gains_kwh_per_day"], 1),
+            "hlc_w_per_k_per_m2": (
+                round(fit["hlc_w_per_k_per_m2"], 2)
+                if "hlc_w_per_k_per_m2" in fit
+                else None
+            ),
             "dhw_baseline_kwh_per_day": (
                 round(fit["dhw_baseline_kwh_per_day"], 1)
                 if fit["dhw_baseline_kwh_per_day"] is not None
@@ -113,6 +116,9 @@ class LoftSensor(ThermalSensor):
             "verdict": verdict,
             "hours_used": fit["hours_used"],
             "window_days": fit["window_days"],
+            "humidity_pct": (
+                round(fit["humidity_pct"], 1) if "humidity_pct" in fit else None
+            ),
         }
 
 

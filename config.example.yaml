@@ -13,6 +13,12 @@ outdoor_entity: sensor.outdoor_temperature
 loft_entity: sensor.loft_temperature
 weather_entity: weather.home   # used later for wind/solar corrections
 
+# The HA integration (custom_components/thermal_efficiency) additionally
+# supports loft_since (ignore a relocated loft sensor's pre-move history),
+# loft_humidity (informational attribute), and floor_area_m2 (normalises HLC
+# to W/K/m2). See README's "Home Assistant integration" section — this
+# offline toolkit's config.yaml doesn't read those keys.
+
 # Night window used for cooling-curve fits (heating normally off/setback).
 night_start: "23:30"
 night_end: "06:30"

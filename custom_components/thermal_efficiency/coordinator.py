@@ -11,9 +11,12 @@ from homeassistant.util import dt as dt_util
 
 from . import thermal_math
 from .const import (
+    CONF_FLOOR_AREA,
     CONF_GAS_METER,
     CONF_HEATING_POWER,
     CONF_LOFT,
+    CONF_LOFT_HUMIDITY,
+    CONF_LOFT_SINCE,
     CONF_MAX_WINDOW_DAYS,
     CONF_OUTDOOR,
     CONF_ROOMS,
@@ -42,6 +45,8 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             ids.add(self.conf[CONF_GAS_METER])
         if self.conf.get(CONF_LOFT):
             ids.add(self.conf[CONF_LOFT])
+        if self.conf.get(CONF_LOFT_HUMIDITY):
+            ids.add(self.conf[CONF_LOFT_HUMIDITY])
         for room in self.conf[CONF_ROOMS].values():
             ids.add(room[CONF_TEMPERATURE])
             if room.get(CONF_HEATING_POWER):
@@ -69,6 +74,13 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
                 "outdoor": self.conf[CONF_OUTDOOR],
                 "gas_meter": self.conf.get(CONF_GAS_METER),
                 "loft": self.conf.get(CONF_LOFT),
+                "loft_since": (
+                    dt_util.parse_date(self.conf[CONF_LOFT_SINCE])
+                    if self.conf.get(CONF_LOFT_SINCE)
+                    else None
+                ),
+                "loft_humidity": self.conf.get(CONF_LOFT_HUMIDITY),
+                "floor_area_m2": self.conf.get(CONF_FLOOR_AREA),
             },
             dt_util.get_default_time_zone(),
             now,

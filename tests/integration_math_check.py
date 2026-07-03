@@ -113,6 +113,50 @@ assert result_on["rooms"]["room"] is None or \
     result_on["rooms"]["room"]["nights_fitted"] == 0
 print("heating filter ok: no nights fitted when heating runs overnight")
 
+# floor_area_m2: HLC normalised to W/K/m2
+conf_area = conf | {"floor_area_m2": 105.0}
+result_area = tm.compute_all(stats, conf_area, TZ, now, (60,))
+hlc_area = result_area["hlc"]
+assert "hlc_w_per_k_per_m2" in hlc_area
+assert abs(hlc_area["hlc_w_per_k_per_m2"] - hlc_area["hlc_w_per_k"] / 105.0) < 1e-9
+print(f"floor_area_m2 ok: {hlc_area['hlc_w_per_k_per_m2']:.2f} W/K/m2")
+
+# loft_since: a relocated sensor's pre-move history sat somewhere warm indoors
+# (fluctuating, not flat, so drop_flatlines can't catch it) before it started
+# tracking the loft. Move it near the end of the window - mirrors the real
+# case, where most of the analysis window predates a recent relocation, so
+# the contaminated data is the majority and would otherwise dominate the
+# median. Cutting it off at the move date should recover ~R_TRUE; without the
+# cutoff the contaminated data should skew it noticeably.
+move_date = idx[int(len(idx) * 0.9)].astimezone(TZ).date()
+moved = np.array([ts.astimezone(TZ).date() >= move_date for ts in idx])
+contaminated_indoor = room + 12.0 + rng.normal(0, 0.3, len(idx))
+loft_true = outdoor + R_TRUE * (room - outdoor)
+loft_relocated = pd.Series(
+    np.where(moved, loft_true.values, contaminated_indoor.values), index=idx
+)
+stats_relocated = stats | {"sensor.loft": to_stats_rows(loft_relocated, "mean")}
+
+result_no_cutoff = tm.compute_all(stats_relocated, conf, TZ, now, (60,))
+assert abs(result_no_cutoff["loft"]["ratio"] - R_TRUE) > 0.3, \
+    "expected contaminated pre-move data to skew the ratio"
+
+conf_since = conf | {"loft_since": move_date}
+result_cutoff = tm.compute_all(stats_relocated, conf_since, TZ, now, (60,))
+assert abs(result_cutoff["loft"]["ratio"] - R_TRUE) < 0.05, result_cutoff["loft"]
+print(f"loft_since ok: uncut ratio {result_no_cutoff['loft']['ratio']:.2f} "
+      f"(true {R_TRUE}) -> cut ratio {result_cutoff['loft']['ratio']:.2f}")
+
+# loft_humidity: informational attribute alongside the ratio
+humidity = pd.Series(55 + 5 * np.sin(2 * np.pi * hours / 24), index=idx)
+conf_hum = conf_since | {"loft_humidity": "sensor.loft_humidity"}
+stats_hum = stats_relocated | {
+    "sensor.loft_humidity": to_stats_rows(humidity, "mean")
+}
+result_hum = tm.compute_all(stats_hum, conf_hum, TZ, now, (60,))
+assert result_hum["loft"] and "humidity_pct" in result_hum["loft"]
+print(f"loft_humidity ok: {result_hum['loft']['humidity_pct']:.1f}%")
+
 # ---------- 2. real cached winter data ----------
 import os
 os.chdir(ROOT)

@@ -1,0 +1,66 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Thermal Efficiency – home settings",
+        "description": "Whole-home sensors. You'll add rooms next, one at a time.",
+        "data": {
+          "outdoor": "Outdoor temperature sensor",
+          "gas_meter": "Gas meter, cumulative kWh (optional)",
+          "loft": "Loft temperature sensor (optional)",
+          "loft_since": "Ignore loft sensor readings before this date (optional)",
+          "loft_humidity": "Loft humidity sensor (optional)",
+          "floor_area_m2": "Floor area in m² (optional – normalises the heat loss coefficient)",
+          "max_window_days": "Maximum lookback window, in days"
+        }
+      },
+      "room": {
+        "title": "Add a room",
+        "description": "Rooms so far: {rooms_so_far}",
+        "data": {
+          "name": "Room name",
+          "temperature": "Temperature sensor",
+          "heating_power": "Heating power sensor (optional)",
+          "add_another": "Add another room"
+        }
+      }
+    },
+    "error": {
+      "invalid_name": "Enter a room name",
+      "duplicate_room": "A room with this name was already added"
+    },
+    "abort": {
+      "single_instance_allowed": "Only one Thermal Efficiency instance is allowed"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Thermal Efficiency – home settings",
+        "data": {
+          "outdoor": "Outdoor temperature sensor",
+          "gas_meter": "Gas meter, cumulative kWh (optional)",
+          "loft": "Loft temperature sensor (optional)",
+          "loft_since": "Ignore loft sensor readings before this date (optional)",
+          "loft_humidity": "Loft humidity sensor (optional)",
+          "floor_area_m2": "Floor area in m² (optional – normalises the heat loss coefficient)",
+          "max_window_days": "Maximum lookback window, in days"
+        }
+      },
+      "room": {
+        "title": "Rooms",
+        "description": "Existing rooms are replayed first so you can review or fix them; you'll be offered the chance to add a new one once they're all through.",
+        "data": {
+          "name": "Room name",
+          "temperature": "Temperature sensor",
+          "heating_power": "Heating power sensor (optional)",
+          "add_another": "Add another room"
+        }
+      }
+    },
+    "error": {
+      "invalid_name": "Enter a room name",
+      "duplicate_room": "A room with this name was already added"
+    }
+  }
+}

@@ -230,6 +230,9 @@ def compute_all(
     fit = fit_hlc(q_by_day, dt_by_day, since_full)
     if fit:
         result["hlc"] = fit | {"window_days": windows_days[-1]}
+        floor_area = conf.get("floor_area_m2")
+        if floor_area:
+            result["hlc"]["hlc_w_per_k_per_m2"] = fit["hlc_w_per_k"] / floor_area
         for window in windows_days[:-1]:
             since = (now - timedelta(days=window)).astimezone(tz).date()
             recent = fit_hlc(q_by_day, dt_by_day, since)
@@ -256,12 +259,28 @@ def compute_all(
                 break
 
     # Loft ratio needs cold nights, so use the full window; drop_flatlines
-    # keeps a dead sensor's frozen value from poisoning the median.
+    # keeps a dead sensor's frozen value from poisoning the median. loft_since
+    # additionally guards against a sensor that was relocated into the loft -
+    # its history from before the move belongs to wherever it used to live,
+    # not the loft, and won't necessarily flatline so drop_flatlines alone
+    # can't catch it.
     result["loft"] = None
     if conf.get("loft"):
         loft = drop_flatlines(series_from_stats(stats.get(conf["loft"], []), "mean"))
-        ratio = loft_ratio(all_rooms, loft, outdoor, tz, since_full)
+        loft_since = conf.get("loft_since")
+        loft_cutoff = max(since_full, loft_since) if loft_since else since_full
+        ratio = loft_ratio(all_rooms, loft, outdoor, tz, loft_cutoff)
         if ratio:
             result["loft"] = ratio | {"window_days": windows_days[-1]}
+            if conf.get("loft_humidity"):
+                humidity = series_from_stats(
+                    stats.get(conf["loft_humidity"], []), "mean"
+                )
+                humidity = {
+                    ts: v for ts, v in humidity.items()
+                    if _local(ts, tz).date() >= loft_cutoff
+                }
+                if humidity:
+                    result["loft"]["humidity_pct"] = humidity[max(humidity)]
 
     return result
