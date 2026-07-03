@@ -82,12 +82,16 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
    Samba/SSH add-on, or the File editor add-on).
 2. Restart Home Assistant so it picks up the new integration.
 3. **Settings → Devices & Services → Add Integration → "Thermal
-   Efficiency".** The setup wizard is two steps:
+   Efficiency".** The setup wizard is:
    - One form for whole-home sensors: outdoor, gas meter, loft (+
      `loft_since`/`loft_humidity`), and floor area.
-   - A repeating form to add rooms one at a time (name, temperature
-     sensor, optional heating-power sensor) — check "Add another room"
-     to keep going, uncheck it once you've added the last one.
+   - Then, per room: pick an existing **Versatile Thermostat climate
+     entity** to auto-fill that room's name (from its Area) and
+     temperature sensor (its EMA sensor — same device as the climate
+     entity), or leave it blank to enter everything by hand. A
+     heating-power sensor is auto-suggested too, but only when there's
+     exactly one unambiguous candidate in that area. Check "Add another
+     room" to keep going, uncheck it once you've added the last one.
 
    Sensors appear within a minute of finishing the wizard (first
    computation runs over up to a year of statistics). To change anything

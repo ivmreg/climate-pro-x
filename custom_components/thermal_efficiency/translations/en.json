@@ -16,6 +16,13 @@
       },
       "room": {
         "title": "Add a room",
+        "description": "Pick a Versatile Thermostat climate entity to auto-fill this room's name and temperature sensor from it (its Area and EMA sensor), or leave blank to enter everything by hand.",
+        "data": {
+          "vtrv_climate": "Versatile Thermostat climate entity (optional)"
+        }
+      },
+      "room_details": {
+        "title": "Confirm room details",
         "description": "Rooms so far: {rooms_so_far}",
         "data": {
           "name": "Room name",
@@ -48,8 +55,23 @@
         }
       },
       "room": {
-        "title": "Rooms",
-        "description": "Existing rooms are replayed first so you can review or fix them; you'll be offered the chance to add a new one once they're all through.",
+        "title": "Review existing room",
+        "description": "Reviewing your existing rooms, one at a time - fix an entity if needed, or just continue.",
+        "data": {
+          "name": "Room name",
+          "temperature": "Temperature sensor",
+          "heating_power": "Heating power sensor (optional)"
+        }
+      },
+      "new_room": {
+        "title": "Add a new room",
+        "description": "All existing rooms reviewed. Pick a Versatile Thermostat climate entity to auto-fill a new room, or leave blank to enter everything by hand.",
+        "data": {
+          "vtrv_climate": "Versatile Thermostat climate entity (optional)"
+        }
+      },
+      "new_room_details": {
+        "title": "Confirm new room details",
         "data": {
           "name": "Room name",
           "temperature": "Temperature sensor",

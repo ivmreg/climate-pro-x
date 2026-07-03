@@ -1,7 +1,9 @@
-"""UI config flow: one form for whole-home sensors, then a repeating form to
-add rooms one at a time. The options flow re-runs the same two steps,
-pre-filled from the current entry so existing rooms can be reviewed/edited
-rather than re-typed from scratch."""
+"""UI config flow: one form for whole-home sensors, then rooms added one at a
+time. Adding a room can piggyback on an existing Versatile Thermostat climate
+entity (room name from its Area, temperature from its EMA sensor - both live
+on the same device) instead of hand-picking every entity. The options flow
+re-runs the same steps, replaying existing rooms first (so they can be
+reviewed/edited) before offering to add new ones."""
 
 from __future__ import annotations
 
@@ -10,7 +12,10 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import config_entries
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import area_registry as ar
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import selector
 from homeassistant.util import slugify
 
@@ -30,8 +35,8 @@ from .const import (
 )
 
 
-def _entity_selector() -> selector.EntitySelector:
-    return selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor"))
+def _entity_selector(**kwargs: Any) -> selector.EntitySelector:
+    return selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", **kwargs))
 
 
 def _suggest(value: Any) -> dict:
@@ -89,8 +94,67 @@ def _normalize_global(user_input: dict) -> dict:
     return data
 
 
-def _room_schema(
-    name: str | None, room: dict | None, ask_add_another: bool
+def _vtrv_picker_schema() -> vol.Schema:
+    return vol.Schema(
+        {
+            vol.Optional("vtrv_climate"): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain="climate", integration="versatile_thermostat"
+                )
+            ),
+        }
+    )
+
+
+def _derive_from_vtrv(
+    hass: HomeAssistant, climate_entity_id: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """Suggested (name, temperature, heating_power) from a Versatile
+    Thermostat climate entity: the room name comes from its Area, and the
+    EMA temperature sensor lives on the same device. A heating-power sensor
+    is typically a separate entity (e.g. from the Tado side) rather than on
+    the VTRV's own device, so it's only suggested when exactly one candidate
+    shares the same area - otherwise it's left for the user to pick."""
+    if not climate_entity_id:
+        return None, None, None
+    ent_reg = er.async_get(hass)
+    entry = ent_reg.async_get(climate_entity_id)
+    if entry is None:
+        return None, None, None
+
+    device = dr.async_get(hass).async_get(entry.device_id) if entry.device_id else None
+    area_id = entry.area_id or (device.area_id if device else None)
+
+    name = None
+    if area_id:
+        area = ar.async_get(hass).async_get_area(area_id)
+        name = area.name if area else None
+
+    temperature = None
+    if entry.device_id:
+        for sibling in er.async_entries_for_device(ent_reg, entry.device_id):
+            if sibling.entity_id.endswith("_ema_temperature"):
+                temperature = sibling.entity_id
+                break
+
+    heating_power = None
+    if area_id:
+        candidates = [
+            e.entity_id
+            for e in er.async_entries_for_area(ent_reg, area_id)
+            if e.entity_id.endswith("_heating_power")
+        ]
+        if len(candidates) == 1:
+            heating_power = candidates[0]
+
+    return name, temperature, heating_power
+
+
+def _room_details_schema(
+    name: str | None,
+    room: dict | None,
+    ask_add_another: bool,
+    default_add_another: bool = True,
 ) -> vol.Schema:
     room = room or {}
     schema: dict = {
@@ -103,7 +167,7 @@ def _room_schema(
         ): _entity_selector(),
     }
     if ask_add_another:
-        schema[vol.Required("add_another", default=not room)] = (
+        schema[vol.Required("add_another", default=default_add_another)] = (
             selector.BooleanSelector()
         )
     return vol.Schema(schema)
@@ -116,14 +180,25 @@ def _room_from_input(user_input: dict) -> dict:
     return room
 
 
+def _validate_room_name(name: str, taken: dict) -> tuple[str | None, dict[str, str]]:
+    slug = slugify(name)
+    if not slug:
+        return None, {"name": "invalid_name"}
+    if slug in taken:
+        return None, {"name": "duplicate_room"}
+    return slug, {}
+
+
 class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Home settings, then rooms one at a time."""
+    """Home settings, then rooms one at a time, each optionally piggybacking
+    on a Versatile Thermostat climate entity."""
 
     VERSION = 1
 
     def __init__(self) -> None:
         self._global: dict = {}
         self._rooms: dict[str, dict] = {}
+        self._pending_vtrv: str | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -136,14 +211,18 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_room(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
+        if user_input is not None:
+            self._pending_vtrv = user_input.get("vtrv_climate")
+            return await self.async_step_room_details()
+        return self.async_show_form(step_id="room", data_schema=_vtrv_picker_schema())
+
+    async def async_step_room_details(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            slug = slugify(user_input["name"])
-            if not slug:
-                errors["name"] = "invalid_name"
-            elif slug in self._rooms:
-                errors["name"] = "duplicate_room"
-            else:
+            slug, errors = _validate_room_name(user_input["name"], self._rooms)
+            if slug:
                 self._rooms[slug] = _room_from_input(user_input)
                 if user_input.get("add_another"):
                     return await self.async_step_room()
@@ -151,13 +230,17 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     title="Thermal Efficiency",
                     data={**self._global, CONF_ROOMS: self._rooms},
                 )
+        name, temperature, heating_power = _derive_from_vtrv(
+            self.hass, self._pending_vtrv
+        )
         return self.async_show_form(
-            step_id="room",
-            data_schema=_room_schema(None, None, ask_add_another=True),
+            step_id="room_details",
+            data_schema=_room_details_schema(
+                name,
+                {CONF_TEMPERATURE: temperature, CONF_HEATING_POWER: heating_power},
+                ask_add_another=True,
+            ),
             errors=errors,
-            description_placeholders={
-                "rooms_so_far": ", ".join(self._rooms) or "none yet"
-            },
         )
 
     async def async_step_import(
@@ -177,13 +260,16 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
-    """Re-runs the same two steps. Existing rooms are replayed first (so they
-    can be reviewed/edited one at a time) before offering to add new ones."""
+    """Existing rooms are replayed first, one at a time, so they can be
+    reviewed/edited; once they're all through, new rooms can be added the
+    same VTRV-assisted way as the initial setup."""
 
     def __init__(self) -> None:
         self._global: dict = {}
         self._rooms: dict[str, dict] = {}
         self._pending_rooms: list[tuple[str, dict]] = []
+        self._current_room: tuple[str | None, dict | None] = (None, None)
+        self._pending_vtrv: str | None = None
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -193,35 +279,64 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
             self._pending_rooms = list(
                 self.config_entry.data.get(CONF_ROOMS, {}).items()
             )
-            return await self.async_step_room()
+            return await self._async_advance_room()
         return self.async_show_form(
             step_id="init", data_schema=_global_schema(self.config_entry.data)
         )
 
+    async def _async_advance_room(self) -> config_entries.ConfigFlowResult:
+        if self._pending_rooms:
+            self._current_room = self._pending_rooms.pop(0)
+            return await self.async_step_room()
+        return await self.async_step_new_room()
+
     async def async_step_room(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Review/edit one pre-existing room."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            slug, errors = _validate_room_name(user_input["name"], self._rooms)
+            if slug:
+                self._rooms[slug] = _room_from_input(user_input)
+                return await self._async_advance_room()
+        name, room = self._current_room
+        return self.async_show_form(
+            step_id="room",
+            data_schema=_room_details_schema(name, room, ask_add_another=False),
+            errors=errors,
+        )
+
+    async def async_step_new_room(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        if user_input is not None:
+            self._pending_vtrv = user_input.get("vtrv_climate")
+            return await self.async_step_new_room_details()
+        return self.async_show_form(
+            step_id="new_room", data_schema=_vtrv_picker_schema()
+        )
+
+    async def async_step_new_room_details(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            slug = slugify(user_input["name"])
-            if not slug:
-                errors["name"] = "invalid_name"
-            elif slug in self._rooms:
-                errors["name"] = "duplicate_room"
-            else:
+            slug, errors = _validate_room_name(user_input["name"], self._rooms)
+            if slug:
                 self._rooms[slug] = _room_from_input(user_input)
-                # Still replaying pre-existing rooms: keep going regardless
-                # of "add_another" (it isn't even shown until they're done).
-                if self._pending_rooms or user_input.get("add_another"):
-                    return await self.async_step_room()
+                if user_input.get("add_another"):
+                    return await self.async_step_new_room()
                 return self._async_finish()
-        name, room = (None, None)
-        if self._pending_rooms:
-            name, room = self._pending_rooms.pop(0)
+        name, temperature, heating_power = _derive_from_vtrv(
+            self.hass, self._pending_vtrv
+        )
         return self.async_show_form(
-            step_id="room",
-            data_schema=_room_schema(
-                name, room, ask_add_another=not self._pending_rooms
+            step_id="new_room_details",
+            data_schema=_room_details_schema(
+                name,
+                {CONF_TEMPERATURE: temperature, CONF_HEATING_POWER: heating_power},
+                ask_add_another=True,
             ),
             errors=errors,
         )
