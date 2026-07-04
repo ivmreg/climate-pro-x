@@ -76,9 +76,10 @@
       },
       "new_room": {
         "title": "Add a new room",
-        "description": "All existing rooms reviewed. Pick a Versatile Thermostat climate entity to auto-fill a new room, or leave blank to enter everything by hand.",
+        "description": "All existing rooms reviewed. Pick a Versatile Thermostat climate entity to auto-fill a new room, leave blank to enter everything by hand, or tick \"No more rooms\" to finish now.",
         "data": {
-          "vtrv_climate": "Versatile Thermostat climate entity (optional)"
+          "vtrv_climate": "Versatile Thermostat climate entity (optional)",
+          "finish": "No more rooms - finish now"
         }
       },
       "new_room_details": {

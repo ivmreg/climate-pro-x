@@ -139,16 +139,17 @@ def _normalize_global(user_input: dict) -> dict:
     return data
 
 
-def _vtrv_picker_schema() -> vol.Schema:
-    return vol.Schema(
-        {
-            vol.Optional("vtrv_climate"): selector.EntitySelector(
-                selector.EntitySelectorConfig(
-                    domain="climate", integration="versatile_thermostat"
-                )
-            ),
-        }
-    )
+def _vtrv_picker_schema(allow_finish: bool = False) -> vol.Schema:
+    schema: dict = {
+        vol.Optional("vtrv_climate"): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain="climate", integration="versatile_thermostat"
+            )
+        ),
+    }
+    if allow_finish:
+        schema[vol.Optional("finish", default=False)] = selector.BooleanSelector()
+    return vol.Schema(schema)
 
 
 def _derive_from_vtrv(
@@ -363,10 +364,12 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         if user_input is not None:
+            if user_input.get("finish"):
+                return self._async_finish()
             self._pending_vtrv = user_input.get("vtrv_climate")
             return await self.async_step_new_room_details()
         return self.async_show_form(
-            step_id="new_room", data_schema=_vtrv_picker_schema()
+            step_id="new_room", data_schema=_vtrv_picker_schema(allow_finish=True)
         )
 
     async def async_step_new_room_details(
