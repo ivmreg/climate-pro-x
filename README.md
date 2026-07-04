@@ -12,7 +12,7 @@ sensor, a loft sensor and a weather integration.
 | **Heat Loss Coefficient HLC (W/K), whole home** | Watts lost per degree of indoor/outdoor difference. *The* retrofit benchmark. | Temperatures + a heat-input proxy (Tado heating power %, or real gas kWh) |
 | **Loft ratio** | Whether your ceiling or your roof is the weak link — i.e. would loft insulation pay off. | Loft + indoor + outdoor temperatures |
 | **Ventilation vs fabric split (W/K)** | Whether the HLC is mostly draughts (draught-proofing) or mostly walls/windows (insulation) — the actual retrofit spending decision. | A CO2 sensor with a season of history, floor area, ceiling height |
-| **Hot-water gas (kWh/day, £/day, £/yr)** | What DHW+hob+pilot actually cost, isolated from space heating — and used to de-bias the winter HLC fit. | Gas meter, a summer (heating-off) stretch of history |
+| **Hot-water gas (kWh/day, £/day, £/yr)** | What non-heating gas actually costs, isolated from space heating — and used to de-bias the winter HLC fit. Covers hot water plus cooking/pilot only if those burn gas; in an electric-cooking home it's purely hot water. | Gas meter, a summer (heating-off) stretch of history |
 
 Typical uninsulated solid-wall UK flats sit around **200–350 W/K**; per-room
 time constants under ~10 h at night usually indicate significant draughts or
@@ -101,7 +101,8 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
   `loft_since` to the move date so its earlier, non-loft readings are
   ignored — a sensor that merely sat somewhere else warm won't necessarily
   flatline, so this isn't caught automatically otherwise.
-- `sensor.thermal_efficiency_hot_water_gas` — DHW+hob+pilot gas, kWh/day,
+- `sensor.thermal_efficiency_hot_water_gas` — non-heating gas (hot water,
+  plus any gas cooking/pilot), kWh/day,
   from a robust summer (heating-off) baseline; attributes include
   `cost_per_day_gbp`/`cost_per_year_gbp` (needs `gas_unit_rate`) and,
   once enough hourly water history has accrued, an informational

@@ -1,5 +1,6 @@
-"""Hot-water (+hob/pilot) gas: a robust summer baseline, scaled by a coarse
-mains-water-temperature model to correct the winter HLC fit for DHW.
+"""Non-heating gas (hot water, plus cooking/pilot only if those burn gas): a
+robust summer baseline, scaled by a coarse mains-water-temperature model to
+correct the winter HLC fit for DHW.
 
 Mirrors the dhw_baseline/mains_temp_c/dhw_daily_kwh/fit_water_gas cluster in
 the HA integration (custom_components/thermal_efficiency/thermal_math.py) -
@@ -35,7 +36,7 @@ def hourly_change(cumulative: pd.Series, max_step: float) -> pd.Series:
 def dhw_baseline(
     q_daily: pd.Series, dt_daily: pd.Series, outdoor_daily: pd.Series
 ) -> dict | None:
-    """Robust hot-water+hob+pilot gas estimate: median daily gas on days
+    """Robust non-heating gas estimate: median daily gas on days
     with negligible heating demand (mean dT < DHW_BASELINE_MAX_DT), plus the
     mean outdoor temperature on those days (the mains-water-temperature
     reference point `dhw_daily_kwh` scales from)."""
@@ -66,10 +67,10 @@ def mains_temp_c(outdoor_c: float) -> float:
 
 
 def dhw_daily_kwh(outdoor_c: float, baseline: dict) -> float:
-    """Scale the measured summer DHW+hob+pilot baseline for a colder mains
+    """Scale the measured summer non-heating baseline for a colder mains
     supply on another day. See thermal_math.dhw_daily_kwh for the rationale
-    behind applying the ratio to the whole baseline rather than splitting
-    out hob/pilot."""
+    behind applying the ratio to the whole baseline (exact when the home
+    cooks on electricity and the baseline is pure DHW)."""
     ref_dt = MAINS_TANK_TEMP_C - mains_temp_c(baseline["outdoor_mean"])
     day_dt = MAINS_TANK_TEMP_C - mains_temp_c(outdoor_c)
     ratio = day_dt / ref_dt if ref_dt > 0 else 1.0

@@ -1,0 +1,153 @@
+# Thermal Efficiency dashboard.
+#
+# Install: Settings -> Dashboards -> Add dashboard -> "New dashboard from
+# scratch" -> open it -> pencil icon -> three-dot menu -> "Raw configuration
+# editor" -> paste this whole file.
+#
+# Needs (all already installed via HACS on this instance):
+#   - apexcharts-card
+#   - flex-table-card
+#
+# Entity ids below match this instance; a fresh install may name the newer
+# sensors without the "metahome_" device prefix - adjust if so.
+
+views:
+  - title: Thermal efficiency
+    icon: mdi:home-thermometer
+    type: sections
+    max_columns: 3
+    sections:
+      # ------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: The headline
+
+          - type: gauge
+            entity: sensor.thermal_efficiency_heat_loss_coefficient
+            name: Heat loss coefficient
+            min: 0
+            max: 500
+            needle: true
+            segments:
+              - from: 0
+                color: "#2e7d32" # excellent (<100)
+              - from: 100
+                color: "#8bc34a" # good (<180)
+              - from: 180
+                color: "#fdd835" # typical solid-wall (<280)
+              - from: 280
+                color: "#fb8c00" # poor (<400)
+              - from: 400
+                color: "#e53935" # very poor
+
+          - type: markdown
+            title: What to do about it
+            content: >-
+              {% set s = 'sensor.thermal_efficiency_heat_loss_coefficient' %}
+              {% set hlc = states(s) | float(0) %}
+              {% set rating = state_attr(s, 'rating') %}
+              {% set sh = state_attr(s, 'space_heating_hlc_w_per_k') %}
+              {% set fabric = states('sensor.metahome_thermal_efficiency_fabric_heat_loss') | float(0) %}
+              {% set share = state_attr('sensor.metahome_thermal_efficiency_ventilation_heat_loss',
+                                        'share_of_delivered_hlc_pct') | float(0) %}
+              {% set ach = states('sensor.metahome_thermal_efficiency_air_change_rate') | float(0) %}
+              {% set loft = states('sensor.thermal_efficiency_loft_ratio') | float(1) %}
+
+              **{{ hlc | round(0) }} W/K — {{ rating }}**
+              {%- if sh %} (space heating only: {{ sh | round(0) }} W/K){% endif %}.
+
+              {% if share < 15 -%}
+              Draughts are only **{{ share | round(0) }}%** of the loss —
+              draught-proofing won't pay. Walls & windows
+              ({{ fabric | round(0) }} W/K) are the retrofit target.
+              {%- else -%}
+              Ventilation is **{{ share | round(0) }}%** of the loss —
+              draught-proofing is worth pricing up alongside insulation.
+              {%- endif %}
+
+              {% if ach and ach < 0.4 -%}
+              ⚠️ Air-change rate {{ ach }}/h is below the ~0.5/h health
+              guideline — keep an eye on bedroom CO₂ overnight.
+              {%- endif %}
+
+              {% if loft < 0.3 -%}
+              Ceiling/loft already performs well — loft insulation is low
+              priority.
+              {%- endif %}
+
+              *Rule of thumb at your tariff: every 10 W/K removed ≈ £30/yr.*
+
+      # ------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: Where the heat goes
+
+          - type: custom:apexcharts-card
+            chart_type: donut
+            header:
+              show: true
+              title: Delivered heat loss split (W/K)
+            series:
+              - entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+                name: Fabric (walls & windows)
+                color: "#e53935"
+              - entity: sensor.metahome_thermal_efficiency_ventilation_heat_loss
+                name: Ventilation (draughts)
+                color: "#42a5f5"
+
+          - type: gauge
+            entity: sensor.metahome_thermal_efficiency_air_change_rate
+            name: Air changes per hour
+            min: 0
+            max: 1.5
+            needle: true
+            segments:
+              - from: 0
+                color: "#fb8c00" # too airtight for health (<0.35)
+              - from: 0.35
+                color: "#2e7d32" # healthy band
+              - from: 0.7
+                color: "#fdd835" # getting draughty
+              - from: 1.0
+                color: "#e53935" # leaky
+
+          - type: markdown
+            title: Hot water & cooking gas
+            content: >-
+              {% set s = 'sensor.metahome_thermal_efficiency_hot_water_gas' %}
+              **{{ states(s) }} kWh/day**
+              → £{{ state_attr(s, 'cost_per_day_gbp') }}/day,
+              **£{{ state_attr(s, 'cost_per_year_gbp') | round(0) }}/yr**
+              (pure hot water — the hob is electric; from
+              {{ state_attr(s, 'days_used') }} heating-off days).
+
+      # ------------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: heading
+            heading: Trends & rooms
+
+          - type: statistics-graph
+            title: HLC over time (weekly mean)
+            entities:
+              - sensor.thermal_efficiency_heat_loss_coefficient
+            period: week
+            stat_types:
+              - mean
+            days_to_show: 365
+
+          - type: custom:flex-table-card
+            title: Room cooling ranking (τ hours, lower = cools faster)
+            entities:
+              include: sensor\.thermal_efficiency_.*_time_constant
+            sort_by: state+
+            columns:
+              - name: Room
+                data: friendly_name
+                modify: x.replace(' time constant','').replace('Thermal Efficiency ','')
+              - name: τ (h)
+                data: state
+              - name: Nights fitted
+                data: nights_fitted

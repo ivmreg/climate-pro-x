@@ -183,7 +183,8 @@ def fit_hlc(
 def dhw_baseline(
     q_by_day: dict, dt_by_day: dict, outdoor_by_day: dict, since
 ) -> dict | None:
-    """Robust hot-water+hob+pilot gas estimate: median daily gas on days
+    """Robust non-heating gas estimate (hot water, plus cooking/pilot only if
+    those burn gas): median daily gas on days
     with negligible heating demand (mean dT < DHW_BASELINE_MAX_DT), plus the
     mean outdoor temperature on those days (the mains-water-temperature
     reference point `dhw_daily_kwh` scales from). Distinct from fit_hlc's own
@@ -220,13 +221,13 @@ def mains_temp_c(outdoor_c: float) -> float:
 
 
 def dhw_daily_kwh(outdoor_c: float, baseline: dict) -> float:
-    """Scale the measured summer DHW+hob+pilot baseline for a colder mains
+    """Scale the measured summer non-heating baseline for a colder mains
     supply on another day. Applies the (tank-mains) delta-T ratio to the
-    whole baseline rather than splitting out hob/pilot - a documented
-    simplification: hob/pilot doesn't depend on mains temperature, but a
-    reliable split needs more water history than a single summer provides
-    (see fit_water_gas's `hot_fraction_pct` for a data-driven split once
-    more accrues).
+    whole baseline rather than splitting out any gas cooking/pilot share - a
+    simplification when those exist (they don't depend on mains temperature),
+    and exact in an electric-cooking home where the baseline is pure DHW. A
+    reliable data-driven split needs more water history than a single summer
+    provides (see fit_water_gas's `hot_fraction_pct` once more accrues).
     """
     ref_dt = MAINS_TANK_TEMP_C - mains_temp_c(baseline["outdoor_mean"])
     day_dt = MAINS_TANK_TEMP_C - mains_temp_c(outdoor_c)

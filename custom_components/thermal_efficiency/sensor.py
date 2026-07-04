@@ -99,7 +99,7 @@ class HlcSensor(ThermalSensor):
                 else None
             ),
             "dhw_correction": (
-                "hot-water/hob gas estimated and subtracted before fitting"
+                "non-heating (hot-water) gas estimated and subtracted before fitting"
                 if "space_heating_hlc_w_per_k" in fit
                 else "not applied - configure a gas meter and enough summer "
                      "(heating-off) days to estimate a DHW baseline"
@@ -232,8 +232,9 @@ class HotWaterGasSensor(ThermalSensor):
         if not dhw:
             return {"note": "not enough summer (heating-off) days yet"}
         return {
-            "includes": "DHW + hob + pilot (no way to isolate hob/pilot "
-                        "reliably from gas alone)",
+            "includes": "all non-heating gas: hot water, plus cooking/pilot "
+                        "only if those burn gas (pure DHW in an "
+                        "electric-cooking home)",
             "days_used": dhw["days_used"],
             "cost_per_day_gbp": (
                 round(dhw["cost_per_day_gbp"], 2)

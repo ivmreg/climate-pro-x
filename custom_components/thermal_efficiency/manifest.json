@@ -1,10 +1,10 @@
 {
   "domain": "thermal_efficiency",
   "name": "Thermal Efficiency",
-  "codeowners": [],
+  "codeowners": ["@ivmreg"],
   "config_flow": true,
   "dependencies": ["recorder"],
-  "documentation": "https://github.com/igor/climate-pro-x",
+  "documentation": "https://github.com/ivmreg/climate-pro-x",
   "integration_type": "hub",
   "iot_class": "calculated",
   "requirements": [],
