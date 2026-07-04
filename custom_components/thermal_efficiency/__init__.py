@@ -12,8 +12,12 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_BOILER_EFFICIENCY,
+    CONF_CEILING_HEIGHT,
+    CONF_CO2,
     CONF_FLOOR_AREA,
     CONF_GAS_METER,
+    CONF_GAS_UNIT_RATE,
     CONF_HEATING_POWER,
     CONF_LOFT,
     CONF_LOFT_HUMIDITY,
@@ -22,6 +26,8 @@ from .const import (
     CONF_OUTDOOR,
     CONF_ROOMS,
     CONF_TEMPERATURE,
+    CONF_WATER,
+    DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_MAX_WINDOW_DAYS,
     DOMAIN,
 )
@@ -61,6 +67,16 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional(CONF_LOFT_SINCE): _loft_since,
                 vol.Optional(CONF_LOFT_HUMIDITY): cv.entity_id,
                 vol.Optional(CONF_FLOOR_AREA): vol.Coerce(float),
+                vol.Optional(CONF_CEILING_HEIGHT): vol.Coerce(float),
+                vol.Optional(CONF_CO2): cv.entity_id,
+                # A statistic id, not an entity - the water history is an
+                # external statistic (e.g. thames_water:thameswater_consumption)
+                # rather than a sensor.* entity.
+                vol.Optional(CONF_WATER): cv.string,
+                vol.Optional(CONF_GAS_UNIT_RATE): cv.entity_id,
+                vol.Optional(
+                    CONF_BOILER_EFFICIENCY, default=DEFAULT_BOILER_EFFICIENCY
+                ): vol.Coerce(float),
                 vol.Optional(
                     CONF_MAX_WINDOW_DAYS, default=DEFAULT_MAX_WINDOW_DAYS
                 ): cv.positive_int,

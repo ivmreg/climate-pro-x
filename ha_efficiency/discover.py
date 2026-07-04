@@ -10,6 +10,9 @@ OUTDOOR_HINTS = ("outdoor", "outside", "external", "garden", "balcony")
 LOFT_HINTS = ("loft", "attic")
 
 
+GAS_RATE_HINTS = ("gas",)
+
+
 def categorise(states: list[dict]) -> dict[str, list[dict]]:
     cats: dict[str, list[dict]] = {
         "indoor_temperature": [],
@@ -19,6 +22,8 @@ def categorise(states: list[dict]) -> dict[str, list[dict]]:
         "climate": [],
         "weather": [],
         "energy": [],
+        "co2": [],
+        "gas_rate": [],
     }
     for s in states:
         eid = s["entity_id"]
@@ -43,6 +48,14 @@ def categorise(states: list[dict]) -> dict[str, list[dict]]:
                 cats["heating_power"].append(s)
             elif device_class in ("energy", "gas") or unit in ("kWh", "m³"):
                 cats["energy"].append(s)
+            elif device_class == "carbon_dioxide":
+                cats["co2"].append(s)
+            elif (
+                device_class == "monetary"
+                and "kwh" in unit.lower()
+                and any(h in name or h in eid for h in GAS_RATE_HINTS)
+            ):
+                cats["gas_rate"].append(s)
     return cats
 
 
@@ -67,9 +80,18 @@ def draft_config(cats: dict[str, list[dict]]) -> dict:
 
     return {
         "boiler_output_kw": 28,
+        "boiler_efficiency": 0.88,
         "gas_kwh_entity": eid(cats["energy"][0]) if cats["energy"] else None,
+        "gas_unit_rate_entity": eid(cats["gas_rate"][0]) if cats["gas_rate"] else None,
         "outdoor_entity": eid(cats["outdoor_temperature"][0]) if cats["outdoor_temperature"] else "FILL_ME_IN",
         "loft_entity": eid(cats["loft_temperature"][0]) if cats["loft_temperature"] else "FILL_ME_IN",
+        "co2_entity": eid(cats["co2"][0]) if cats["co2"] else None,
+        # External statistic (e.g. from a water utility integration), not a
+        # sensor.* entity - not visible here since this only scans
+        # /api/states. Find it in HA's Developer Tools > Statistics, e.g.
+        # "thames_water:thameswater_consumption".
+        "water_stat": None,
+        "ceiling_height_m": None,
         "weather_entity": eid(cats["weather"][0]) if cats["weather"] else None,
         "night_start": "23:30",
         "night_end": "06:30",
@@ -95,3 +117,8 @@ def run(config_path: str = "config.yaml") -> None:
     print("  * check the outdoor/loft guesses (matched by name)")
     print("  * remove rooms that aren't rooms (e.g. fridge/boiler sensors)")
     print("  * set boiler_output_kw from your Worcester Bosch model plate")
+    print("  * fill in co2_entity + floor_area_m2 + ceiling_height_m to unlock "
+          "the `ventilation` command (ventilation vs fabric loss split)")
+    print("  * fill in water_stat (an external statistic id, not a sensor.* "
+          "entity - see Developer Tools > Statistics) to unlock the "
+          "informational hot-water-fraction regression in `dhw`")

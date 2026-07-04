@@ -11,6 +11,8 @@ sensor, a loft sensor and a weather integration.
 | **Thermal time constant τ (hours), per room** | How fast each room cools when heating is off. Low τ = leaky room. | Temperatures only |
 | **Heat Loss Coefficient HLC (W/K), whole home** | Watts lost per degree of indoor/outdoor difference. *The* retrofit benchmark. | Temperatures + a heat-input proxy (Tado heating power %, or real gas kWh) |
 | **Loft ratio** | Whether your ceiling or your roof is the weak link — i.e. would loft insulation pay off. | Loft + indoor + outdoor temperatures |
+| **Ventilation vs fabric split (W/K)** | Whether the HLC is mostly draughts (draught-proofing) or mostly walls/windows (insulation) — the actual retrofit spending decision. | A CO2 sensor with a season of history, floor area, ceiling height |
+| **Hot-water gas (kWh/day, £/day, £/yr)** | What DHW+hob+pilot actually cost, isolated from space heating — and used to de-bias the winter HLC fit. | Gas meter, a summer (heating-off) stretch of history |
 
 Typical uninsulated solid-wall UK flats sit around **200–350 W/K**; per-room
 time constants under ~10 h at night usually indicate significant draughts or
@@ -37,12 +39,34 @@ uninsulated external walls.
 
    ```bash
    .venv/bin/python -m ha_efficiency pull --days 10
-   .venv/bin/python -m ha_efficiency cooling     # per-room time constants
-   .venv/bin/python -m ha_efficiency hlc         # heat loss coefficient
-   .venv/bin/python -m ha_efficiency loft        # ceiling vs roof analysis
+   .venv/bin/python -m ha_efficiency cooling      # per-room time constants
+   .venv/bin/python -m ha_efficiency hlc          # heat loss coefficient
+   .venv/bin/python -m ha_efficiency loft         # ceiling vs roof analysis
+   .venv/bin/python -m ha_efficiency ventilation  # ventilation vs fabric loss split
+   .venv/bin/python -m ha_efficiency dhw          # hot-water gas cost + DHW-corrected HLC
    ```
 
 Plots land in `output/`, cached history in `data/`.
+
+`ventilation` needs `co2_entity`, `floor_area_m2` and `ceiling_height_m` in
+`config.yaml`, plus a gas meter for the HLC it splits. `dhw` needs a gas
+meter and enough cached summer (heating-off) days; `gas_unit_rate_entity`
+adds the £/day figure (fetched live — see the gotcha below), and `water_stat`
+adds an informational Wh/L regression. Both are pulled via `pull --lts`,
+same as the loft/HLC winter analyses.
+
+**Gotcha:** a household water meter integration may expose *two* things that
+look similar but aren't: a recorder-tracked `sensor.*` entity that only
+updates once a day (diffing it gives one big daily spike, not real hourly
+usage) and a separate *external statistic* (not a `sensor.*` entity — check
+Developer Tools → Statistics) with genuine backfilled hourly readings. Use
+the external statistic for `water_stat`; the CSV filename ends up with a
+colon in it (e.g. `thames_water:thameswater_consumption.csv`), which is
+expected. Similarly, a gas/electricity *tariff* sensor is usually
+`state_class: total` but isn't a real meter, so its long-term "sum"
+statistics are meaningless noise (recorder computes a running delta as if it
+were a meter) — `gas_unit_rate_entity` is read from its **live** state, not
+cached history, for both the offline `dhw` command and the live integration.
 
 ## Notes on data depth
 
@@ -62,8 +86,11 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
 - `sensor.thermal_efficiency_heat_loss_coefficient` — W/K over the full
   window (stable, season-blended), with attributes: rating, R², days used,
   DHW baseline, a shorter-window `recent_hlc_w_per_k` for spotting
-  improvements after e.g. draught-proofing, and `hlc_w_per_k_per_m2` (set
-  `floor_area_m2` to get this — the normalised benchmark assessors use).
+  improvements after e.g. draught-proofing, `hlc_w_per_k_per_m2` (set
+  `floor_area_m2` to get this — the normalised benchmark assessors use), and
+  `space_heating_hlc_w_per_k` — the same fit with hot-water gas subtracted
+  day-by-day (needs a gas meter and enough summer history for a DHW
+  baseline; see `hot_water_gas` below).
 - `sensor.thermal_efficiency_<room>_time_constant` — median overnight
   cooling τ in hours; nights are skipped when Tado heating power shows the
   radiator ran, and gated on fit quality otherwise.
@@ -74,6 +101,19 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
   `loft_since` to the move date so its earlier, non-loft readings are
   ignored — a sensor that merely sat somewhere else warm won't necessarily
   flatline, so this isn't caught automatically otherwise.
+- `sensor.thermal_efficiency_hot_water_gas` — DHW+hob+pilot gas, kWh/day,
+  from a robust summer (heating-off) baseline; attributes include
+  `cost_per_day_gbp`/`cost_per_year_gbp` (needs `gas_unit_rate`) and,
+  once enough hourly water history has accrued, an informational
+  `wh_per_litre`/`hot_fraction_of_metered_water_pct` from a gas-vs-water
+  regression (needs `water`).
+- `sensor.thermal_efficiency_air_change_rate` — whole-home air-change rate
+  (1/h) from CO2 decay curves (needs `co2`), plus
+  `sensor.thermal_efficiency_ventilation_heat_loss` and
+  `..._fabric_heat_loss` (W/K) splitting the delivered space-heating HLC
+  between draughts and fabric (needs `co2`, `floor_area_m2` and
+  `ceiling_height_m`) — the number that actually decides draught-proofing
+  vs wall/window insulation.
 
 ### Install
 
@@ -84,7 +124,10 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
 3. **Settings → Devices & Services → Add Integration → "Thermal
    Efficiency".** The setup wizard is:
    - One form for whole-home sensors: outdoor, gas meter, loft (+
-     `loft_since`/`loft_humidity`), and floor area.
+     `loft_since`/`loft_humidity`), floor area, ceiling height, a CO2
+     sensor, a water statistic, a gas tariff sensor and boiler efficiency
+     (the last five are all optional — see the metrics table above for
+     what each unlocks).
    - Then, per room: pick an existing **Versatile Thermostat climate
      entity** to auto-fill that room's name (from its Area) and
      temperature sensor (its EMA sensor — same device as the climate
@@ -114,6 +157,13 @@ thermal_efficiency:
   loft_since: "2026-07-03"  # ignore this sensor's history before its move into the loft
   loft_humidity: sensor.portable_sensor_humidity
   floor_area_m2: 105
+  ceiling_height_m: 2.45
+  co2: sensor.qp_sensor_co2
+  # An external statistic id (not a sensor.* entity - see the gotcha above),
+  # e.g. from a water-utility integration with genuine hourly usage.
+  water: thames_water:thameswater_consumption
+  gas_unit_rate: sensor.smart_meter_gas_import_unit_rate
+  boiler_efficiency: 0.88
   rooms:
     living_room:
       temperature: sensor.living_room_vtrv_ema_temperature
@@ -137,4 +187,7 @@ thermal_efficiency:
 
 Tests: `tests/synthetic_check.py` (offline toolkit) and
 `tests/integration_math_check.py` (integration maths, synthetic + real
-cached data) — both run with `.venv/bin/python`.
+cached data) — both run with `.venv/bin/python`. Coverage includes HLC,
+per-room τ, loft ratio, the ventilation/fabric CO2 split, and the DHW
+baseline/HLC correction, each checked against known-physics synthetic data
+plus (in the integration test) real cached data.

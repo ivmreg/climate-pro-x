@@ -9,15 +9,35 @@ boiler_output_kw: 28
 # meter integration. Leave null to estimate input from Tado heating power.
 gas_kwh_entity: null
 
+# Optional: GBP/kWh gas tariff sensor and your combi's efficiency (0-1) —
+# used by the `dhw` command to cost the hot-water gas baseline.
+gas_unit_rate_entity: null
+boiler_efficiency: 0.88
+
+# Optional: enables the `ventilation` command (ventilation vs fabric split
+# of the delivered HLC). co2_entity needs a real CO2 sensor with a season of
+# history; floor_area_m2 is also used here (not just for HLC/m2 below).
+co2_entity: null
+floor_area_m2: null
+ceiling_height_m: null
+
+# Optional: an external statistic id (not a sensor.* entity — check HA's
+# Developer Tools > Statistics) with genuine hourly water usage, e.g. from a
+# water-utility integration. Enables the informational hot-water-fraction
+# regression in the `dhw` command. A recorder-tracked sensor.* meter that
+# only updates once/day (a daily batch import) will NOT work here — diffing
+# it gives one large daily spike, not real hourly usage.
+water_stat: null
+
 outdoor_entity: sensor.outdoor_temperature
 loft_entity: sensor.loft_temperature
 weather_entity: weather.home   # used later for wind/solar corrections
 
 # The HA integration (custom_components/thermal_efficiency) additionally
-# supports loft_since (ignore a relocated loft sensor's pre-move history),
-# loft_humidity (informational attribute), and floor_area_m2 (normalises HLC
-# to W/K/m2). See README's "Home Assistant integration" section — this
-# offline toolkit's config.yaml doesn't read those keys.
+# supports loft_since (ignore a relocated loft sensor's pre-move history)
+# and loft_humidity (informational attribute). See README's "Home Assistant
+# integration" section — this offline toolkit's config.yaml doesn't read
+# those two keys, though it does now read floor_area_m2 (see above).
 
 # Night window used for cooling-curve fits (heating normally off/setback).
 night_start: "23:30"

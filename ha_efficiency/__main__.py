@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from . import cooling, discover, hlc, loft, store
+from . import cooling, dhw, discover, hlc, loft, store, ventilation
 from .client import HAClient
 
 
@@ -23,6 +23,10 @@ def config_entities(cfg: dict) -> list[str]:
     entities = [cfg["outdoor_entity"], cfg.get("loft_entity")]
     if cfg.get("gas_kwh_entity"):
         entities.append(cfg["gas_kwh_entity"])
+    if cfg.get("co2_entity"):
+        entities.append(cfg["co2_entity"])
+    if cfg.get("gas_unit_rate_entity"):
+        entities.append(cfg["gas_unit_rate_entity"])
     for room in cfg["rooms"].values():
         entities.append(room["temperature"])
         if room.get("heating_power"):
@@ -37,6 +41,10 @@ def cmd_pull(args) -> None:
     entities = config_entities(cfg)
     if args.lts:
         from . import lts
+        # water_stat is an external statistic, not a sensor.* entity - only
+        # reachable via the LTS websocket path, not the REST history API.
+        if cfg.get("water_stat"):
+            entities = entities + [cfg["water_stat"]]
         print(f"Pulling hourly long-term statistics, {len(entities)} entities, {args.days} days …")
         series = lts.fetch(entities, start)
     else:
@@ -159,6 +167,123 @@ def cmd_loft(args) -> None:
     print(f"Verdict: {result['verdict']}")
 
 
+def _gas_daily_inputs(cfg: dict) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """(q_daily, dt_daily, outdoor_daily, gas) shared by ventilation/dhw."""
+    outdoor = store.load_resampled(cfg["outdoor_entity"])
+    temps = _room_series(cfg, "temperature")
+    gas_entity = cfg.get("gas_kwh_entity")
+    if outdoor is None or not temps or not gas_entity:
+        sys.exit("Missing cached data — run `pull` first "
+                 "(need outdoor, rooms, gas_kwh_entity).")
+    dt_daily = hlc.daily_delta_t(temps, outdoor)
+    gas = store.load(gas_entity)
+    q_daily = hlc.daily_heat_input_from_meter(gas)
+    outdoor_daily = outdoor.resample("1D").mean()
+    return q_daily, dt_daily, outdoor_daily, gas
+
+
+def cmd_ventilation(args) -> None:
+    cfg = load_config()
+    co2_entity = cfg.get("co2_entity")
+    if not co2_entity:
+        sys.exit("Set co2_entity in config.yaml first.")
+    co2 = store.load(co2_entity)
+    if co2 is None:
+        sys.exit("No cached CO2 data — run `pull --lts` first.")
+    fit = ventilation.air_change_rate(co2)
+    if not fit:
+        sys.exit("Not enough clean CO2 decay windows yet — pull more history.")
+    print(f"\nAir-change rate: {fit['ach']:.2f} /h  ({fit['windows']} decay windows, "
+          f"outdoor CO2 baseline {fit['baseline_ppm']:.0f} ppm)")
+
+    floor_area = cfg.get("floor_area_m2")
+    ceiling = cfg.get("ceiling_height_m")
+    if not (floor_area and ceiling):
+        print("Set floor_area_m2 and ceiling_height_m in config.yaml to see the W/K split.")
+        return
+
+    q_daily, dt_daily, outdoor_daily, _gas = _gas_daily_inputs(cfg)
+    corrected = dhw.corrected_hlc(q_daily, dt_daily, outdoor_daily)
+    if corrected:
+        space_heating_hlc = corrected["hlc_w_per_k"]
+        print(f"Using DHW-corrected space-heating HLC: {space_heating_hlc:.0f} W/K")
+    else:
+        raw = hlc.fit_hlc(q_daily, dt_daily)
+        if "note" in raw:
+            sys.exit(raw["note"])
+        space_heating_hlc = raw["hlc_w_per_k"]
+        print("Using raw HLC (not enough summer data yet for a DHW correction): "
+              f"{space_heating_hlc:.0f} W/K")
+
+    boiler_eff = cfg.get("boiler_efficiency", 0.88)
+    split = ventilation.split_losses(
+        fit["ach"], floor_area, ceiling, space_heating_hlc, boiler_eff
+    )
+    print(f"\nVentilation loss: {split['ventilation_w_per_k']:.0f} W/K "
+          f"({split['ventilation_share_pct']:.0f}% of delivered)")
+    print(f"Fabric loss:      {split['fabric_w_per_k']:.0f} W/K")
+    print(f"(delivered HLC {split['hlc_delivered_w_per_k']:.0f} W/K at "
+          f"{boiler_eff * 100:.0f}% boiler efficiency)")
+
+
+def cmd_dhw(args) -> None:
+    cfg = load_config()
+    q_daily, dt_daily, outdoor_daily, gas = _gas_daily_inputs(cfg)
+
+    baseline = dhw.dhw_baseline(q_daily, dt_daily, outdoor_daily)
+    if not baseline:
+        sys.exit("Not enough summer (heating-off) days cached yet for a DHW baseline.")
+    print(f"\nHot water + hob + pilot gas: {baseline['kwh_per_day']:.1f} kWh/day "
+          f"({baseline['days_used']} summer days used)")
+
+    rate_entity = cfg.get("gas_unit_rate_entity")
+    if rate_entity:
+        # Live state, not cached LTS: a tariff sensor is state_class "total"
+        # but isn't a real meter, so the recorder's long-term "sum" for it is
+        # meaningless noise (seen as ~0 GBP/kWh) - only the current state is
+        # a sensible rate. Same reasoning as the live integration's
+        # coordinator._gas_unit_rate(), which reads hass.states directly.
+        rate = None
+        try:
+            state = next(
+                (s for s in HAClient().states() if s["entity_id"] == rate_entity), None
+            )
+            if state and state["state"] not in ("unknown", "unavailable"):
+                rate = float(state["state"])
+        except Exception:
+            rate = None
+        if rate:
+            per_day = baseline["kwh_per_day"] * rate
+            print(f"Cost: £{per_day:.2f}/day (£{per_day * 365:.0f}/year "
+                  f"at {rate * 100:.1f}p/kWh)")
+        else:
+            print("\ngas_unit_rate_entity configured but its live value "
+                  "wasn't available (need a live HA connection).")
+
+    water_stat = cfg.get("water_stat")
+    if water_stat:
+        water = store.load(water_stat)
+        if water is None:
+            print("\nwater_stat configured but not cached — run `pull --lts` first.")
+        else:
+            gas_hourly = dhw.hourly_change(gas, dhw.GAS_MAX_STEP_KWH)
+            water_hourly = dhw.hourly_change(water, dhw.WATER_MAX_STEP_L)
+            wfit = dhw.fit_water_gas(gas_hourly, water_hourly)
+            if wfit:
+                print(f"\n(informational) hourly gas-vs-water regression: "
+                      f"{wfit['wh_per_litre']:.1f} Wh/L, ~{wfit['hot_fraction_pct']:.0f}% "
+                      f"of metered water is hot (R² {wfit['regression_r_squared']:.2f}, "
+                      f"{wfit['regression_hours']} hours)")
+            else:
+                print("\n(informational) not enough overlapping gas/water hours yet "
+                      "for the Wh-per-litre regression.")
+
+    corrected = dhw.corrected_hlc(q_daily, dt_daily, outdoor_daily)
+    if corrected:
+        print(f"\nDHW-corrected space-heating HLC: {corrected['hlc_w_per_k']:.0f} W/K "
+              f"(R² {corrected['r_squared']:.2f}, {corrected['days']} days)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="ha_efficiency")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -171,6 +296,8 @@ def main() -> None:
     sub.add_parser("cooling", help="per-room thermal time constants")
     sub.add_parser("hlc", help="whole-home heat loss coefficient")
     sub.add_parser("loft", help="ceiling vs roof loss analysis")
+    sub.add_parser("ventilation", help="ventilation vs fabric heat loss split (needs a CO2 sensor)")
+    sub.add_parser("dhw", help="hot-water gas cost + DHW-corrected HLC")
     args = parser.parse_args()
     {
         "discover": lambda a: discover.run(),
@@ -178,6 +305,8 @@ def main() -> None:
         "cooling": cmd_cooling,
         "hlc": cmd_hlc,
         "loft": cmd_loft,
+        "ventilation": cmd_ventilation,
+        "dhw": cmd_dhw,
     }[args.command](args)
 
 

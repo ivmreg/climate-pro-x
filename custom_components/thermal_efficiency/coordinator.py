@@ -11,8 +11,12 @@ from homeassistant.util import dt as dt_util
 
 from . import thermal_math
 from .const import (
+    CONF_BOILER_EFFICIENCY,
+    CONF_CEILING_HEIGHT,
+    CONF_CO2,
     CONF_FLOOR_AREA,
     CONF_GAS_METER,
+    CONF_GAS_UNIT_RATE,
     CONF_HEATING_POWER,
     CONF_LOFT,
     CONF_LOFT_HUMIDITY,
@@ -21,6 +25,7 @@ from .const import (
     CONF_OUTDOOR,
     CONF_ROOMS,
     CONF_TEMPERATURE,
+    CONF_WATER,
     DOMAIN,
     EXPANDING_WINDOWS_DAYS,
     UPDATE_INTERVAL_HOURS,
@@ -47,11 +52,29 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             ids.add(self.conf[CONF_LOFT])
         if self.conf.get(CONF_LOFT_HUMIDITY):
             ids.add(self.conf[CONF_LOFT_HUMIDITY])
+        if self.conf.get(CONF_CO2):
+            ids.add(self.conf[CONF_CO2])
+        if self.conf.get(CONF_WATER):
+            ids.add(self.conf[CONF_WATER])
         for room in self.conf[CONF_ROOMS].values():
             ids.add(room[CONF_TEMPERATURE])
             if room.get(CONF_HEATING_POWER):
                 ids.add(room[CONF_HEATING_POWER])
         return ids
+
+    def _gas_unit_rate(self) -> float | None:
+        """Latest GBP/kWh tariff, read live rather than from statistics - we
+        only need the current rate, not its history."""
+        entity_id = self.conf.get(CONF_GAS_UNIT_RATE)
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unknown", "unavailable"):
+            return None
+        try:
+            return float(state.state)
+        except ValueError:
+            return None
 
     async def _async_update_data(self) -> dict:
         max_days = self.conf[CONF_MAX_WINDOW_DAYS]
@@ -81,6 +104,11 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
                 ),
                 "loft_humidity": self.conf.get(CONF_LOFT_HUMIDITY),
                 "floor_area_m2": self.conf.get(CONF_FLOOR_AREA),
+                "co2": self.conf.get(CONF_CO2),
+                "ceiling_height_m": self.conf.get(CONF_CEILING_HEIGHT),
+                "water": self.conf.get(CONF_WATER),
+                "gas_unit_rate": self._gas_unit_rate(),
+                "boiler_efficiency": self.conf.get(CONF_BOILER_EFFICIENCY),
             },
             dt_util.get_default_time_zone(),
             now,

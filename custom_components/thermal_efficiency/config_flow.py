@@ -20,8 +20,12 @@ from homeassistant.helpers import selector
 from homeassistant.util import slugify
 
 from .const import (
+    CONF_BOILER_EFFICIENCY,
+    CONF_CEILING_HEIGHT,
+    CONF_CO2,
     CONF_FLOOR_AREA,
     CONF_GAS_METER,
+    CONF_GAS_UNIT_RATE,
     CONF_HEATING_POWER,
     CONF_LOFT,
     CONF_LOFT_HUMIDITY,
@@ -30,6 +34,8 @@ from .const import (
     CONF_OUTDOOR,
     CONF_ROOMS,
     CONF_TEMPERATURE,
+    CONF_WATER,
+    DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_MAX_WINDOW_DAYS,
     DOMAIN,
 )
@@ -74,6 +80,41 @@ def _global_schema(defaults: dict | None = None) -> vol.Schema:
                 )
             ),
             vol.Optional(
+                CONF_CEILING_HEIGHT,
+                description=_suggest(defaults.get(CONF_CEILING_HEIGHT)),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=1.8,
+                    max=5,
+                    step=0.05,
+                    unit_of_measurement="m",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_CO2, description=_suggest(defaults.get(CONF_CO2))
+            ): _entity_selector(device_class="carbon_dioxide"),
+            # Water history lives in an external statistic (e.g. from the
+            # Thames Water integration), not a sensor.* entity - a plain
+            # entity selector can't reach it.
+            vol.Optional(
+                CONF_WATER, description=_suggest(defaults.get(CONF_WATER))
+            ): selector.StatisticSelector(),
+            vol.Optional(
+                CONF_GAS_UNIT_RATE,
+                description=_suggest(defaults.get(CONF_GAS_UNIT_RATE)),
+            ): _entity_selector(device_class="monetary"),
+            vol.Optional(
+                CONF_BOILER_EFFICIENCY,
+                description=_suggest(
+                    defaults.get(CONF_BOILER_EFFICIENCY, DEFAULT_BOILER_EFFICIENCY)
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0.5, max=1.0, step=0.01, mode=selector.NumberSelectorMode.BOX
+                )
+            ),
+            vol.Optional(
                 CONF_MAX_WINDOW_DAYS,
                 default=defaults.get(CONF_MAX_WINDOW_DAYS, DEFAULT_MAX_WINDOW_DAYS),
             ): selector.NumberSelector(
@@ -91,6 +132,10 @@ def _normalize_global(user_input: dict) -> dict:
         data[CONF_MAX_WINDOW_DAYS] = int(data[CONF_MAX_WINDOW_DAYS])
     if CONF_FLOOR_AREA in data:
         data[CONF_FLOOR_AREA] = float(data[CONF_FLOOR_AREA])
+    if CONF_CEILING_HEIGHT in data:
+        data[CONF_CEILING_HEIGHT] = float(data[CONF_CEILING_HEIGHT])
+    if CONF_BOILER_EFFICIENCY in data:
+        data[CONF_BOILER_EFFICIENCY] = float(data[CONF_BOILER_EFFICIENCY])
     return data
 
 

@@ -11,6 +11,11 @@
           "loft_since": "Ignore loft sensor readings before this date (optional)",
           "loft_humidity": "Loft humidity sensor (optional)",
           "floor_area_m2": "Floor area in m² (optional – normalises the heat loss coefficient)",
+          "ceiling_height_m": "Ceiling height in m (optional – enables the ventilation/fabric loss split)",
+          "co2": "CO2 sensor (optional – enables the ventilation/fabric loss split)",
+          "water": "Water meter statistic, hourly (optional – enables the hot-water gas split)",
+          "gas_unit_rate": "Gas tariff sensor, GBP/kWh (optional – enables the hot-water gas cost figure)",
+          "boiler_efficiency": "Boiler efficiency, 0-1 (optional – default 0.88)",
           "max_window_days": "Maximum lookback window, in days"
         }
       },
@@ -51,6 +56,11 @@
           "loft_since": "Ignore loft sensor readings before this date (optional)",
           "loft_humidity": "Loft humidity sensor (optional)",
           "floor_area_m2": "Floor area in m² (optional – normalises the heat loss coefficient)",
+          "ceiling_height_m": "Ceiling height in m (optional – enables the ventilation/fabric loss split)",
+          "co2": "CO2 sensor (optional – enables the ventilation/fabric loss split)",
+          "water": "Water meter statistic, hourly (optional – enables the hot-water gas split)",
+          "gas_unit_rate": "Gas tariff sensor, GBP/kWh (optional – enables the hot-water gas cost figure)",
+          "boiler_efficiency": "Boiler efficiency, 0-1 (optional – default 0.88)",
           "max_window_days": "Maximum lookback window, in days"
         }
       },

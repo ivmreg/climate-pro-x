@@ -38,6 +38,23 @@ TAU_MIN_NIGHTS = 3
 LOFT_NIGHT_HOURS = range(1, 6)
 LOFT_MIN_DT = 6.0
 LOFT_MIN_HOURS = 12
+WATER_MAX_STEP_L = 1000.0  # bigger hourly steps are meter/statistics artifacts
+CO2_MIN_WINDOW_H = 4.0
+CO2_MIN_DROP_PPM = 120.0
+CO2_MIN_R2 = 0.9
+CO2_BASELINE_PCT = 0.02  # outdoor CO2 estimated as this low percentile of the series
+CO2_MIN_WINDOWS = 10
+CO2_MAX_GAP_S = 5400  # 1.5h; bigger gaps break the exponential-decay assumption
+AIR_HEAT_CAPACITY = 0.335  # Wh/(m3*K), volumetric heat capacity of air
+DEFAULT_BOILER_EFFICIENCY = 0.88
+DHW_BASELINE_MIN_DAYS = 7
+DHW_REGRESSION_MIN_HOURS = 200
+DHW_THEORETICAL_WH_PER_L = 34.8  # Wh to raise 1L by 30K, a combi's typical DHW rise
+MAINS_TANK_TEMP_C = 55.0
+MAINS_TEMP_MIN_C = 4.0
+MAINS_TEMP_MAX_C = 16.0
+MAINS_OUTDOOR_MIN_C = 2.0
+MAINS_OUTDOOR_MAX_C = 18.0
 
 
 def series_from_stats(rows: list[dict], kind: str) -> Series:
@@ -94,14 +111,27 @@ def drop_flatlines(series: Series, window: int = 24, eps: float = 0.05) -> Serie
     return out
 
 
+def hourly_change(cumulative: Series, max_step: float) -> Series:
+    """Hourly deltas from a cumulative statistics 'sum' series, dropping
+    resets (negative steps) and implausible artifacts (> max_step). Unlike
+    daily_gas_kwh's own accumulation, zero-valued hours are kept - they
+    matter for lining a fine-grained series up against another (e.g. gas
+    against water for the DHW regression).
+    """
+    out: Series = {}
+    items = sorted(cumulative.items())
+    for (_, v0), (t1, v1) in zip(items, items[1:]):
+        step = v1 - v0
+        if 0 <= step <= max_step:
+            out[t1] = step
+    return out
+
+
 def daily_gas_kwh(gas_sum: Series, tz: tzinfo) -> dict:
     """Local-date daily kWh from a cumulative statistics 'sum' series."""
     days: dict = defaultdict(float)
-    items = sorted(gas_sum.items())
-    for (_, v0), (t1, v1) in zip(items, items[1:]):
-        step = v1 - v0
-        if 0 < step <= GAS_MAX_STEP_KWH:
-            days[_local(t1, tz).date()] += step
+    for ts, step in hourly_change(gas_sum, GAS_MAX_STEP_KWH).items():
+        days[_local(ts, tz).date()] += step
     return dict(days)
 
 
@@ -115,10 +145,20 @@ def daily_delta_t(rooms: list[Series], outdoor: Series, tz: tzinfo) -> dict:
     return {d: sum(v) / len(v) for d, v in per_day.items() if len(v) >= 12}
 
 
-def fit_hlc(q_by_day: dict, dt_by_day: dict, since) -> dict | None:
+def daily_mean(series: Series, tz: tzinfo) -> dict:
+    """Local-date mean of any hourly series."""
+    per_day: dict = defaultdict(list)
+    for ts, v in series.items():
+        per_day[_local(ts, tz).date()].append(v)
+    return {d: sum(v) / len(v) for d, v in per_day.items()}
+
+
+def fit_hlc(
+    q_by_day: dict, dt_by_day: dict, since, dhw_by_day: dict | None = None
+) -> dict | None:
     days = sorted(d for d in q_by_day if d in dt_by_day and d >= since)
     pairs = [
-        (dt_by_day[d], q_by_day[d])
+        (dt_by_day[d], q_by_day[d] - (dhw_by_day.get(d, 0.0) if dhw_by_day else 0.0))
         for d in days
         if dt_by_day[d] > HLC_MIN_DT and q_by_day[d] > HLC_MIN_Q
     ]
@@ -135,8 +175,87 @@ def fit_hlc(q_by_day: dict, dt_by_day: dict, since) -> dict | None:
         "days_used": len(pairs),
         "free_gains_kwh_per_day": -intercept,
         "dhw_baseline_kwh_per_day": (
-            median(baseline_days) if len(baseline_days) >= 7 else None
+            median(baseline_days) if len(baseline_days) >= DHW_BASELINE_MIN_DAYS else None
         ),
+    }
+
+
+def dhw_baseline(
+    q_by_day: dict, dt_by_day: dict, outdoor_by_day: dict, since
+) -> dict | None:
+    """Robust hot-water+hob+pilot gas estimate: median daily gas on days
+    with negligible heating demand (mean dT < DHW_BASELINE_MAX_DT), plus the
+    mean outdoor temperature on those days (the mains-water-temperature
+    reference point `dhw_daily_kwh` scales from). Distinct from fit_hlc's own
+    `dhw_baseline_kwh_per_day` attribute, which is the same median as a cheap
+    sanity figure - this version additionally tracks the outdoor reference
+    needed for the winter mains-temperature correction below.
+    """
+    days = [
+        d for d in q_by_day
+        if d >= since and d in dt_by_day and dt_by_day[d] < DHW_BASELINE_MAX_DT
+        and d in outdoor_by_day
+    ]
+    if len(days) < DHW_BASELINE_MIN_DAYS:
+        return None
+    return {
+        "kwh_per_day": median([q_by_day[d] for d in days]),
+        "outdoor_mean": sum(outdoor_by_day[d] for d in days) / len(days),
+        "days_used": len(days),
+    }
+
+
+def mains_temp_c(outdoor_c: float) -> float:
+    """Coarse UK mains-water-temperature model (cold in winter, warmer in
+    summer, tracking outdoor air with damping). Only used as a scaling ratio
+    between the summer DHW baseline and other days, not as an absolute
+    physical claim.
+    """
+    if outdoor_c <= MAINS_OUTDOOR_MIN_C:
+        return MAINS_TEMP_MIN_C
+    if outdoor_c >= MAINS_OUTDOOR_MAX_C:
+        return MAINS_TEMP_MAX_C
+    frac = (outdoor_c - MAINS_OUTDOOR_MIN_C) / (MAINS_OUTDOOR_MAX_C - MAINS_OUTDOOR_MIN_C)
+    return MAINS_TEMP_MIN_C + frac * (MAINS_TEMP_MAX_C - MAINS_TEMP_MIN_C)
+
+
+def dhw_daily_kwh(outdoor_c: float, baseline: dict) -> float:
+    """Scale the measured summer DHW+hob+pilot baseline for a colder mains
+    supply on another day. Applies the (tank-mains) delta-T ratio to the
+    whole baseline rather than splitting out hob/pilot - a documented
+    simplification: hob/pilot doesn't depend on mains temperature, but a
+    reliable split needs more water history than a single summer provides
+    (see fit_water_gas's `hot_fraction_pct` for a data-driven split once
+    more accrues).
+    """
+    ref_dt = MAINS_TANK_TEMP_C - mains_temp_c(baseline["outdoor_mean"])
+    day_dt = MAINS_TANK_TEMP_C - mains_temp_c(outdoor_c)
+    ratio = day_dt / ref_dt if ref_dt > 0 else 1.0
+    return baseline["kwh_per_day"] * ratio
+
+
+def fit_water_gas(gas_sum: Series, water_sum: Series) -> dict | None:
+    """Informational only: hourly gas-vs-water regression, giving a rough
+    Wh-per-litre rate and the implied hot fraction of metered water. Noisy
+    (household draws are bursty and mix hot/cold) - not the basis for the
+    DHW cost figure, which comes from dhw_baseline instead.
+    """
+    gas_hourly = hourly_change(gas_sum, GAS_MAX_STEP_KWH)
+    water_hourly = hourly_change(water_sum, WATER_MAX_STEP_L)
+    common = sorted(set(gas_hourly) & set(water_hourly))
+    if len(common) < DHW_REGRESSION_MIN_HOURS:
+        return None
+    slope, _, r2 = linear_fit(
+        [water_hourly[ts] for ts in common], [gas_hourly[ts] for ts in common]
+    )
+    if slope <= 0:
+        return None
+    wh_per_litre = slope * 1000
+    return {
+        "wh_per_litre": wh_per_litre,
+        "hot_fraction_pct": min(100.0, wh_per_litre / DHW_THEORETICAL_WH_PER_L * 100),
+        "regression_r_squared": r2,
+        "regression_hours": len(common),
     }
 
 
@@ -198,6 +317,59 @@ def loft_ratio(
     return {"ratio": median(ratios), "hours_used": len(ratios)}
 
 
+def _percentile(values: list[float], pct: float) -> float:
+    s = sorted(values)
+    return s[int(pct * (len(s) - 1))]
+
+
+def air_change_rate(co2: Series, tz: tzinfo, since) -> dict | None:
+    """Whole-home air-change rate (1/h) from CO2 decay curves.
+
+    With no fresh CO2 source (room unoccupied / no combustion), indoor CO2
+    relaxes toward an outdoor baseline as C(t) = C_out + (C0-C_out)e^(-ACH t),
+    so ln(C-C_out) is linear in t with slope -ACH. Falling stretches of the
+    series are auto-detected (occupants leaving/sleeping does this several
+    times a day) and fit individually; the median ACH across clean fits is
+    reported. Measured in one room and used as a whole-home infiltration
+    proxy - a reasonable ballpark, not an exact whole-flat measurement.
+    """
+    items = sorted((ts, v) for ts, v in co2.items() if _local(ts, tz).date() >= since)
+    if len(items) < 2:
+        return None
+    baseline = _percentile([v for _, v in items], CO2_BASELINE_PCT)
+
+    fits = []
+    i, n = 0, len(items)
+    while i < n - 1:
+        j = i
+        while (
+            j + 1 < n
+            and items[j + 1][0] - items[j][0] <= CO2_MAX_GAP_S
+            and items[j + 1][1] <= items[j][1] + 2  # tolerate small sensor noise
+        ):
+            j += 1
+        window = items[i : j + 1]
+        i = j if j > i else i + 1
+        if (window[-1][0] - window[0][0]) / 3600 < CO2_MIN_WINDOW_H:
+            continue
+        if window[0][1] - baseline < CO2_MIN_DROP_PPM:
+            continue
+        excess = [v - baseline for _, v in window]
+        if min(excess) <= 0:
+            continue
+        t0 = window[0][0]
+        xs = [(ts - t0) / 3600 for ts, _ in window]
+        ys = [log(e) for e in excess]
+        slope, _, r2 = linear_fit(xs, ys)
+        if slope >= 0 or r2 < CO2_MIN_R2:
+            continue
+        fits.append(-slope)
+
+    if len(fits) < CO2_MIN_WINDOWS:
+        return None
+    return {"ach": median(fits), "windows": len(fits), "baseline_ppm": baseline}
+
+
 def compute_all(
     stats: dict[str, list[dict]],
     conf: dict,
@@ -221,18 +393,53 @@ def compute_all(
     gas = series_from_stats(stats.get(conf["gas_meter"], []), "sum") if conf.get("gas_meter") else {}
     q_by_day = daily_gas_kwh(gas, tz)
     dt_by_day = daily_delta_t(all_rooms, outdoor, tz)
+    outdoor_by_day = daily_mean(outdoor, tz)
     # Primary HLC over the full window: season-blended and stable. A
     # shorter-window "recent" estimate rides along as extra data — useful for
     # seeing improvements (draught-proofing etc.) without destabilising the
     # main sensor value in shoulder seasons.
     result["hlc"] = None
     since_full = (now - timedelta(days=windows_days[-1])).astimezone(tz).date()
+
+    # Hot water: a robust summer (heating-off) gas baseline, used both as the
+    # headline "hot water gas" cost figure and - scaled for colder winter
+    # mains water via dhw_daily_kwh - to strip DHW out of the winter HLC fit
+    # below via the space_heating_hlc_w_per_k attribute.
+    result["dhw"] = None
+    dhw_by_day: dict = {}
+    baseline = dhw_baseline(q_by_day, dt_by_day, outdoor_by_day, since_full)
+    if baseline:
+        dhw_by_day = {
+            d: dhw_daily_kwh(outdoor_by_day[d], baseline)
+            for d in q_by_day
+            if d in outdoor_by_day
+        }
+        result["dhw"] = {
+            "kwh_per_day": baseline["kwh_per_day"],
+            "days_used": baseline["days_used"],
+            "outdoor_mean": baseline["outdoor_mean"],
+        }
+        gas_rate = conf.get("gas_unit_rate")
+        if gas_rate:
+            result["dhw"]["cost_per_day_gbp"] = baseline["kwh_per_day"] * gas_rate
+            result["dhw"]["cost_per_year_gbp"] = baseline["kwh_per_day"] * gas_rate * 365
+        if conf.get("water"):
+            water = series_from_stats(stats.get(conf["water"], []), "sum")
+            water_fit = fit_water_gas(gas, water)
+            if water_fit:
+                result["dhw"].update(water_fit)
+
     fit = fit_hlc(q_by_day, dt_by_day, since_full)
     if fit:
         result["hlc"] = fit | {"window_days": windows_days[-1]}
         floor_area = conf.get("floor_area_m2")
         if floor_area:
             result["hlc"]["hlc_w_per_k_per_m2"] = fit["hlc_w_per_k"] / floor_area
+        if dhw_by_day:
+            corrected = fit_hlc(q_by_day, dt_by_day, since_full, dhw_by_day)
+            if corrected:
+                result["hlc"]["space_heating_hlc_w_per_k"] = corrected["hlc_w_per_k"]
+                result["hlc"]["space_heating_r_squared"] = corrected["r_squared"]
         for window in windows_days[:-1]:
             since = (now - timedelta(days=window)).astimezone(tz).date()
             recent = fit_hlc(q_by_day, dt_by_day, since)
@@ -241,6 +448,37 @@ def compute_all(
                 result["hlc"]["recent_window_days"] = window
                 result["hlc"]["recent_days_used"] = recent["days_used"]
                 break
+
+    # Ventilation/fabric split: air-change rate from CO2 decay curves, times
+    # the flat's volume, gives ventilation W/K; the rest of the delivered
+    # space-heating HLC is fabric (walls/windows/roof).
+    result["losses"] = None
+    if conf.get("co2") and conf.get("floor_area_m2") and conf.get("ceiling_height_m") and result["hlc"]:
+        co2 = series_from_stats(stats.get(conf["co2"], []), "mean")
+        ach_fit = air_change_rate(co2, tz, since_full)
+        if ach_fit:
+            volume = conf["floor_area_m2"] * conf["ceiling_height_m"]
+            ventilation_w_per_k = AIR_HEAT_CAPACITY * ach_fit["ach"] * volume
+            boiler_eff = conf.get("boiler_efficiency") or DEFAULT_BOILER_EFFICIENCY
+            space_heating_hlc = result["hlc"].get(
+                "space_heating_hlc_w_per_k", result["hlc"]["hlc_w_per_k"]
+            )
+            hlc_delivered = space_heating_hlc * boiler_eff
+            fabric_w_per_k = max(0.0, hlc_delivered - ventilation_w_per_k)
+            result["losses"] = {
+                "ach": ach_fit["ach"],
+                "windows": ach_fit["windows"],
+                "baseline_ppm": ach_fit["baseline_ppm"],
+                "ventilation_w_per_k": ventilation_w_per_k,
+                "fabric_w_per_k": fabric_w_per_k,
+                "hlc_delivered_w_per_k": hlc_delivered,
+                "ventilation_share_pct": (
+                    ventilation_w_per_k / hlc_delivered * 100
+                    if hlc_delivered > 0
+                    else None
+                ),
+                "boiler_efficiency_used": boiler_eff,
+            }
 
     for name, temps in room_temp.items():
         result["rooms"][name] = None

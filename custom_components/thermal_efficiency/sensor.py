@@ -24,7 +24,14 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: ThermalCoordinator = entry.runtime_data
-    entities: list[SensorEntity] = [HlcSensor(coordinator), LoftSensor(coordinator)]
+    entities: list[SensorEntity] = [
+        HlcSensor(coordinator),
+        LoftSensor(coordinator),
+        AirChangeRateSensor(coordinator),
+        VentilationLossSensor(coordinator),
+        FabricLossSensor(coordinator),
+        HotWaterGasSensor(coordinator),
+    ]
     entities += [
         RoomTauSensor(coordinator, room) for room in coordinator.conf["rooms"]
     ]
@@ -86,6 +93,17 @@ class HlcSensor(ThermalSensor):
             ),
             "recent_window_days": fit.get("recent_window_days"),
             "recent_days_used": fit.get("recent_days_used"),
+            "space_heating_hlc_w_per_k": (
+                round(fit["space_heating_hlc_w_per_k"], 1)
+                if "space_heating_hlc_w_per_k" in fit
+                else None
+            ),
+            "dhw_correction": (
+                "hot-water/hob gas estimated and subtracted before fitting"
+                if "space_heating_hlc_w_per_k" in fit
+                else "not applied - configure a gas meter and enough summer "
+                     "(heating-off) days to estimate a DHW baseline"
+            ),
         }
 
 
@@ -118,6 +136,122 @@ class LoftSensor(ThermalSensor):
             "window_days": fit["window_days"],
             "humidity_pct": (
                 round(fit["humidity_pct"], 1) if "humidity_pct" in fit else None
+            ),
+        }
+
+
+class AirChangeRateSensor(ThermalSensor):
+    _attr_unique_id = f"{DOMAIN}_air_change_rate"
+    _attr_name = "Air change rate"
+    _attr_native_unit_of_measurement = "1/h"
+    _attr_icon = "mdi:weather-windy"
+    _attr_suggested_display_precision = 2
+
+    @property
+    def native_value(self) -> float | None:
+        losses = self.coordinator.data.get("losses")
+        return round(losses["ach"], 3) if losses else None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        losses = self.coordinator.data.get("losses")
+        if not losses:
+            return {"note": "not enough clean CO2 decay windows yet - "
+                             "configure a CO2 sensor, floor area and ceiling height"}
+        return {
+            "decay_windows_used": losses["windows"],
+            "outdoor_co2_baseline_ppm": round(losses["baseline_ppm"], 0),
+        }
+
+
+class VentilationLossSensor(ThermalSensor):
+    _attr_unique_id = f"{DOMAIN}_ventilation_loss"
+    _attr_name = "Ventilation heat loss"
+    _attr_native_unit_of_measurement = "W/K"
+    _attr_icon = "mdi:door-open"
+    _attr_suggested_display_precision = 0
+
+    @property
+    def native_value(self) -> float | None:
+        losses = self.coordinator.data.get("losses")
+        return round(losses["ventilation_w_per_k"], 1) if losses else None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        losses = self.coordinator.data.get("losses")
+        if not losses:
+            return {"note": "not enough data yet"}
+        return {
+            "share_of_delivered_hlc_pct": (
+                round(losses["ventilation_share_pct"], 1)
+                if losses["ventilation_share_pct"] is not None
+                else None
+            ),
+            "air_change_rate": round(losses["ach"], 3),
+        }
+
+
+class FabricLossSensor(ThermalSensor):
+    _attr_unique_id = f"{DOMAIN}_fabric_loss"
+    _attr_name = "Fabric heat loss"
+    _attr_native_unit_of_measurement = "W/K"
+    _attr_icon = "mdi:wall"
+    _attr_suggested_display_precision = 0
+
+    @property
+    def native_value(self) -> float | None:
+        losses = self.coordinator.data.get("losses")
+        return round(losses["fabric_w_per_k"], 1) if losses else None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        losses = self.coordinator.data.get("losses")
+        if not losses:
+            return {"note": "not enough data yet"}
+        return {
+            "hlc_delivered_w_per_k": round(losses["hlc_delivered_w_per_k"], 1),
+            "boiler_efficiency_used": losses["boiler_efficiency_used"],
+        }
+
+
+class HotWaterGasSensor(ThermalSensor):
+    _attr_unique_id = f"{DOMAIN}_hot_water_gas"
+    _attr_name = "Hot water gas"
+    _attr_native_unit_of_measurement = "kWh/d"
+    _attr_icon = "mdi:water-boiler"
+    _attr_suggested_display_precision = 1
+
+    @property
+    def native_value(self) -> float | None:
+        dhw = self.coordinator.data.get("dhw")
+        return round(dhw["kwh_per_day"], 2) if dhw else None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        dhw = self.coordinator.data.get("dhw")
+        if not dhw:
+            return {"note": "not enough summer (heating-off) days yet"}
+        return {
+            "includes": "DHW + hob + pilot (no way to isolate hob/pilot "
+                        "reliably from gas alone)",
+            "days_used": dhw["days_used"],
+            "cost_per_day_gbp": (
+                round(dhw["cost_per_day_gbp"], 2)
+                if "cost_per_day_gbp" in dhw
+                else None
+            ),
+            "cost_per_year_gbp": (
+                round(dhw["cost_per_year_gbp"], 0)
+                if "cost_per_year_gbp" in dhw
+                else None
+            ),
+            "wh_per_litre": (
+                round(dhw["wh_per_litre"], 1) if "wh_per_litre" in dhw else None
+            ),
+            "hot_fraction_of_metered_water_pct": (
+                round(dhw["hot_fraction_pct"], 0)
+                if "hot_fraction_pct" in dhw
+                else None
             ),
         }
 

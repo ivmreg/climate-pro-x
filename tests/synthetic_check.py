@@ -12,7 +12,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ha_efficiency import cooling, hlc, loft
+from ha_efficiency import cooling, dhw, hlc, loft, ventilation
 
 rng = np.random.default_rng(42)
 idx = pd.date_range("2026-01-01", "2026-01-15", freq="5min", tz="Europe/London")
@@ -74,5 +74,121 @@ cumulative = q_daily.fillna(0).clip(lower=0).cumsum()
 daily_from_meter = hlc.daily_heat_input_from_meter(cumulative)
 assert (daily_from_meter.dropna() >= 0).all()
 print("meter path ok")
+
+# --- ventilation: air-change rate from CO2 decay curves ---
+ACH_TRUE = 0.25
+CO2_BASELINE_TRUE = 420.0
+co2_idx = pd.date_range("2026-01-01", "2026-01-31", freq="1h", tz="Europe/London")
+co2_vals = np.empty(len(co2_idx))
+co2_vals[0] = CO2_BASELINE_TRUE + 300
+# Every ~5th day is a fully unoccupied "quiet" day (e.g. away/weekend), so
+# CO2 genuinely reaches the true outdoor baseline sometimes. Without that, a
+# short nightly-only decay window never gets close enough to the asymptote
+# for the low-percentile baseline estimate to be unbiased - which then
+# biases the fitted ACH itself (a real property of this method: any
+# constant overestimate of the baseline compresses the tail of every decay
+# curve and skews the fitted slope steeper than truth), not a test quirk.
+quiet_day = co2_idx.dayofyear % 5 == 0
+for i in range(1, len(co2_idx)):
+    occupied = (9 <= co2_idx[i].hour < 18) and not quiet_day[i]
+    if occupied:  # CO2 rises, breaking any decay window
+        target = 1100 + rng.normal(0, 50)
+        co2_vals[i] = co2_vals[i - 1] + 0.3 * (target - co2_vals[i - 1]) + rng.normal(0, 5)
+    else:  # unoccupied: pure exponential decay at the true ACH
+        co2_vals[i] = CO2_BASELINE_TRUE + (co2_vals[i - 1] - CO2_BASELINE_TRUE) * np.exp(-ACH_TRUE)
+co2_series = pd.Series(co2_vals + rng.normal(0, 2, len(co2_idx)), index=co2_idx)
+
+vent_fit = ventilation.air_change_rate(co2_series)
+assert vent_fit, "no air-change-rate fit on synthetic CO2 data"
+assert abs(vent_fit["ach"] - ACH_TRUE) / ACH_TRUE < 0.2, vent_fit
+print(f"ventilation ach ok: {vent_fit['ach']:.2f} /h (true {ACH_TRUE}), "
+      f"{vent_fit['windows']} windows")
+
+FLOOR_AREA, CEILING = 105.0, 2.45
+split = ventilation.split_losses(
+    vent_fit["ach"], FLOOR_AREA, CEILING, HLC_TRUE, boiler_efficiency=1.0
+)
+expected_vent_w_per_k = ventilation.AIR_HEAT_CAPACITY * ACH_TRUE * FLOOR_AREA * CEILING
+assert abs(split["ventilation_w_per_k"] - expected_vent_w_per_k) / expected_vent_w_per_k < 0.25
+assert abs(split["fabric_w_per_k"] - (HLC_TRUE - split["ventilation_w_per_k"])) < 1e-6
+print(f"ventilation split ok: {split['ventilation_w_per_k']:.0f} W/K ventilation, "
+      f"{split['fabric_w_per_k']:.0f} W/K fabric")
+
+# --- dhw: mains-temperature-scaled baseline corrects a seasonally-biased HLC ---
+FABRIC_HLC_TRUE, HOB_PILOT_TRUE = 300.0, 2.0
+# Exaggerated on purpose so the correction's effect is unambiguous against
+# noise - the real effect on a typical UK combi is a much smaller, documented
+# refinement (a few W/K), not this synthetic test's ~50 kWh/day.
+DHW_SUMMER_KWH_TRUE = 50.0
+
+days = pd.date_range("2025-06-01", "2026-05-31", freq="1D", tz="Europe/London")
+rng2 = np.random.default_rng(11)
+day_of_year = days.dayofyear.values
+outdoor_daily_true = 10 + 8 * np.cos(2 * np.pi * (day_of_year - 15) / 365)
+dt_daily_true = np.clip(18 - outdoor_daily_true, 0, None) + rng2.normal(0, 0.3, len(days))
+
+outdoor_daily = pd.Series(outdoor_daily_true, index=days)
+dt_daily2 = pd.Series(dt_daily_true, index=days)
+
+summer_mask = dt_daily_true < dhw.DHW_BASELINE_MAX_DT
+outdoor_summer_mean_true = float(outdoor_daily_true[summer_mask].mean())
+baseline_true = {"kwh_per_day": DHW_SUMMER_KWH_TRUE, "outdoor_mean": outdoor_summer_mean_true}
+dhw_true = np.array([dhw.dhw_daily_kwh(o, baseline_true) for o in outdoor_daily_true])
+heating_true = FABRIC_HLC_TRUE * dt_daily_true * 24 / 1000
+q_daily2 = pd.Series(
+    (HOB_PILOT_TRUE + dhw_true + heating_true + rng2.normal(0, 0.5, len(days))).clip(min=0),
+    index=days,
+)
+
+baseline_est = dhw.dhw_baseline(q_daily2, dt_daily2, outdoor_daily)
+assert baseline_est, "no DHW baseline recovered"
+# The "summer" selection band (dt < 3K) spans a range of outdoor temps over
+# which the mains-temperature model varies, and still lets a little real
+# heating leak in (dt up to just under 3K, not exactly 0) - both genuine
+# properties of dhw_baseline's dT-threshold approximation, not test quirks.
+# So the expected median isn't simply DHW_SUMMER_KWH_TRUE + HOB_PILOT_TRUE;
+# compute it from the same (noise-free) model components actually summed
+# into q_daily2 for those days.
+expected_summer_median = float(
+    np.median(HOB_PILOT_TRUE + dhw_true[summer_mask] + heating_true[summer_mask])
+)
+assert abs(baseline_est["kwh_per_day"] - expected_summer_median) < 3, baseline_est
+print(f"dhw baseline ok: {baseline_est['kwh_per_day']:.1f} kWh/day "
+      f"(expected ~{expected_summer_median:.1f} from the model), {baseline_est['days_used']} days")
+
+raw_fit = hlc.fit_hlc(q_daily2, dt_daily2)
+assert "note" not in raw_fit, raw_fit
+raw_error = abs(raw_fit["hlc_w_per_k"] - FABRIC_HLC_TRUE)
+
+corrected_fit = dhw.corrected_hlc(q_daily2, dt_daily2, outdoor_daily)
+assert corrected_fit, "no DHW-corrected HLC fit"
+corrected_error = abs(corrected_fit["hlc_w_per_k"] - FABRIC_HLC_TRUE)
+
+assert raw_error > 15, f"expected the uncorrected fit visibly biased by the synthetic DHW signal, got {raw_error:.1f} W/K off"
+assert corrected_error < 10, f"expected the DHW correction to recover the true fabric HLC, got {corrected_error:.1f} W/K off"
+assert corrected_error < raw_error, "DHW correction should reduce, not increase, the HLC bias"
+print(f"dhw correction ok: raw HLC {raw_fit['hlc_w_per_k']:.0f} W/K (off by {raw_error:.0f}) "
+      f"-> corrected {corrected_fit['hlc_w_per_k']:.0f} W/K (off by {corrected_error:.0f}), "
+      f"true fabric HLC {FABRIC_HLC_TRUE:.0f} W/K")
+
+# --- fit_water_gas: hourly gas-vs-water regression recovers a known Wh/L rate ---
+WH_PER_L_TRUE, HOB_PILOT_HOURLY_TRUE = 18.0, 0.1
+water_idx = pd.date_range("2026-02-01", periods=24 * 40, freq="1h", tz="UTC")
+rng3 = np.random.default_rng(13)
+water_hourly_true = np.clip(rng3.exponential(3.0, len(water_idx)) - 2.0, 0, None)
+gas_hourly_true = (
+    HOB_PILOT_HOURLY_TRUE + WH_PER_L_TRUE / 1000 * water_hourly_true
+    + rng3.normal(0, 0.02, len(water_idx))
+).clip(min=0)
+gas_cum = pd.Series(gas_hourly_true, index=water_idx).cumsum() + 500.0
+water_cum = pd.Series(water_hourly_true, index=water_idx).cumsum() + 1000.0
+
+gas_hourly = dhw.hourly_change(gas_cum, dhw.GAS_MAX_STEP_KWH)
+water_hourly = dhw.hourly_change(water_cum, dhw.WATER_MAX_STEP_L)
+water_fit = dhw.fit_water_gas(gas_hourly, water_hourly)
+assert water_fit, "no water regression fit"
+assert abs(water_fit["wh_per_litre"] - WH_PER_L_TRUE) / WH_PER_L_TRUE < 0.15, water_fit
+print(f"fit_water_gas ok: {water_fit['wh_per_litre']:.1f} Wh/L (true {WH_PER_L_TRUE}), "
+      f"R² {water_fit['regression_r_squared']:.2f}, {water_fit['regression_hours']} hours")
 
 print("\nall checks passed")
