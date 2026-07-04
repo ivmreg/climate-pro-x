@@ -200,6 +200,7 @@ def _room_details_schema(
     room: dict | None,
     ask_add_another: bool,
     default_add_another: bool = True,
+    allow_remove: bool = False,
 ) -> vol.Schema:
     room = room or {}
     schema: dict = {
@@ -211,6 +212,8 @@ def _room_details_schema(
             CONF_HEATING_POWER, description=_suggest(room.get(CONF_HEATING_POWER))
         ): _entity_selector(),
     }
+    if allow_remove:
+        schema[vol.Optional("remove_room", default=False)] = selector.BooleanSelector()
     if ask_add_another:
         schema[vol.Required("add_another", default=default_add_another)] = (
             selector.BooleanSelector()
@@ -338,9 +341,11 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
     async def async_step_room(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        """Review/edit one pre-existing room."""
+        """Review/edit one pre-existing room, or drop it from the config."""
         errors: dict[str, str] = {}
         if user_input is not None:
+            if user_input.get("remove_room"):
+                return await self._async_advance_room()
             slug, errors = _validate_room_name(user_input["name"], self._rooms)
             if slug:
                 self._rooms[slug] = _room_from_input(user_input)
@@ -348,7 +353,9 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         name, room = self._current_room
         return self.async_show_form(
             step_id="room",
-            data_schema=_room_details_schema(name, room, ask_add_another=False),
+            data_schema=_room_details_schema(
+                name, room, ask_add_another=False, allow_remove=True
+            ),
             errors=errors,
         )
 

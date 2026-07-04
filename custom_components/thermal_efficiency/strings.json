@@ -66,11 +66,12 @@
       },
       "room": {
         "title": "Review existing room",
-        "description": "Reviewing your existing rooms, one at a time - fix an entity if needed, or just continue.",
+        "description": "Reviewing your existing rooms, one at a time - fix an entity, tick \"Remove this room\" to drop it, or just continue.",
         "data": {
           "name": "Room name",
           "temperature": "Temperature sensor",
-          "heating_power": "Heating power sensor (optional)"
+          "heating_power": "Heating power sensor (optional)",
+          "remove_room": "Remove this room"
         }
       },
       "new_room": {
