@@ -44,38 +44,51 @@ def night_windows(index: pd.DatetimeIndex, night_start: str, night_end: str):
 
 
 def fit_window(room: pd.Series, outdoor: pd.Series) -> NightFit | None:
-    room, outdoor = room.dropna(), outdoor.dropna()
-    if room.empty or outdoor.empty:
+    aligned = pd.concat([room.rename("room"), outdoor.rename("outdoor")], axis=1).dropna()
+    if aligned.empty:
+        return None
+    room, outdoor = aligned.room, aligned.outdoor
+    gaps = room.index.to_series().diff().dropna()
+    if not gaps.empty and gaps.max() > pd.Timedelta("10min"):
         return None
     hours = (room.index[-1] - room.index[0]).total_seconds() / 3600
     if hours < MIN_WINDOW_HOURS:
         return None
-    t_out = outdoor.mean()
-    excess = room - t_out
+    excess = room - outdoor
     if excess.min() < MIN_DELTA_T:
         return None
     if room.iloc[0] - room.iloc[-1] < MIN_DROP:
         return None  # not cooling (heating on, or fully insulated night)
 
-    t = (room.index - room.index[0]).total_seconds() / 3600
-    y = np.log(excess.values)
-    slope, intercept = np.polyfit(t, y, 1)
-    if slope >= 0:
-        return None
-    pred = slope * t + intercept
-    ss_res = float(np.sum((y - pred) ** 2))
-    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    elapsed = room.index.to_series().diff().dt.total_seconds().div(3600).to_numpy()
+    room_values = room.to_numpy(dtype=float)
+    outdoor_values = outdoor.to_numpy(dtype=float)
+    best_tau = None
+    best_residual = float("inf")
+    for tau in np.arange(1.0, 200.25, 0.25):
+        predicted = np.empty(len(room_values))
+        predicted[0] = room_values[0]
+        for i in range(1, len(room_values)):
+            boundary = (outdoor_values[i - 1] + outdoor_values[i]) / 2
+            predicted[i] = boundary + (predicted[i - 1] - boundary) * np.exp(
+                -elapsed[i] / tau
+            )
+        residual = float(np.sum((room_values - predicted) ** 2))
+        if residual < best_residual:
+            best_tau, best_residual = float(tau), residual
+    ss_res = best_residual
+    ss_tot = float(np.sum((room_values - room_values.mean()) ** 2))
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    if r2 < 0.8:
+    if best_tau is None or r2 < 0.8:
         return None  # non-exponential (door opened, sun, heating blip)
 
     return NightFit(
         date=str(room.index[0].date()),
-        tau_hours=-1 / slope,
+        tau_hours=best_tau,
         r_squared=r2,
         t_start=float(room.iloc[0]),
         t_end=float(room.iloc[-1]),
-        outdoor_mean=float(t_out),
+        outdoor_mean=float(outdoor.mean()),
     )
 
 
@@ -91,7 +104,7 @@ def analyse_room(
         window = room[start:end]
         if heating is not None:
             h = heating[start:end].dropna()
-            if h.empty or h.max() > MAX_HEATING_PCT:
+            if len(h) / max(len(window), 1) < 0.8 or h.max() > MAX_HEATING_PCT:
                 continue  # heating ran during the window — not a free cooldown
         fit = fit_window(window, outdoor[start:end])
         if fit:

@@ -15,12 +15,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from ha_efficiency import cooling, dhw, hlc, loft, ventilation
 
 rng = np.random.default_rng(42)
-idx = pd.date_range("2026-01-01", "2026-01-15", freq="5min", tz="Europe/London")
+idx = pd.date_range("2026-01-01", "2026-02-15", freq="5min", tz="Europe/London")
 hours = np.arange(len(idx)) * 5 / 60
 
 # Outdoor: 5 degC mean, +-4 daily swing, slow weather drift
 outdoor = pd.Series(
     5 + 4 * np.sin(2 * np.pi * (hours - 15) / 24)
+    + 4 * np.sin(2 * np.pi * hours / (24 * 11))
     + np.cumsum(rng.normal(0, 0.01, len(idx))),
     index=idx,
 )

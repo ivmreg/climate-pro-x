@@ -8,6 +8,7 @@
 Run: .venv/bin/python tests/integration_math_check.py
 """
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +69,8 @@ conf = {
     "outdoor": "sensor.out",
     "gas_meter": "sensor.gas",
     "loft": "sensor.loft",
+    # The synthetic gas input below is already expressed as delivered heat.
+    "boiler_efficiency": 1.0,
 }
 
 HLC_TRUE, GAINS = 300.0, 5.0
@@ -138,14 +141,14 @@ loft_relocated = pd.Series(
 stats_relocated = stats | {"sensor.loft": to_stats_rows(loft_relocated, "mean")}
 
 result_no_cutoff = tm.compute_all(stats_relocated, conf, TZ, now, (60,))
-assert abs(result_no_cutoff["loft"]["ratio"] - R_TRUE) > 0.3, \
-    "expected contaminated pre-move data to skew the ratio"
+assert result_no_cutoff["loft"] is None, \
+    "physically impossible contaminated loft history should be suppressed"
 
 conf_since = conf | {"loft_since": move_date}
 result_cutoff = tm.compute_all(stats_relocated, conf_since, TZ, now, (60,))
 assert abs(result_cutoff["loft"]["ratio"] - R_TRUE) < 0.05, result_cutoff["loft"]
-print(f"loft_since ok: uncut ratio {result_no_cutoff['loft']['ratio']:.2f} "
-      f"(true {R_TRUE}) -> cut ratio {result_cutoff['loft']['ratio']:.2f}")
+print(f"loft_since ok: contaminated uncut history suppressed "
+      f"-> cut ratio {result_cutoff['loft']['ratio']:.2f}")
 
 # loft_humidity: informational attribute alongside the ratio
 humidity = pd.Series(55 + 5 * np.sin(2 * np.pi * hours / 24), index=idx)
@@ -274,7 +277,10 @@ print(f"thermal_math fit_water_gas ok: {water_fit2['wh_per_litre']:.1f} Wh/L "
       f"{water_fit2['regression_hours']} hours")
 
 # ---------- 2. real cached winter data ----------
-import os
+if os.environ.get("SKIP_REAL_CACHE_CHECK") == "1":
+    print("real-cache cross-check skipped by environment")
+    raise SystemExit(0)
+
 os.chdir(ROOT)
 from ha_efficiency import store
 
@@ -295,6 +301,7 @@ real_conf = {
     "water": "thames_water:thameswater_consumption",
     "floor_area_m2": 105.0,
     "ceiling_height_m": 2.45,
+    "boiler_efficiency": 0.88,
     # Live tariff snapshot - its own LTS history is unusable (a price sensor
     # isn't a real meter, so the recorder's long-term "sum" for it is noise
     # around 0 GBP/kWh; see the offline `dhw` command, which fetches this
@@ -320,7 +327,10 @@ print(f"\nreal hlc: {hlc['hlc_w_per_k']:.0f} W/K, R² {hlc['r_squared']:.2f}, "
       f"dhw baseline {hlc['dhw_baseline_kwh_per_day']:.1f} kWh/d, "
       f"recent {hlc.get('recent_hlc_w_per_k', float('nan')):.0f} W/K "
       f"over {hlc.get('recent_window_days')}d")
-assert abs(hlc["hlc_w_per_k"] - 356) < 30, "diverges from offline toolkit result"
+assert abs(hlc["fuel_input_hlc_w_per_k"] - 356) < 30, \
+    "gas-side diagnostic diverges from the earlier result"
+assert abs(hlc["hlc_w_per_k"] - 303) < 35, \
+    "delivered HLC diverges from the efficiency-adjusted result"
 
 loft_fit = real["loft"]
 assert loft_fit, "no loft fit on real data"

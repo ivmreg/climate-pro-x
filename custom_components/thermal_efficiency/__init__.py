@@ -24,6 +24,8 @@ from .const import (
     CONF_LOFT_SINCE,
     CONF_MAX_WINDOW_DAYS,
     CONF_OUTDOOR,
+    CONF_OUTDOOR_CO2,
+    CONF_OUTDOOR_CO2_SENSOR,
     CONF_ROOMS,
     CONF_TEMPERATURE,
     CONF_WATER,
@@ -53,12 +55,19 @@ ROOM_SCHEMA = vol.Schema(
     }
 )
 
+
+def _bounded_float(minimum: float, maximum: float):
+    """Coerce a numeric configuration value and enforce physical bounds."""
+    return vol.All(vol.Coerce(float), vol.Range(min=minimum, max=maximum))
+
 CONFIG_SCHEMA = vol.Schema(
     {
         DOMAIN: vol.Schema(
             {
                 vol.Required(CONF_OUTDOOR): cv.entity_id,
-                vol.Required(CONF_ROOMS): {cv.slug: ROOM_SCHEMA},
+                vol.Required(CONF_ROOMS): vol.All(
+                    {cv.slug: ROOM_SCHEMA}, vol.Length(min=1)
+                ),
                 vol.Optional(CONF_GAS_METER): cv.entity_id,
                 vol.Optional(CONF_LOFT): cv.entity_id,
                 # Loft sensor history before this date is ignored - protects
@@ -66,9 +75,11 @@ CONFIG_SCHEMA = vol.Schema(
                 # earlier readings are from wherever it used to live).
                 vol.Optional(CONF_LOFT_SINCE): _loft_since,
                 vol.Optional(CONF_LOFT_HUMIDITY): cv.entity_id,
-                vol.Optional(CONF_FLOOR_AREA): vol.Coerce(float),
-                vol.Optional(CONF_CEILING_HEIGHT): vol.Coerce(float),
-                vol.Optional(CONF_CO2): cv.entity_id,
+                vol.Optional(CONF_FLOOR_AREA): _bounded_float(1.0, 2000.0),
+                vol.Optional(CONF_CEILING_HEIGHT): _bounded_float(1.8, 10.0),
+                vol.Optional(CONF_CO2): vol.Any(cv.entity_id, [cv.entity_id]),
+                vol.Optional(CONF_OUTDOOR_CO2): _bounded_float(350.0, 550.0),
+                vol.Optional(CONF_OUTDOOR_CO2_SENSOR): cv.entity_id,
                 # A statistic id, not an entity - the water history is an
                 # external statistic (e.g. thames_water:thameswater_consumption)
                 # rather than a sensor.* entity.
@@ -76,10 +87,10 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional(CONF_GAS_UNIT_RATE): cv.entity_id,
                 vol.Optional(
                     CONF_BOILER_EFFICIENCY, default=DEFAULT_BOILER_EFFICIENCY
-                ): vol.Coerce(float),
+                ): _bounded_float(0.5, 1.0),
                 vol.Optional(
                     CONF_MAX_WINDOW_DAYS, default=DEFAULT_MAX_WINDOW_DAYS
-                ): cv.positive_int,
+                ): vol.All(cv.positive_int, vol.Range(min=30, max=730)),
             }
         )
     },

@@ -33,7 +33,16 @@ def loft_ratio(
     if len(df) < 12:
         return {"hours_used": len(df), "ratio": float("nan"),
                 "note": "Not enough cold night hours in the data yet."}
-    ratio = ((df["loft"] - df["out"]) / dt).median()
+    ratios = (df["loft"] - df["out"]) / dt
+    ratio = ratios.median()
+    iqr = ratios.quantile(0.75) - ratios.quantile(0.25)
+    out_of_range_pct = float(((ratios < 0) | (ratios > 1)).mean() * 100)
+    if not 0 <= ratio <= 1 or iqr > 0.5 or out_of_range_pct > 20:
+        return {
+            "hours_used": int(len(df)),
+            "ratio": float("nan"),
+            "note": "Loft observations failed physical bounds or stability checks.",
+        }
     if ratio > 0.5:
         verdict = ("loft stays warm: the ceiling is the weak link — "
                    "loft floor insulation should give a direct win")
@@ -43,4 +52,10 @@ def loft_ratio(
         verdict = ("loft tracks outdoor temperature: ceiling already "
                    "insulating well (or loft is very ventilated); "
                    "walls/windows are likely the bigger losses")
-    return {"hours_used": int(len(df)), "ratio": float(ratio), "verdict": verdict}
+    return {
+        "hours_used": int(len(df)),
+        "ratio": float(ratio),
+        "iqr": float(iqr),
+        "out_of_range_pct": out_of_range_pct,
+        "verdict": verdict,
+    }

@@ -5,6 +5,12 @@ from datetime import timedelta
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
+from homeassistant.const import (
+    ATTR_UNIT_OF_MEASUREMENT,
+    UnitOfEnergy,
+    UnitOfTemperature,
+    UnitOfVolume,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -23,6 +29,8 @@ from .const import (
     CONF_LOFT_SINCE,
     CONF_MAX_WINDOW_DAYS,
     CONF_OUTDOOR,
+    CONF_OUTDOOR_CO2,
+    CONF_OUTDOOR_CO2_SENSOR,
     CONF_ROOMS,
     CONF_TEMPERATURE,
     CONF_WATER,
@@ -52,8 +60,13 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             ids.add(self.conf[CONF_LOFT])
         if self.conf.get(CONF_LOFT_HUMIDITY):
             ids.add(self.conf[CONF_LOFT_HUMIDITY])
-        if self.conf.get(CONF_CO2):
-            ids.add(self.conf[CONF_CO2])
+        co2 = self.conf.get(CONF_CO2)
+        if isinstance(co2, str):
+            ids.add(co2)
+        elif co2:
+            ids.update(co2)
+        if self.conf.get(CONF_OUTDOOR_CO2_SENSOR):
+            ids.add(self.conf[CONF_OUTDOOR_CO2_SENSOR])
         if self.conf.get(CONF_WATER):
             ids.add(self.conf[CONF_WATER])
         for room in self.conf[CONF_ROOMS].values():
@@ -63,8 +76,12 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         return ids
 
     def _gas_unit_rate(self) -> float | None:
-        """Latest GBP/kWh tariff, read live rather than from statistics - we
-        only need the current rate, not its history."""
+        """Return the latest tariff normalized to GBP/kWh.
+
+        Tariff integrations commonly expose either pounds or pence per kWh.
+        Silently treating the latter as pounds creates a 100x cost error, so an
+        unknown or missing unit is rejected instead of guessed.
+        """
         entity_id = self.conf.get(CONF_GAS_UNIT_RATE)
         if not entity_id:
             return None
@@ -72,9 +89,34 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         if state is None or state.state in ("unknown", "unavailable"):
             return None
         try:
-            return float(state.state)
+            value = float(state.state)
         except ValueError:
             return None
+        if value < 0:
+            return None
+
+        unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+        if not isinstance(unit, str):
+            _LOGGER.warning(
+                "Gas tariff %s has no unit; expected GBP/kWh or p/kWh",
+                entity_id,
+            )
+            return None
+
+        normalized = unit.casefold().replace(" ", "")
+        if normalized in {"gbp/kwh", "£/kwh"}:
+            return value
+        if normalized in {"p/kwh", "pence/kwh"}:
+            return value / 100.0
+        if normalized in {"gbp/mwh", "£/mwh"}:
+            return value / 1000.0
+
+        _LOGGER.warning(
+            "Gas tariff %s uses unsupported unit %s; expected GBP/kWh or p/kWh",
+            entity_id,
+            unit,
+        )
+        return None
 
     async def _async_update_data(self) -> dict:
         max_days = self.conf[CONF_MAX_WINDOW_DAYS]
@@ -87,7 +129,11 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             now,
             self._statistic_ids(),
             "hour",
-            None,
+            {
+                "energy": UnitOfEnergy.KILO_WATT_HOUR,
+                "temperature": UnitOfTemperature.CELSIUS,
+                "volume": UnitOfVolume.LITERS,
+            },
             {"mean", "sum"},
         )
         return thermal_math.compute_all(
@@ -105,6 +151,8 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
                 "loft_humidity": self.conf.get(CONF_LOFT_HUMIDITY),
                 "floor_area_m2": self.conf.get(CONF_FLOOR_AREA),
                 "co2": self.conf.get(CONF_CO2),
+                "outdoor_co2_ppm": self.conf.get(CONF_OUTDOOR_CO2),
+                "outdoor_co2_sensor": self.conf.get(CONF_OUTDOOR_CO2_SENSOR),
                 "ceiling_height_m": self.conf.get(CONF_CEILING_HEIGHT),
                 "water": self.conf.get(CONF_WATER),
                 "gas_unit_rate": self._gas_unit_rate(),

@@ -32,6 +32,8 @@ from .const import (
     CONF_LOFT_SINCE,
     CONF_MAX_WINDOW_DAYS,
     CONF_OUTDOOR,
+    CONF_OUTDOOR_CO2,
+    CONF_OUTDOOR_CO2_SENSOR,
     CONF_ROOMS,
     CONF_TEMPERATURE,
     CONF_WATER,
@@ -49,26 +51,33 @@ def _suggest(value: Any) -> dict:
     return {"suggested_value": value} if value is not None else {}
 
 
+def _suggest_list(value: Any) -> dict:
+    """Normalize legacy scalar values for a multiple-entity selector."""
+    if value is None:
+        return {}
+    return {"suggested_value": value if isinstance(value, list) else [value]}
+
+
 def _global_schema(defaults: dict | None = None) -> vol.Schema:
     defaults = defaults or {}
     return vol.Schema(
         {
             vol.Required(
                 CONF_OUTDOOR, description=_suggest(defaults.get(CONF_OUTDOOR))
-            ): _entity_selector(),
+            ): _entity_selector(device_class="temperature"),
             vol.Optional(
                 CONF_GAS_METER, description=_suggest(defaults.get(CONF_GAS_METER))
-            ): _entity_selector(),
+            ): _entity_selector(device_class="energy"),
             vol.Optional(
                 CONF_LOFT, description=_suggest(defaults.get(CONF_LOFT))
-            ): _entity_selector(),
+            ): _entity_selector(device_class="temperature"),
             vol.Optional(
                 CONF_LOFT_SINCE, description=_suggest(defaults.get(CONF_LOFT_SINCE))
             ): selector.DateSelector(),
             vol.Optional(
                 CONF_LOFT_HUMIDITY,
                 description=_suggest(defaults.get(CONF_LOFT_HUMIDITY)),
-            ): _entity_selector(),
+            ): _entity_selector(device_class="humidity"),
             vol.Optional(
                 CONF_FLOOR_AREA, description=_suggest(defaults.get(CONF_FLOOR_AREA))
             ): selector.NumberSelector(
@@ -92,7 +101,23 @@ def _global_schema(defaults: dict | None = None) -> vol.Schema:
                 )
             ),
             vol.Optional(
-                CONF_CO2, description=_suggest(defaults.get(CONF_CO2))
+                CONF_CO2, description=_suggest_list(defaults.get(CONF_CO2))
+            ): _entity_selector(device_class="carbon_dioxide", multiple=True),
+            vol.Optional(
+                CONF_OUTDOOR_CO2,
+                description=_suggest(defaults.get(CONF_OUTDOOR_CO2)),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=350,
+                    max=550,
+                    step=1,
+                    unit_of_measurement="ppm",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
+            vol.Optional(
+                CONF_OUTDOOR_CO2_SENSOR,
+                description=_suggest(defaults.get(CONF_OUTDOOR_CO2_SENSOR)),
             ): _entity_selector(device_class="carbon_dioxide"),
             # Water history lives in an external statistic (e.g. from the
             # Thames Water integration), not a sensor.* entity - a plain
@@ -136,6 +161,8 @@ def _normalize_global(user_input: dict) -> dict:
         data[CONF_CEILING_HEIGHT] = float(data[CONF_CEILING_HEIGHT])
     if CONF_BOILER_EFFICIENCY in data:
         data[CONF_BOILER_EFFICIENCY] = float(data[CONF_BOILER_EFFICIENCY])
+    if CONF_OUTDOOR_CO2 in data:
+        data[CONF_OUTDOOR_CO2] = float(data[CONF_OUTDOOR_CO2])
     return data
 
 
@@ -208,7 +235,7 @@ def _room_details_schema(
         vol.Required("name", description=_suggest(name)): selector.TextSelector(),
         vol.Required(
             CONF_TEMPERATURE, description=_suggest(room.get(CONF_TEMPERATURE))
-        ): _entity_selector(),
+        ): _entity_selector(device_class="temperature"),
         vol.Optional(
             CONF_HEATING_POWER, description=_suggest(room.get(CONF_HEATING_POWER))
         ): _entity_selector(),

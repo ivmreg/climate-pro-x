@@ -18,6 +18,13 @@ boiler_efficiency: 0.88
 # of the delivered HLC). co2_entity needs a real CO2 sensor with a season of
 # history; floor_area_m2 is also used here (not just for HLC/m2 below).
 co2_entity: null
+# Additional indoor sensors are fitted independently; the median valid ACH is
+# used so a single atypical room does not control the estimate.
+co2_entities: []
+# Optional measured/assumed outdoor baseline. When omitted, the lowest indoor
+# observations are used as a noisier fallback.
+outdoor_co2_ppm: null
+outdoor_co2_entity: null
 floor_area_m2: null
 ceiling_height_m: null
 

@@ -22,15 +22,23 @@ CO2_BASELINE_PCT = 0.02  # outdoor CO2 estimated as this low percentile of the s
 CO2_MIN_WINDOWS = 10
 CO2_MAX_GAP = pd.Timedelta("1.5h")  # bigger gaps break the exponential-decay assumption
 AIR_HEAT_CAPACITY = 0.335  # Wh/(m3*K), volumetric heat capacity of air
+MIN_ACH = 0.05
+MAX_ACH = 3.0
 
 
-def air_change_rate(co2: pd.Series) -> dict | None:
+def air_change_rate(
+    co2: pd.Series, outdoor_baseline_ppm: float | None = None
+) -> dict | None:
     """Median air-change rate (1/h) from CO2 decay curves; see module
     docstring for the model."""
     co2 = co2.dropna().sort_index()
     if len(co2) < 2:
         return None
-    baseline = float(co2.quantile(CO2_BASELINE_PCT))
+    baseline = (
+        float(outdoor_baseline_ppm)
+        if outdoor_baseline_ppm is not None
+        else float(co2.quantile(CO2_BASELINE_PCT))
+    )
 
     times, values = co2.index, co2.values
     n = len(co2)
@@ -61,7 +69,10 @@ def air_change_rate(co2: pd.Series) -> dict | None:
 
     if len(fits) < CO2_MIN_WINDOWS:
         return None
-    return {"ach": float(np.median(fits)), "windows": len(fits), "baseline_ppm": baseline}
+    ach = float(np.median(fits))
+    if not MIN_ACH <= ach <= MAX_ACH:
+        return None
+    return {"ach": ach, "windows": len(fits), "baseline_ppm": baseline}
 
 
 def split_losses(
@@ -70,12 +81,20 @@ def split_losses(
     ceiling_height_m: float,
     space_heating_hlc_w_per_k: float,
     boiler_efficiency: float = 0.88,
-) -> dict:
+) -> dict | None:
     """Ventilation vs fabric split of the delivered space-heating HLC."""
     volume = floor_area_m2 * ceiling_height_m
     ventilation_w_per_k = AIR_HEAT_CAPACITY * ach * volume
     hlc_delivered = space_heating_hlc_w_per_k * boiler_efficiency
-    fabric_w_per_k = max(0.0, hlc_delivered - ventilation_w_per_k)
+    if (
+        ach < 0
+        or floor_area_m2 <= 0
+        or ceiling_height_m <= 0
+        or hlc_delivered <= 0
+        or ventilation_w_per_k > hlc_delivered
+    ):
+        return None
+    fabric_w_per_k = hlc_delivered - ventilation_w_per_k
     return {
         "ventilation_w_per_k": ventilation_w_per_k,
         "fabric_w_per_k": fabric_w_per_k,

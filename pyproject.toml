@@ -1,0 +1,26 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "-ra --strict-config --strict-markers --cov=ha_efficiency.cooling --cov=ha_efficiency.dhw --cov=ha_efficiency.hlc --cov=ha_efficiency.loft --cov=ha_efficiency.store --cov=ha_efficiency.ventilation --cov=custom_components --cov-branch --cov-report=term-missing"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+branch = true
+omit = [
+  "tests/*",
+  "ha_efficiency/__main__.py",
+  "custom_components/thermal_efficiency/__init__.py",
+  "custom_components/thermal_efficiency/config_flow.py",
+  "custom_components/thermal_efficiency/const.py",
+  "custom_components/thermal_efficiency/coordinator.py",
+  "custom_components/thermal_efficiency/sensor.py",
+]
+
+[tool.coverage.report]
+fail_under = 80
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]
+show_missing = true

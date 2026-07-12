@@ -25,7 +25,7 @@ views:
 
           - type: gauge
             entity: sensor.thermal_efficiency_heat_loss_coefficient
-            name: Heat loss coefficient
+            name: Delivered heat loss coefficient
             min: 0
             max: 500
             needle: true
@@ -42,41 +42,44 @@ views:
                 color: "#e53935" # very poor
 
           - type: markdown
-            title: What to do about it
+            title: Evidence summary
             content: >-
               {% set s = 'sensor.thermal_efficiency_heat_loss_coefficient' %}
               {% set hlc = states(s) | float(0) %}
               {% set rating = state_attr(s, 'rating') %}
-              {% set sh = state_attr(s, 'space_heating_hlc_w_per_k') %}
+              {% set status = state_attr(s, 'status') %}
+              {% set days = state_attr(s, 'days_used') %}
+              {% set low = state_attr(s, 'confidence_interval_low_w_per_k') %}
+              {% set high = state_attr(s, 'confidence_interval_high_w_per_k') %}
               {% set fabric = states('sensor.metahome_thermal_efficiency_fabric_heat_loss') | float(0) %}
               {% set share = state_attr('sensor.metahome_thermal_efficiency_ventilation_heat_loss',
                                         'share_of_delivered_hlc_pct') | float(0) %}
               {% set ach = states('sensor.metahome_thermal_efficiency_air_change_rate') | float(0) %}
               {% set loft = states('sensor.thermal_efficiency_loft_ratio') | float(1) %}
 
-              **{{ hlc | round(0) }} W/K — {{ rating }}**
-              {%- if sh %} (space heating only: {{ sh | round(0) }} W/K){% endif %}.
+              **{{ hlc | round(0) }} W/K delivered — {{ rating }}**
+              ({{ status }}, {{ days }} days{% if low and high %}, approximate
+              95% interval {{ low | round(0) }}–{{ high | round(0) }} W/K{% endif %}).
 
-              {% if share < 15 -%}
-              Draughts are only **{{ share | round(0) }}%** of the loss —
-              draught-proofing won't pay. Walls & windows
-              ({{ fabric | round(0) }} W/K) are the retrofit target.
-              {%- else -%}
-              Ventilation is **{{ share | round(0) }}%** of the loss —
-              draught-proofing is worth pricing up alongside insulation.
+              {% if share -%}
+              The room-derived CO₂ proxy assigns **{{ share | round(0) }}%**
+              to ventilation and {{ fabric | round(0) }} W/K to fabric. Treat
+              this split as exploratory: one room may not represent whole-home
+              air mixing.
+              {%- else %}
+              No physically consistent ventilation/fabric split is available.
               {%- endif %}
 
-              {% if ach and ach < 0.4 -%}
-              ⚠️ Air-change rate {{ ach }}/h is below the ~0.5/h health
-              guideline — keep an eye on bedroom CO₂ overnight.
+              {% if ach -%}
+              Room-derived decay estimate: **{{ ach }}/h**. This is not a
+              compliance ventilation measurement.
               {%- endif %}
 
-              {% if loft < 0.3 -%}
-              Ceiling/loft already performs well — loft insulation is low
-              priority.
+              {% if loft -%}
+              Loft ratio: **{{ loft | round(2) }}**. It describes observed
+              temperature coupling and does not by itself establish insulation
+              payback.
               {%- endif %}
-
-              *Rule of thumb at your tariff: every 10 W/K removed ≈ £30/yr.*
 
       # ------------------------------------------------------------------
       - type: grid
@@ -99,29 +102,29 @@ views:
 
           - type: gauge
             entity: sensor.metahome_thermal_efficiency_air_change_rate
-            name: Air changes per hour
+            name: Room-derived ACH proxy
             min: 0
             max: 1.5
             needle: true
             segments:
               - from: 0
-                color: "#fb8c00" # too airtight for health (<0.35)
+                color: "#fb8c00"
               - from: 0.35
-                color: "#2e7d32" # healthy band
+                color: "#2e7d32"
               - from: 0.7
-                color: "#fdd835" # getting draughty
+                color: "#fdd835"
               - from: 1.0
-                color: "#e53935" # leaky
+                color: "#e53935"
 
           - type: markdown
-            title: Hot water & cooking gas
+            title: Non-space-heating gas baseline
             content: >-
               {% set s = 'sensor.metahome_thermal_efficiency_hot_water_gas' %}
               **{{ states(s) }} kWh/day**
-              → £{{ state_attr(s, 'cost_per_day_gbp') }}/day,
-              **£{{ state_attr(s, 'cost_per_year_gbp') | round(0) }}/yr**
-              (pure hot water — the hob is electric; from
-              {{ state_attr(s, 'days_used') }} heating-off days).
+              → £{{ state_attr(s, 'cost_per_day_gbp') }}/baseline day,
+              **£{{ state_attr(s, 'cost_per_year_gbp') | round(0) }}/modelled yr**.
+              Includes hot water plus any gas cooking or pilot load; estimated
+              from {{ state_attr(s, 'days_used') }} low-heating days.
 
       # ------------------------------------------------------------------
       - type: grid
@@ -146,7 +149,7 @@ views:
             columns:
               - name: Room
                 data: friendly_name
-                modify: x.replace(' time constant','').replace('Thermal Efficiency ','')
+                modify: x.replace(' effective overnight cooling time constant','').replace('Thermal Efficiency ','')
               - name: τ (h)
                 data: state
               - name: Nights fitted

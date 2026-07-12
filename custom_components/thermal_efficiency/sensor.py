@@ -10,14 +10,6 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import ThermalCoordinator
 
-HLC_BANDS = (
-    (100, "excellent"),
-    (180, "good"),
-    (280, "typical solid-wall"),
-    (400, "poor"),
-)
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -53,7 +45,7 @@ class ThermalSensor(CoordinatorEntity[ThermalCoordinator], SensorEntity):
 
 class HlcSensor(ThermalSensor):
     _attr_unique_id = f"{DOMAIN}_hlc"
-    _attr_name = "Heat loss coefficient"
+    _attr_name = "Delivered heat loss coefficient"
     _attr_native_unit_of_measurement = "W/K"
     _attr_icon = "mdi:home-thermometer-outline"
     _attr_suggested_display_precision = 0
@@ -68,14 +60,22 @@ class HlcSensor(ThermalSensor):
         fit = self.coordinator.data.get("hlc")
         if not fit:
             return {"note": "not enough heating days yet"}
-        value = fit["hlc_w_per_k"]
-        rating = next((label for limit, label in HLC_BANDS if value < limit), "very poor")
         return {
-            "rating": rating,
+            "rating": "not benchmarked; building type and floor area context required",
+            "status": fit.get("status", "provisional"),
             "r_squared": round(fit["r_squared"], 3),
             "days_used": fit["days_used"],
             "window_days": fit["window_days"],
-            "free_gains_kwh_per_day": round(fit["free_gains_kwh_per_day"], 1),
+            "confidence_interval_low_w_per_k": round(fit["hlc_ci_low_w_per_k"], 1),
+            "confidence_interval_high_w_per_k": round(fit["hlc_ci_high_w_per_k"], 1),
+            "fuel_input_hlc_w_per_k": round(fit["fuel_input_hlc_w_per_k"], 1),
+            "space_heating_fuel_input_hlc_w_per_k": round(
+                fit["space_heating_fuel_input_hlc_w_per_k"], 1
+            ),
+            "boiler_efficiency_used": fit["boiler_efficiency_used"],
+            "regression_intercept_kwh_per_day": round(
+                fit["regression_intercept_kwh_per_day"], 1
+            ),
             "hlc_w_per_k_per_m2": (
                 round(fit["hlc_w_per_k_per_m2"], 2)
                 if "hlc_w_per_k_per_m2" in fit
@@ -125,15 +125,20 @@ class LoftSensor(ThermalSensor):
             return {"note": "not enough cold night hours yet"}
         ratio = fit["ratio"]
         if ratio > 0.5:
-            verdict = "ceiling is the weak link - loft insulation pays off"
+            verdict = "loft stayed relatively warm; ceiling heat transfer may be significant"
         elif ratio > 0.25:
-            verdict = "moderate ceiling loss"
+            verdict = "loft temperature was moderately coupled to indoors"
         else:
-            verdict = "loft tracks outdoor - ceiling insulated or loft well ventilated"
+            verdict = "loft tracked outdoors; this can indicate insulation or strong ventilation"
         return {
             "verdict": verdict,
             "hours_used": fit["hours_used"],
             "window_days": fit["window_days"],
+            "interquartile_range": round(fit.get("iqr", 0.0), 3),
+            "out_of_range_observations_pct": round(
+                fit.get("out_of_range_pct", 0.0), 1
+            ),
+            "note": "directional estimate, not an insulation payback assessment",
             "humidity_pct": (
                 round(fit["humidity_pct"], 1) if "humidity_pct" in fit else None
             ),
@@ -142,7 +147,7 @@ class LoftSensor(ThermalSensor):
 
 class AirChangeRateSensor(ThermalSensor):
     _attr_unique_id = f"{DOMAIN}_air_change_rate"
-    _attr_name = "Air change rate"
+    _attr_name = "Room-derived air change rate proxy"
     _attr_native_unit_of_measurement = "1/h"
     _attr_icon = "mdi:weather-windy"
     _attr_suggested_display_precision = 2
@@ -161,12 +166,15 @@ class AirChangeRateSensor(ThermalSensor):
         return {
             "decay_windows_used": losses["windows"],
             "outdoor_co2_baseline_ppm": round(losses["baseline_ppm"], 0),
+            "co2_sensors_used": losses.get("co2_sensors_used", 1),
+            "co2_baseline_source": losses.get("co2_baseline_source"),
+            "scope": losses.get("scope"),
         }
 
 
 class VentilationLossSensor(ThermalSensor):
     _attr_unique_id = f"{DOMAIN}_ventilation_loss"
-    _attr_name = "Ventilation heat loss"
+    _attr_name = "Estimated ventilation heat loss"
     _attr_native_unit_of_measurement = "W/K"
     _attr_icon = "mdi:door-open"
     _attr_suggested_display_precision = 0
@@ -193,7 +201,7 @@ class VentilationLossSensor(ThermalSensor):
 
 class FabricLossSensor(ThermalSensor):
     _attr_unique_id = f"{DOMAIN}_fabric_loss"
-    _attr_name = "Fabric heat loss"
+    _attr_name = "Estimated fabric heat loss"
     _attr_native_unit_of_measurement = "W/K"
     _attr_icon = "mdi:wall"
     _attr_suggested_display_precision = 0
@@ -216,7 +224,7 @@ class FabricLossSensor(ThermalSensor):
 
 class HotWaterGasSensor(ThermalSensor):
     _attr_unique_id = f"{DOMAIN}_hot_water_gas"
-    _attr_name = "Hot water gas"
+    _attr_name = "Non-space-heating gas baseline"
     _attr_native_unit_of_measurement = "kWh/d"
     _attr_icon = "mdi:water-boiler"
     _attr_suggested_display_precision = 1
@@ -232,6 +240,7 @@ class HotWaterGasSensor(ThermalSensor):
         if not dhw:
             return {"note": "not enough summer (heating-off) days yet"}
         return {
+            "status": dhw.get("status", "provisional"),
             "includes": "all non-heating gas: hot water, plus cooking/pilot "
                         "only if those burn gas (pure DHW in an "
                         "electric-cooking home)",
@@ -246,8 +255,18 @@ class HotWaterGasSensor(ThermalSensor):
                 if "cost_per_year_gbp" in dhw
                 else None
             ),
+            "modelled_annual_kwh": (
+                round(dhw["modelled_annual_kwh"], 1)
+                if "modelled_annual_kwh" in dhw
+                else None
+            ),
             "wh_per_litre": (
                 round(dhw["wh_per_litre"], 1) if "wh_per_litre" in dhw else None
+            ),
+            "wh_per_litre_basis": (
+                "gas fuel input; hot-fraction estimate applies boiler efficiency"
+                if "wh_per_litre" in dhw
+                else None
             ),
             "hot_fraction_of_metered_water_pct": (
                 round(dhw["hot_fraction_pct"], 0)
@@ -266,7 +285,9 @@ class RoomTauSensor(ThermalSensor):
         super().__init__(coordinator)
         self._room = room
         self._attr_unique_id = f"{DOMAIN}_{room}_tau"
-        self._attr_name = f"{room.replace('_', ' ').title()} time constant"
+        self._attr_name = (
+            f"{room.replace('_', ' ').title()} effective overnight cooling time constant"
+        )
 
     @property
     def native_value(self) -> float | None:

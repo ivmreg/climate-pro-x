@@ -17,6 +17,21 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+MIN_HLC_DAYS = 20
+MIN_HLC_R2 = 0.5
+MIN_DT_SPREAD = 3.0
+MIN_HLC_W_PER_K = 10.0
+MAX_HLC_W_PER_K = 1500.0
+MAX_METER_GAP = pd.Timedelta("1.5h")
+MIN_DAILY_COVERAGE = 0.9
+
+
+def _expected_day_hours(day: pd.Timestamp) -> int:
+    """Return the real number of hours in a local day, including DST."""
+    start = day.normalize()
+    end = start + pd.DateOffset(days=1)
+    return round((end.tz_convert("UTC") - start.tz_convert("UTC")).total_seconds() / 3600)
+
 
 def daily_heat_input_from_tado(
     heating_by_room: dict[str, pd.Series], boiler_output_kw: float
@@ -37,36 +52,84 @@ def daily_heat_input_from_meter(
     domestic boiler can't burn more than ~max_step_kwh between readings)
     are treated as artifacts, not consumption.
     """
+    gas_kwh = gas_kwh.sort_index()
     diffs = gas_kwh.diff()
-    diffs[(diffs < 0) | (diffs > max_step_kwh)] = 0.0
-    return diffs.resample("1D").sum()
+    gaps = gas_kwh.index.to_series().diff()
+    valid = (
+        (gaps > pd.Timedelta(0))
+        & (gaps <= MAX_METER_GAP)
+        & (diffs >= 0)
+        & (diffs <= max_step_kwh)
+    )
+    diffs = diffs.where(valid)
+    totals = diffs.resample("1D").agg(["sum", "count"])
+    complete = [
+        count >= (_expected_day_hours(day) - 1) * MIN_DAILY_COVERAGE
+        for day, count in totals["count"].items()
+    ]
+    result = totals.loc[complete, "sum"]
+    result.name = gas_kwh.name
+    return result
 
 
 def daily_delta_t(
     indoor_by_room: dict[str, pd.Series], outdoor: pd.Series
 ) -> pd.Series:
-    indoor_mean = pd.DataFrame(indoor_by_room).mean(axis=1)
-    dt = indoor_mean - outdoor.reindex(indoor_mean.index).interpolate(limit=24)
-    return dt.resample("1D").mean()
+    if not indoor_by_room:
+        return pd.Series(dtype=float)
+    rooms = pd.DataFrame(indoor_by_room).dropna(how="any")
+    indoor_mean = rooms.mean(axis=1)
+    aligned_outdoor = outdoor.reindex(indoor_mean.index).interpolate(limit=1)
+    dt = (indoor_mean - aligned_outdoor).dropna()
+    daily = dt.resample("1D").agg(["mean", "count"])
+    gaps = dt.index.to_series().diff().dropna()
+    cadence = gaps[gaps > pd.Timedelta(0)].median() if not gaps.empty else pd.Timedelta("1h")
+    complete = [
+        count >= _expected_day_hours(day) * pd.Timedelta("1h") / cadence * MIN_DAILY_COVERAGE
+        for day, count in daily["count"].items()
+    ]
+    return daily.loc[complete, "mean"]
 
 
 def fit_hlc(q_daily: pd.Series, dt_daily: pd.Series) -> dict:
     df = pd.DataFrame({"q": q_daily, "dt": dt_daily}).dropna()
     # Heating-season days only: meaningful dT and some heat actually delivered
     df = df[(df.dt > 4) & (df.q > 0.5)]
-    if len(df) < 5:
+    if len(df) < MIN_HLC_DAYS:
         return {"days": len(df), "hlc_w_per_k": float("nan"),
-                "note": "Fewer than 5 usable heating days — pull more history "
+                "note": f"Fewer than {MIN_HLC_DAYS} usable heating days — pull more history "
                         "or wait for colder weather."}
+    if df.dt.max() - df.dt.min() < MIN_DT_SPREAD:
+        return {"days": len(df), "hlc_w_per_k": float("nan"),
+                "note": "Usable days do not span enough indoor-outdoor temperature variation."}
     slope, intercept = np.polyfit(df.dt, df.q, 1)
     pred = slope * df.dt + intercept
     ss_res = float(np.sum((df.q - pred) ** 2))
     ss_tot = float(np.sum((df.q - df.q.mean()) ** 2))
+    r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    hlc_w_per_k = slope * 1000 / 24
+    sxx = float(np.sum((df.dt - df.dt.mean()) ** 2))
+    slope_se = float(np.sqrt(ss_res / (len(df) - 2) / sxx)) if sxx > 0 else float("inf")
+    ci_low = (slope - 1.96 * slope_se) * 1000 / 24
+    ci_high = (slope + 1.96 * slope_se) * 1000 / 24
+    if (
+        slope <= 0
+        or r_squared < MIN_HLC_R2
+        or ci_low <= 0
+        or not MIN_HLC_W_PER_K <= hlc_w_per_k <= MAX_HLC_W_PER_K
+    ):
+        return {"days": len(df), "hlc_w_per_k": float("nan"),
+                "r_squared": r_squared,
+                "note": "HLC fit failed physical or statistical quality gates."}
     return {
         "days": len(df),
-        "hlc_w_per_k": slope * 1000 / 24,
+        "hlc_w_per_k": hlc_w_per_k,
+        "hlc_ci_low_w_per_k": ci_low,
+        "hlc_ci_high_w_per_k": ci_high,
         "free_gains_kwh_per_day": -intercept,
-        "r_squared": 1 - ss_res / ss_tot if ss_tot > 0 else 0.0,
+        "regression_intercept_kwh_per_day": intercept,
+        "r_squared": r_squared,
+        "status": "valid" if len(df) >= 30 else "provisional",
         "data": df,
     }
 
@@ -74,13 +137,4 @@ def fit_hlc(q_daily: pd.Series, dt_daily: pd.Series) -> dict:
 def benchmark(hlc: float) -> str:
     if np.isnan(hlc):
         return "insufficient data"
-    bands = [
-        (100, "excellent — like a modern insulated build"),
-        (180, "good — better than most solid-wall homes"),
-        (280, "typical for an unimproved solid-brick flat"),
-        (400, "poor — significant losses; check draughts, glazing, loft"),
-    ]
-    for limit, label in bands:
-        if hlc < limit:
-            return label
-    return "very poor — worth a professional survey"
+    return "not benchmarked — compare qualified trends or use a building-specific standard"

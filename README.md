@@ -8,15 +8,15 @@ sensor, a loft sensor and a weather integration.
 
 | Metric | What it tells you | Needs |
 |---|---|---|
-| **Thermal time constant τ (hours), per room** | How fast each room cools when heating is off. Low τ = leaky room. | Temperatures only |
-| **Heat Loss Coefficient HLC (W/K), whole home** | Watts lost per degree of indoor/outdoor difference. *The* retrofit benchmark. | Temperatures + a heat-input proxy (Tado heating power %, or real gas kWh) |
-| **Loft ratio** | Whether your ceiling or your roof is the weak link — i.e. would loft insulation pay off. | Loft + indoor + outdoor temperatures |
-| **Ventilation vs fabric split (W/K)** | Whether the HLC is mostly draughts (draught-proofing) or mostly walls/windows (insulation) — the actual retrofit spending decision. | A CO2 sensor with a season of history, floor area, ceiling height |
-| **Hot-water gas (kWh/day, £/day, £/yr)** | What non-heating gas actually costs, isolated from space heating — and used to de-bias the winter HLC fit. Covers hot water plus cooking/pilot only if those burn gas; in an electric-cooking home it's purely hot water. | Gas meter, a summer (heating-off) stretch of history |
+| **Effective overnight cooling time constant τ (hours), per room** | How quickly a room cooled under the observed conditions. It combines fabric, draughts, thermal mass and heat exchange with adjacent rooms. | Temperatures; heating-power coverage strongly recommended |
+| **Delivered Heat Loss Coefficient HLC (W/K), whole home** | Estimated heat delivered to replace each watt lost per degree of indoor/outdoor difference, after the DHW and boiler-efficiency corrections available from the data. | Temperatures + real gas kWh; the offline Tado proxy is trend-only |
+| **Loft ratio** | Directional evidence about how closely loft temperature follows indoors versus outdoors; not an insulation payback calculation. | Loft + indoor + outdoor temperatures |
+| **Ventilation vs fabric split (W/K)** | An exploratory split based on a room-derived CO2 decay proxy. A single room is not assumed to be a direct whole-home ACH measurement. | CO2 sensor, floor area, ceiling height, and valid HLC |
+| **Non-space-heating gas baseline (kWh/day, £/day, £/yr)** | Summer gas not explained by space heating. It includes hot water and any gas cooking/pilot load, and is used to de-bias HLC. | Gas meter and enough complete low-heating days |
 
-Typical uninsulated solid-wall UK flats sit around **200–350 W/K**; per-room
-time constants under ~10 h at night usually indicate significant draughts or
-uninsulated external walls.
+Treat these as household diagnostics rather than a substitute for a calibrated
+co-heating test or professional retrofit survey. The integration suppresses
+results that fail coverage, fit-quality, confidence or physical-bound checks.
 
 ## Setup
 
@@ -73,7 +73,11 @@ cached history, for both the offline `dhw` command and the live integration.
 The `pull` command uses the recorder history API, which by default keeps ~10
 days. That's plenty for cooling curves; for a robust HLC you ideally want
 weeks of heating-season data. If your recorder retention is short, run `pull`
-periodically — the cache is additive — or extend `purge_keep_days`.
+periodically — the cache is additive — or extend `purge_keep_days`. REST and
+long-term-statistics pulls are now stored separately under `data/_sources/` so
+different cumulative-meter baselines cannot be blindly interleaved. Run
+`python -m ha_efficiency cache-audit --cumulative` to inspect or safely
+canonicalise older cache files.
 
 ## The Home Assistant integration (Phase 2)
 
@@ -83,17 +87,18 @@ long-term statistics — no tokens, no polling, no pip requirements.
 
 Entities (updated every 6 h, all under one "Thermal Efficiency" device):
 
-- `sensor.thermal_efficiency_heat_loss_coefficient` — W/K over the full
-  window (stable, season-blended), with attributes: rating, R², days used,
+- `sensor.thermal_efficiency_heat_loss_coefficient` — delivered W/K over the
+  full window after available DHW and boiler-efficiency corrections, with
+  attributes for the fuel-input slopes, confidence interval, R² and days used,
   DHW baseline, a shorter-window `recent_hlc_w_per_k` for spotting
   improvements after e.g. draught-proofing, `hlc_w_per_k_per_m2` (set
   `floor_area_m2` to get this — the normalised benchmark assessors use), and
   `space_heating_hlc_w_per_k` — the same fit with hot-water gas subtracted
   day-by-day (needs a gas meter and enough summer history for a DHW
   baseline; see `hot_water_gas` below).
-- `sensor.thermal_efficiency_<room>_time_constant` — median overnight
-  cooling τ in hours; nights are skipped when Tado heating power shows the
-  radiator ran, and gated on fit quality otherwise.
+- `sensor.thermal_efficiency_<room>_time_constant` — median effective overnight
+  cooling τ in hours; nights require continuous temperature data and at least
+  80% heating-power coverage when that source is configured.
 - `sensor.thermal_efficiency_loft_ratio` — ceiling-vs-roof loss split from
   cold nights; robust to flatlined (dead-battery) sensors, plus a
   `humidity_pct` attribute if `loft_humidity` is configured. If your loft
@@ -101,15 +106,17 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
   `loft_since` to the move date so its earlier, non-loft readings are
   ignored — a sensor that merely sat somewhere else warm won't necessarily
   flatline, so this isn't caught automatically otherwise.
-- `sensor.thermal_efficiency_hot_water_gas` — non-heating gas (hot water,
+- `sensor.thermal_efficiency_hot_water_gas` — non-space-heating gas (hot water,
   plus any gas cooking/pilot), kWh/day,
   from a robust summer (heating-off) baseline; attributes include
   `cost_per_day_gbp`/`cost_per_year_gbp` (needs `gas_unit_rate`) and,
   once enough hourly water history has accrued, an informational
   `wh_per_litre`/`hot_fraction_of_metered_water_pct` from a gas-vs-water
   regression (needs `water`).
-- `sensor.thermal_efficiency_air_change_rate` — whole-home air-change rate
-  (1/h) from CO2 decay curves (needs `co2`), plus
+- `sensor.thermal_efficiency_air_change_rate` — median room-derived air-change
+  proxy (1/h) from independently fitted CO2 sensors (needs `co2`; configure an
+  `outdoor_co2_sensor` or `outdoor_co2_ppm` rather than relying on the
+  low-percentile indoor fallback when possible), plus
   `sensor.thermal_efficiency_ventilation_heat_loss` and
   `..._fabric_heat_loss` (W/K) splitting the delivered space-heating HLC
   between draughts and fabric (needs `co2`, `floor_area_m2` and
@@ -159,7 +166,12 @@ thermal_efficiency:
   loft_humidity: sensor.portable_sensor_humidity
   floor_area_m2: 105
   ceiling_height_m: 2.45
-  co2: sensor.qp_sensor_co2
+  co2:
+    - sensor.bedroom_co2
+    - sensor.living_room_co2
+  outdoor_co2_sensor: sensor.garden_co2
+  # Used only when no valid outdoor sensor history is available:
+  outdoor_co2_ppm: 420
   # An external statistic id (not a sensor.* entity - see the gotcha above),
   # e.g. from a water-utility integration with genuine hourly usage.
   water: thames_water:thameswater_consumption
@@ -186,9 +198,26 @@ thermal_efficiency:
       heating_power: sensor.office_heating_power
 ```
 
-Tests: `tests/synthetic_check.py` (offline toolkit) and
-`tests/integration_math_check.py` (integration maths, synthetic + real
-cached data) — both run with `.venv/bin/python`. Coverage includes HLC,
-per-room τ, loft ratio, the ventilation/fabric CO2 split, and the DHW
-baseline/HLC correction, each checked against known-physics synthetic data
-plus (in the integration test) real cached data.
+### Version 0.4 migration notes
+
+- Existing entity unique IDs are retained, but the headline HLC value is now
+  delivered heat loss after boiler efficiency and any valid DHW correction.
+  It will normally be lower than the old gas-input slope.
+- Gas-side diagnostics remain available as attributes named
+  `fuel_input_hlc_w_per_k` and `space_heating_fuel_input_hlc_w_per_k`.
+- HLC now needs at least 20 complete, statistically useful heating days. A
+  previously visible value may become unavailable until that evidence exists.
+- Weak water regressions, impossible loft ratios and ventilation estimates
+  larger than total delivered loss are suppressed.
+- Old mixed caches are not rewritten automatically. Audit them with
+  `python -m ha_efficiency cache-audit --cumulative`, then pull clean LTS data
+  to populate the source-separated cache.
+
+Tests: install `requirements-dev.txt` and run `pytest`. The suite covers nominal
+and adversarial HLC, meter gaps, partial and DST days, cache backfills, Home
+Assistant config/coordinator behavior, multiple CO2 sensors, loft bounds,
+ventilation reconciliation, weak water regressions, and an immutable sanitized
+heating-season fixture. CI enforces 80% coverage across trust-sensitive modules
+and at least 90% branch coverage for the live pure-math core. The executable
+cross-checks `tests/synthetic_check.py` and `tests/integration_math_check.py`
+remain as broader known-physics and cached-data validations.

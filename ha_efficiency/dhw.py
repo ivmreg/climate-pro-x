@@ -13,8 +13,9 @@ import numpy as np
 import pandas as pd
 
 DHW_BASELINE_MAX_DT = 3.0
-DHW_BASELINE_MIN_DAYS = 7
+DHW_BASELINE_MIN_DAYS = 14
 DHW_REGRESSION_MIN_HOURS = 200
+DHW_REGRESSION_MIN_R2 = 0.5
 DHW_THEORETICAL_WH_PER_L = 34.8  # Wh to raise 1L by 30K, a combi's typical DHW rise
 MAINS_TANK_TEMP_C = 55.0
 MAINS_TEMP_MIN_C = 4.0
@@ -23,14 +24,22 @@ MAINS_OUTDOOR_MIN_C = 2.0
 MAINS_OUTDOOR_MAX_C = 18.0
 GAS_MAX_STEP_KWH = 40.0
 WATER_MAX_STEP_L = 1000.0
+MAX_METER_GAP = pd.Timedelta("1.5h")
 
 
 def hourly_change(cumulative: pd.Series, max_step: float) -> pd.Series:
     """Hourly deltas from a cumulative statistics series, dropping resets
     (negative steps) and implausible artifacts (> max_step)."""
-    diffs = cumulative.sort_index().diff()
-    diffs[(diffs < 0) | (diffs > max_step)] = np.nan
-    return diffs.dropna()
+    cumulative = cumulative.sort_index()
+    diffs = cumulative.diff()
+    gaps = cumulative.index.to_series().diff()
+    valid = (
+        (gaps > pd.Timedelta(0))
+        & (gaps <= MAX_METER_GAP)
+        & (diffs >= 0)
+        & (diffs <= max_step)
+    )
+    return diffs.where(valid).dropna()
 
 
 def dhw_baseline(
@@ -90,23 +99,27 @@ def corrected_hlc(
         {"q": q_daily, "dt": dt_daily, "outdoor": outdoor_daily}
     ).dropna()
     df = df[(df.dt > 4) & (df.q > 0.5)]
-    if len(df) < 5:
+    if df.empty:
         return None
     dhw_kwh = df.outdoor.apply(lambda t: dhw_daily_kwh(t, baseline))
     q_adjusted = df.q - dhw_kwh
-    slope, intercept = np.polyfit(df.dt, q_adjusted, 1)
-    pred = slope * df.dt + intercept
-    ss_res = float(np.sum((q_adjusted - pred) ** 2))
-    ss_tot = float(np.sum((q_adjusted - q_adjusted.mean()) ** 2))
-    return {
-        "days": len(df),
-        "hlc_w_per_k": slope * 1000 / 24,
-        "r_squared": 1 - ss_res / ss_tot if ss_tot > 0 else 0.0,
-        "baseline": baseline,
-    }
+    valid = q_adjusted > 0
+    if not valid.any():
+        return None
+    from . import hlc
+
+    fitted = hlc.fit_hlc(q_adjusted[valid], df.loc[valid, "dt"])
+    if "note" in fitted:
+        return None
+    fitted["baseline"] = baseline
+    return fitted
 
 
-def fit_water_gas(gas_kwh_hourly: pd.Series, water_l_hourly: pd.Series) -> dict | None:
+def fit_water_gas(
+    gas_kwh_hourly: pd.Series,
+    water_l_hourly: pd.Series,
+    boiler_efficiency: float = 0.88,
+) -> dict | None:
     """Informational only: hourly gas-vs-water regression, giving a rough
     Wh-per-litre rate and the implied hot fraction of metered water. Noisy
     (household draws are bursty and mix hot/cold) - not the basis for the
@@ -114,7 +127,7 @@ def fit_water_gas(gas_kwh_hourly: pd.Series, water_l_hourly: pd.Series) -> dict 
     df = pd.concat(
         [gas_kwh_hourly.rename("gas"), water_l_hourly.rename("water")], axis=1
     ).dropna()
-    if len(df) < DHW_REGRESSION_MIN_HOURS:
+    if len(df) < DHW_REGRESSION_MIN_HOURS or df.water.nunique() < 10:
         return None
     slope, intercept = np.polyfit(df.water, df.gas, 1)
     if slope <= 0:
@@ -122,10 +135,17 @@ def fit_water_gas(gas_kwh_hourly: pd.Series, water_l_hourly: pd.Series) -> dict 
     pred = slope * df.water + intercept
     ss_res = float(np.sum((df.gas - pred) ** 2))
     ss_tot = float(np.sum((df.gas - df.gas.mean()) ** 2))
+    r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    if r_squared < DHW_REGRESSION_MIN_R2:
+        return None
     wh_per_litre = slope * 1000
     return {
         "wh_per_litre": wh_per_litre,
-        "hot_fraction_pct": min(100.0, wh_per_litre / DHW_THEORETICAL_WH_PER_L * 100),
-        "regression_r_squared": 1 - ss_res / ss_tot if ss_tot > 0 else 0.0,
+        "fuel_input_wh_per_litre": wh_per_litre,
+        "hot_fraction_pct": min(
+            100.0,
+            wh_per_litre * boiler_efficiency / DHW_THEORETICAL_WH_PER_L * 100,
+        ),
+        "regression_r_squared": r_squared,
         "regression_hours": len(df),
     }

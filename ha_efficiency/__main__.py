@@ -4,6 +4,7 @@ import argparse
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 
 import pandas as pd
 import yaml
@@ -25,6 +26,9 @@ def config_entities(cfg: dict) -> list[str]:
         entities.append(cfg["gas_kwh_entity"])
     if cfg.get("co2_entity"):
         entities.append(cfg["co2_entity"])
+    entities.extend(cfg.get("co2_entities") or [])
+    if cfg.get("outdoor_co2_entity"):
+        entities.append(cfg["outdoor_co2_entity"])
     if cfg.get("gas_unit_rate_entity"):
         entities.append(cfg["gas_unit_rate_entity"])
     for room in cfg["rooms"].values():
@@ -51,7 +55,19 @@ def cmd_pull(args) -> None:
         client = HAClient()
         print(f"Pulling {len(entities)} entities, {args.days} days …")
         series = client.history_chunked(entities, start, end)
-    store.save(series)
+    cumulative_entities = {
+        entity
+        for entity in (cfg.get("gas_kwh_entity"), cfg.get("water_stat"))
+        if entity
+    }
+    store.save(
+        series,
+        source="lts" if args.lts else "rest",
+        kind_by_entity={
+            entity: "cumulative" if entity in cumulative_entities else "measurement"
+            for entity in series
+        },
+    )
     for eid in entities:
         got = series.get(eid)
         span = f"{got.index[0]:%Y-%m-%d} → {got.index[-1]:%Y-%m-%d} ({len(got)} pts)" \
@@ -124,11 +140,26 @@ def cmd_hlc(args) -> None:
     if "note" in result:
         print(result["note"])
         return
-    value = result["hlc_w_per_k"]
-    print(f"Heat Loss Coefficient: {value:.0f} W/K  (R² {result['r_squared']:.2f})")
-    print(f"Free gains: ~{result['free_gains_kwh_per_day']:.1f} kWh/day")
+    fitted = result
+    efficiency = 1.0
+    if gas_entity:
+        outdoor_daily = outdoor.resample("1D").mean()
+        corrected = dhw.corrected_hlc(q_daily, dt_daily, outdoor_daily)
+        fitted = corrected or result
+        efficiency = cfg.get("boiler_efficiency", 0.88)
+    fuel_or_proxy_value = fitted["hlc_w_per_k"]
+    value = fuel_or_proxy_value * efficiency
+    print(f"Delivered Heat Loss Coefficient: {value:.0f} W/K  "
+          f"(R² {fitted['r_squared']:.2f})")
+    if gas_entity:
+        print(f"Fuel-input slope: {fuel_or_proxy_value:.0f} W/K; "
+              f"boiler efficiency assumption: {efficiency:.0%}")
+        print("DHW correction: " + ("applied" if fitted is not result else "not available"))
+    else:
+        print("Heat input is a Tado demand proxy; use this result for trends, not benchmarking.")
+    print(f"Regression intercept: {fitted['regression_intercept_kwh_per_day']:.1f} kWh/day")
     print(f"Benchmark: {hlc.benchmark(value)}")
-    _plot_hlc(result)
+    _plot_hlc(fitted)
 
 
 def _plot_hlc(result: dict) -> None:
@@ -184,17 +215,35 @@ def _gas_daily_inputs(cfg: dict) -> tuple[pd.Series, pd.Series, pd.Series, pd.Se
 
 def cmd_ventilation(args) -> None:
     cfg = load_config()
-    co2_entity = cfg.get("co2_entity")
-    if not co2_entity:
-        sys.exit("Set co2_entity in config.yaml first.")
-    co2 = store.load(co2_entity)
-    if co2 is None:
-        sys.exit("No cached CO2 data — run `pull --lts` first.")
-    fit = ventilation.air_change_rate(co2)
-    if not fit:
+    co2_entities = [
+        entity
+        for entity in [cfg.get("co2_entity"), *(cfg.get("co2_entities") or [])]
+        if entity
+    ]
+    if not co2_entities:
+        sys.exit("Set co2_entity or co2_entities in config.yaml first.")
+    outdoor_baseline = cfg.get("outdoor_co2_ppm")
+    outdoor_co2_entity = cfg.get("outdoor_co2_entity")
+    if outdoor_co2_entity:
+        outdoor_co2 = store.load(outdoor_co2_entity)
+        if outdoor_co2 is not None and not outdoor_co2.empty:
+            outdoor_baseline = float(outdoor_co2.median())
+    fits = []
+    for entity in co2_entities:
+        co2 = store.load(entity)
+        if co2 is not None:
+            fit = ventilation.air_change_rate(co2, outdoor_baseline)
+            if fit:
+                fits.append(fit)
+    if not fits:
         sys.exit("Not enough clean CO2 decay windows yet — pull more history.")
+    fit = {
+        "ach": median(item["ach"] for item in fits),
+        "windows": sum(item["windows"] for item in fits),
+        "baseline_ppm": median(item["baseline_ppm"] for item in fits),
+    }
     print(f"\nAir-change rate: {fit['ach']:.2f} /h  ({fit['windows']} decay windows, "
-          f"outdoor CO2 baseline {fit['baseline_ppm']:.0f} ppm)")
+          f"{len(fits)} sensor(s), outdoor CO2 baseline {fit['baseline_ppm']:.0f} ppm)")
 
     floor_area = cfg.get("floor_area_m2")
     ceiling = cfg.get("ceiling_height_m")
@@ -219,6 +268,11 @@ def cmd_ventilation(args) -> None:
     split = ventilation.split_losses(
         fit["ach"], floor_area, ceiling, space_heating_hlc, boiler_eff
     )
+    if split is None:
+        sys.exit(
+            "Ventilation loss exceeds the delivered HLC or an input is invalid; "
+            "the fabric/ventilation split has been suppressed."
+        )
     print(f"\nVentilation loss: {split['ventilation_w_per_k']:.0f} W/K "
           f"({split['ventilation_share_pct']:.0f}% of delivered)")
     print(f"Fabric loss:      {split['fabric_w_per_k']:.0f} W/K")
@@ -233,7 +287,7 @@ def cmd_dhw(args) -> None:
     baseline = dhw.dhw_baseline(q_daily, dt_daily, outdoor_daily)
     if not baseline:
         sys.exit("Not enough summer (heating-off) days cached yet for a DHW baseline.")
-    print(f"\nHot water + hob + pilot gas: {baseline['kwh_per_day']:.1f} kWh/day "
+    print(f"\nNon-space-heating gas baseline: {baseline['kwh_per_day']:.1f} kWh/day "
           f"({baseline['days_used']} summer days used)")
 
     rate_entity = cfg.get("gas_unit_rate_entity")
@@ -253,8 +307,24 @@ def cmd_dhw(args) -> None:
         except Exception:
             rate = None
         if rate:
+            state_unit = (state.get("attributes") or {}).get("unit_of_measurement", "")
+            normalized_unit = str(state_unit).casefold().replace(" ", "")
+            if normalized_unit in {"p/kwh", "pence/kwh"}:
+                rate /= 100
+            elif normalized_unit in {"gbp/mwh", "£/mwh"}:
+                rate /= 1000
+            elif normalized_unit not in {"gbp/kwh", "£/kwh"}:
+                rate = None
+        if rate:
             per_day = baseline["kwh_per_day"] * rate
-            print(f"Cost: £{per_day:.2f}/day (£{per_day * 365:.0f}/year "
+            modelled = outdoor_daily.dropna().apply(
+                lambda value: dhw.dhw_daily_kwh(value, baseline)
+            )
+            annual_kwh = (
+                float(modelled.mean()) * 365 if not modelled.empty
+                else baseline["kwh_per_day"] * 365
+            )
+            print(f"Cost: £{per_day:.2f}/baseline day (£{annual_kwh * rate:.0f}/modelled year "
                   f"at {rate * 100:.1f}p/kWh)")
         else:
             print("\ngas_unit_rate_entity configured but its live value "
@@ -268,7 +338,11 @@ def cmd_dhw(args) -> None:
         else:
             gas_hourly = dhw.hourly_change(gas, dhw.GAS_MAX_STEP_KWH)
             water_hourly = dhw.hourly_change(water, dhw.WATER_MAX_STEP_L)
-            wfit = dhw.fit_water_gas(gas_hourly, water_hourly)
+            wfit = dhw.fit_water_gas(
+                gas_hourly,
+                water_hourly,
+                cfg.get("boiler_efficiency", 0.88),
+            )
             if wfit:
                 print(f"\n(informational) hourly gas-vs-water regression: "
                       f"{wfit['wh_per_litre']:.1f} Wh/L, ~{wfit['hot_fraction_pct']:.0f}% "
@@ -280,8 +354,42 @@ def cmd_dhw(args) -> None:
 
     corrected = dhw.corrected_hlc(q_daily, dt_daily, outdoor_daily)
     if corrected:
-        print(f"\nDHW-corrected space-heating HLC: {corrected['hlc_w_per_k']:.0f} W/K "
-              f"(R² {corrected['r_squared']:.2f}, {corrected['days']} days)")
+        efficiency = cfg.get("boiler_efficiency", 0.88)
+        print(f"\nDHW-corrected delivered HLC: "
+              f"{corrected['hlc_w_per_k'] * efficiency:.0f} W/K "
+              f"(fuel-input slope {corrected['hlc_w_per_k']:.0f} W/K, "
+              f"R² {corrected['r_squared']:.2f}, {corrected['days']} days)")
+
+
+def cmd_cache_audit(args) -> None:
+    """Report cache provenance and refuse unsafe cumulative reconstruction."""
+    cfg = load_config()
+    entity_id = args.entity or cfg.get("gas_kwh_entity")
+    if not entity_id:
+        sys.exit("Pass an entity id or configure gas_kwh_entity first.")
+    report = store.audit(
+        entity_id, cumulative=args.cumulative, max_step=args.max_step
+    )
+    print(f"\nCache audit: {entity_id}")
+    for source, details in report["sources"].items():
+        print(
+            f"  {source:8s} {details['rows']:6d} rows  "
+            f"{details['start']} -> {details['end']}  "
+            f"gaps={details['large_gaps']}"
+        )
+        if args.cumulative:
+            print(
+                f"           resets={details.get('negative_steps', 0)} "
+                f"large_steps={details.get('over_limit_steps', 0)} "
+                f"mixed_baseline={details.get('mixed_baseline_likely', False)}"
+            )
+    for warning in report["warnings"]:
+        print(f"  WARNING: {warning}")
+    if args.repair:
+        outcome = store.repair(
+            entity_id, source=args.source, cumulative=args.cumulative
+        )
+        print(f"Repair: {outcome}")
 
 
 def main() -> None:
@@ -298,6 +406,12 @@ def main() -> None:
     sub.add_parser("loft", help="ceiling vs roof loss analysis")
     sub.add_parser("ventilation", help="ventilation vs fabric heat loss split (needs a CO2 sensor)")
     sub.add_parser("dhw", help="hot-water gas cost + DHW-corrected HLC")
+    p_audit = sub.add_parser("cache-audit", help="inspect cached data quality/provenance")
+    p_audit.add_argument("entity", nargs="?")
+    p_audit.add_argument("--cumulative", action="store_true")
+    p_audit.add_argument("--max-step", type=float, default=40.0)
+    p_audit.add_argument("--repair", action="store_true")
+    p_audit.add_argument("--source", default="legacy")
     args = parser.parse_args()
     {
         "discover": lambda a: discover.run(),
@@ -307,6 +421,7 @@ def main() -> None:
         "loft": cmd_loft,
         "ventilation": cmd_ventilation,
         "dhw": cmd_dhw,
+        "cache-audit": cmd_cache_audit,
     }[args.command](args)
 
 
