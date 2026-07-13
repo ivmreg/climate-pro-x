@@ -4,153 +4,38 @@
 # scratch" -> open it -> pencil icon -> three-dot menu -> "Raw configuration
 # editor" -> paste this whole file.
 #
-# Needs (all already installed via HACS on this instance):
-#   - apexcharts-card
-#   - flex-table-card
+# Install the companion card first:
+#   1. Copy lovelace/thermal-storyboard-card.js to
+#      /config/www/thermal-storyboard-card.js.
+#   2. Settings -> Dashboards -> three-dot menu -> Resources -> Add resource:
+#        URL: /local/thermal-storyboard-card.js
+#        Type: JavaScript module
 #
-# Entity ids below match this instance; a fresh install may name the newer
-# sensors without the "metahome_" device prefix - adjust if so.
+# No third-party Lovelace cards are required. Entity ids below match this
+# instance; a fresh install may name the newer sensors without the
+# "metahome_" device prefix, so adjust those ids if needed.
 
 views:
   - title: Thermal efficiency
     icon: mdi:home-thermometer
     type: sections
-    max_columns: 3
+    max_columns: 4
     sections:
-      # ------------------------------------------------------------------
       - type: grid
+        column_span: 4
         cards:
-          - type: heading
-            heading: The headline
-
-          - type: gauge
-            entity: sensor.thermal_efficiency_heat_loss_coefficient
-            name: Delivered heat loss coefficient
-            min: 0
-            max: 500
-            needle: true
-            segments:
-              - from: 0
-                color: "#2e7d32" # excellent (<100)
-              - from: 100
-                color: "#8bc34a" # good (<180)
-              - from: 180
-                color: "#fdd835" # typical solid-wall (<280)
-              - from: 280
-                color: "#fb8c00" # poor (<400)
-              - from: 400
-                color: "#e53935" # very poor
-
-          - type: markdown
-            title: Evidence summary
-            content: >-
-              {% set s = 'sensor.thermal_efficiency_heat_loss_coefficient' %}
-              {% set hlc = states(s) | float(0) %}
-              {% set rating = state_attr(s, 'rating') %}
-              {% set status = state_attr(s, 'status') %}
-              {% set days = state_attr(s, 'days_used') %}
-              {% set low = state_attr(s, 'confidence_interval_low_w_per_k') %}
-              {% set high = state_attr(s, 'confidence_interval_high_w_per_k') %}
-              {% set fabric = states('sensor.metahome_thermal_efficiency_fabric_heat_loss') | float(0) %}
-              {% set share = state_attr('sensor.metahome_thermal_efficiency_ventilation_heat_loss',
-                                        'share_of_delivered_hlc_pct') | float(0) %}
-              {% set ach = states('sensor.metahome_thermal_efficiency_air_change_rate') | float(0) %}
-              {% set loft = states('sensor.thermal_efficiency_loft_ratio') | float(1) %}
-
-              **{{ hlc | round(0) }} W/K delivered — {{ rating }}**
-              ({{ status }}, {{ days }} days{% if low and high %}, approximate
-              95% interval {{ low | round(0) }}–{{ high | round(0) }} W/K{% endif %}).
-
-              {% if share -%}
-              The room-derived CO₂ proxy assigns **{{ share | round(0) }}%**
-              to ventilation and {{ fabric | round(0) }} W/K to fabric. Treat
-              this split as exploratory: one room may not represent whole-home
-              air mixing.
-              {%- else %}
-              No physically consistent ventilation/fabric split is available.
-              {%- endif %}
-
-              {% if ach -%}
-              Room-derived decay estimate: **{{ ach }}/h**. This is not a
-              compliance ventilation measurement.
-              {%- endif %}
-
-              {% if loft -%}
-              Loft ratio: **{{ loft | round(2) }}**. It describes observed
-              temperature coupling and does not by itself establish insulation
-              payback.
-              {%- endif %}
-
-      # ------------------------------------------------------------------
-      - type: grid
-        cards:
-          - type: heading
-            heading: Where the heat goes
-
-          - type: custom:apexcharts-card
-            chart_type: donut
-            header:
-              show: true
-              title: Delivered heat loss split (W/K)
-            series:
-              - entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
-                name: Fabric (walls & windows)
-                color: "#e53935"
-              - entity: sensor.metahome_thermal_efficiency_ventilation_heat_loss
-                name: Ventilation (draughts)
-                color: "#42a5f5"
-
-          - type: gauge
-            entity: sensor.metahome_thermal_efficiency_air_change_rate
-            name: Room-derived ACH proxy
-            min: 0
-            max: 1.5
-            needle: true
-            segments:
-              - from: 0
-                color: "#fb8c00"
-              - from: 0.35
-                color: "#2e7d32"
-              - from: 0.7
-                color: "#fdd835"
-              - from: 1.0
-                color: "#e53935"
-
-          - type: markdown
-            title: Non-space-heating gas baseline
-            content: >-
-              {% set s = 'sensor.metahome_thermal_efficiency_hot_water_gas' %}
-              **{{ states(s) }} kWh/day**
-              → £{{ state_attr(s, 'cost_per_day_gbp') }}/baseline day,
-              **£{{ state_attr(s, 'cost_per_year_gbp') | round(0) }}/modelled yr**.
-              Includes hot water plus any gas cooking or pilot load; estimated
-              from {{ state_attr(s, 'days_used') }} low-heating days.
-
-      # ------------------------------------------------------------------
-      - type: grid
-        cards:
-          - type: heading
-            heading: Trends & rooms
-
-          - type: statistics-graph
-            title: HLC over time (weekly mean)
-            entities:
-              - sensor.thermal_efficiency_heat_loss_coefficient
-            period: week
-            stat_types:
-              - mean
-            days_to_show: 365
-
-          - type: custom:flex-table-card
-            title: Room cooling ranking (τ hours, lower = cools faster)
-            entities:
-              include: sensor\.thermal_efficiency_.*_time_constant
-            sort_by: state+
-            columns:
-              - name: Room
-                data: friendly_name
-                modify: x.replace(' effective overnight cooling time constant','').replace('Thermal Efficiency ','')
-              - name: τ (h)
-                data: state
-              - name: Nights fitted
-                data: nights_fitted
+          - type: custom:thermal-storyboard-card
+            title: Thermal efficiency
+            hlc: sensor.thermal_efficiency_heat_loss_coefficient
+            fabric: sensor.metahome_thermal_efficiency_fabric_heat_loss
+            ventilation: sensor.metahome_thermal_efficiency_ventilation_heat_loss
+            ach: sensor.metahome_thermal_efficiency_air_change_rate
+            hot_water: sensor.metahome_thermal_efficiency_hot_water_gas
+            loft: sensor.thermal_efficiency_loft_ratio
+            rooms:
+              - sensor.thermal_efficiency_living_room_time_constant
+              - sensor.thermal_efficiency_bedroom_time_constant
+              - sensor.thermal_efficiency_kids_room_time_constant
+              - sensor.thermal_efficiency_kitchen_time_constant
+              - sensor.thermal_efficiency_bathroom_time_constant
+              - sensor.thermal_efficiency_office_time_constant

@@ -68,6 +68,50 @@ statistics are meaningless noise (recorder computes a running delta as if it
 were a meter) — `gas_unit_rate_entity` is read from its **live** state, not
 cached history, for both the offline `dhw` command and the live integration.
 
+## Thermal Storyboard dashboard card
+
+[`lovelace/thermal-storyboard-card.js`](lovelace/thermal-storyboard-card.js) is
+a dependency-free custom Lovelace card that combines the integration's three
+main visual stories:
+
+- HLC evidence: fit status, R², heating days, confidence interval and the
+  full-versus-recent estimate.
+- Heat-loss flow: delivered HLC split into fabric and ventilation W/K, with
+  non-space-heating gas kept separate because it is measured in kWh/day.
+- Room thermal fingerprints: effective cooling time constants ranked from
+  fastest to slowest cooling, with fit counts and observation windows.
+
+To install it, copy the JavaScript file to
+`/config/www/thermal-storyboard-card.js`, then add `/local/thermal-storyboard-card.js`
+as a **JavaScript module** under **Settings → Dashboards → Resources**. Paste
+[`lovelace/thermal_efficiency_dashboard.yaml`](lovelace/thermal_efficiency_dashboard.yaml)
+into a dashboard's raw configuration editor. The example entity IDs match the
+development instance; edit the `metahome_` variants if Home Assistant assigned
+different IDs on your installation.
+
+The full card configuration is explicit and therefore stable across entity
+renames:
+
+```yaml
+type: custom:thermal-storyboard-card
+title: Thermal efficiency
+hlc: sensor.thermal_efficiency_heat_loss_coefficient
+fabric: sensor.metahome_thermal_efficiency_fabric_heat_loss
+ventilation: sensor.metahome_thermal_efficiency_ventilation_heat_loss
+ach: sensor.metahome_thermal_efficiency_air_change_rate
+hot_water: sensor.metahome_thermal_efficiency_hot_water_gas
+loft: sensor.thermal_efficiency_loft_ratio
+rooms:
+  - sensor.thermal_efficiency_living_room_time_constant
+  - sensor.thermal_efficiency_bedroom_time_constant
+```
+
+`rooms` may be omitted: the card then discovers available time-constant
+entities that expose `nights_fitted`. Clicking any metric or room opens Home
+Assistant's normal entity detail dialog. The evidence panel intentionally does
+not fabricate a regression scatter plot from summary attributes; daily points
+remain a future diagnostics-data enhancement.
+
 ## Notes on data depth
 
 The `pull` command uses the recorder history API, which by default keeps ~10
