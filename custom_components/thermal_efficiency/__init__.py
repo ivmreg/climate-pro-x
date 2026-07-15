@@ -15,6 +15,8 @@ from .const import (
     CONF_BOILER_EFFICIENCY,
     CONF_CEILING_HEIGHT,
     CONF_CO2,
+    CONF_ELECTRICITY_METER,
+    CONF_ELECTRICITY_UNIT_RATE,
     CONF_FLOOR_AREA,
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
@@ -23,6 +25,7 @@ from .const import (
     CONF_LOFT_HUMIDITY,
     CONF_LOFT_SINCE,
     CONF_MAX_WINDOW_DAYS,
+    CONF_MIN_DHW_WATER_L,
     CONF_OUTDOOR,
     CONF_OUTDOOR_CO2,
     CONF_OUTDOOR_CO2_SENSOR,
@@ -31,6 +34,7 @@ from .const import (
     CONF_WATER,
     DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_MAX_WINDOW_DAYS,
+    DEFAULT_MIN_DHW_WATER_L,
     DOMAIN,
 )
 from .coordinator import ThermalCoordinator
@@ -84,7 +88,14 @@ CONFIG_SCHEMA = vol.Schema(
                 # external statistic (e.g. thames_water:thameswater_consumption)
                 # rather than a sensor.* entity.
                 vol.Optional(CONF_WATER): cv.string,
+                # Heating-off days with less metered water than this are
+                # treated as away days for the hot-water baseline.
+                vol.Optional(
+                    CONF_MIN_DHW_WATER_L, default=DEFAULT_MIN_DHW_WATER_L
+                ): _bounded_float(0.0, 2000.0),
                 vol.Optional(CONF_GAS_UNIT_RATE): cv.entity_id,
+                vol.Optional(CONF_ELECTRICITY_METER): cv.entity_id,
+                vol.Optional(CONF_ELECTRICITY_UNIT_RATE): cv.entity_id,
                 vol.Optional(
                     CONF_BOILER_EFFICIENCY, default=DEFAULT_BOILER_EFFICIENCY
                 ): _bounded_float(0.5, 1.0),

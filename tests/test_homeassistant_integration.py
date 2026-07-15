@@ -15,6 +15,8 @@ from custom_components.thermal_efficiency.config_flow import ThermalEfficiencyCo
 from custom_components.thermal_efficiency.const import (
     CONF_BOILER_EFFICIENCY,
     CONF_CO2,
+    CONF_ELECTRICITY_METER,
+    CONF_ELECTRICITY_UNIT_RATE,
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
     CONF_MAX_WINDOW_DAYS,
@@ -101,7 +103,7 @@ async def test_tariff_is_normalized_from_pence_per_kwh(hass):
         {"unit_of_measurement": "p/kWh"},
     )
 
-    assert coordinator._gas_unit_rate() == pytest.approx(0.0525)
+    assert coordinator._unit_rate(CONF_GAS_UNIT_RATE, "Gas") == pytest.approx(0.0525)
 
 
 async def test_tariff_with_unknown_unit_is_suppressed(hass):
@@ -112,7 +114,25 @@ async def test_tariff_with_unknown_unit_is_suppressed(hass):
         {"unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR},
     )
 
-    assert coordinator._gas_unit_rate() is None
+    assert coordinator._unit_rate(CONF_GAS_UNIT_RATE, "Gas") is None
+
+
+async def test_electricity_meter_and_tariff_are_wired(hass):
+    config = _config() | {
+        CONF_ELECTRICITY_METER: "sensor.electricity_energy",
+        CONF_ELECTRICITY_UNIT_RATE: "sensor.electricity_rate",
+    }
+    coordinator = ThermalCoordinator(hass, config)
+    hass.states.async_set(
+        "sensor.electricity_rate",
+        "18.4",
+        {"unit_of_measurement": "p/kWh"},
+    )
+
+    assert "sensor.electricity_energy" in coordinator._statistic_ids()
+    assert coordinator._unit_rate(
+        CONF_ELECTRICITY_UNIT_RATE, "Electricity"
+    ) == pytest.approx(0.184)
 
 
 async def test_options_entry_can_hold_legacy_scalar_co2(hass):

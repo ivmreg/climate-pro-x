@@ -15,11 +15,15 @@ CONF_OUTDOOR_CO2 = "outdoor_co2_ppm"
 CONF_OUTDOOR_CO2_SENSOR = "outdoor_co2_sensor"
 CONF_CEILING_HEIGHT = "ceiling_height_m"
 CONF_WATER = "water"
+CONF_MIN_DHW_WATER_L = "min_dhw_water_litres"
 CONF_GAS_UNIT_RATE = "gas_unit_rate"
 CONF_BOILER_EFFICIENCY = "boiler_efficiency"
+CONF_ELECTRICITY_METER = "electricity_meter"
+CONF_ELECTRICITY_UNIT_RATE = "electricity_unit_rate"
 
 DEFAULT_MAX_WINDOW_DAYS = 365
 DEFAULT_BOILER_EFFICIENCY = 0.88
+DEFAULT_MIN_DHW_WATER_L = 50.0
 # Windows tried in order until enough usable data is found.
 EXPANDING_WINDOWS_DAYS = (60, 120, 365)
 UPDATE_INTERVAL_HOURS = 6

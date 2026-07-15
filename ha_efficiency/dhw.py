@@ -14,6 +14,10 @@ import pandas as pd
 
 DHW_BASELINE_MAX_DT = 3.0
 DHW_BASELINE_MIN_DAYS = 14
+DHW_OCCUPIED_MIN_WATER_L = 50.0
+DHW_WATER_MIN_DAYS = 10
+DHW_RATE_MIN_WH_PER_L_PER_K = 0.05
+DHW_RATE_MAX_WH_PER_L_PER_K = 1.5
 DHW_REGRESSION_MIN_HOURS = 200
 DHW_REGRESSION_MIN_R2 = 0.5
 DHW_THEORETICAL_WH_PER_L = 34.8  # Wh to raise 1L by 30K, a combi's typical DHW rise
@@ -84,6 +88,39 @@ def dhw_daily_kwh(outdoor_c: float, baseline: dict) -> float:
     day_dt = MAINS_TANK_TEMP_C - mains_temp_c(outdoor_c)
     ratio = day_dt / ref_dt if ref_dt > 0 else 1.0
     return baseline["kwh_per_day"] * ratio
+
+
+def fit_dhw_water_rate(
+    q_daily: pd.Series,
+    water_daily: pd.Series,
+    outdoor_daily: pd.Series,
+    heating_off: set,
+    min_water_l: float = DHW_OCCUPIED_MIN_WATER_L,
+) -> dict | None:
+    """Mirror of thermal_math.fit_dhw_water_rate: daily gas-per-litre-per-K
+    rate from heating-off days with enough metered water that someone was
+    home (all gas on such days is hot water in an electric-cooking combi
+    home). The median rate predicts DHW gas on heating days from actual
+    litres instead of a constant mains-scaled baseline."""
+    df = pd.DataFrame(
+        {"q": q_daily, "water": water_daily, "outdoor": outdoor_daily}
+    ).dropna()
+    df = df[df.index.isin(list(heating_off)) & (df.water >= min_water_l) & (df.q > 0)]
+    rise = MAINS_TANK_TEMP_C - df.outdoor.map(mains_temp_c)
+    df, rise = df[rise > 0], rise[rise > 0]
+    if len(df) < DHW_WATER_MIN_DAYS:
+        return None
+    rates = df.q * 1000 / df.water / rise
+    rate = float(rates.median())
+    if not DHW_RATE_MIN_WH_PER_L_PER_K <= rate <= DHW_RATE_MAX_WH_PER_L_PER_K:
+        return None
+    return {"wh_per_litre_per_k": rate, "days_used": int(len(rates))}
+
+
+def dhw_kwh_from_water(litres: float, outdoor_c: float, water_rate: dict) -> float:
+    """DHW gas for a day, from its metered litres and the fitted daily rate."""
+    rise = MAINS_TANK_TEMP_C - mains_temp_c(outdoor_c)
+    return litres * water_rate["wh_per_litre_per_k"] * rise / 1000
 
 
 def corrected_hlc(

@@ -12,7 +12,9 @@ sensor, a loft sensor and a weather integration.
 | **Delivered Heat Loss Coefficient HLC (W/K), whole home** | Estimated heat delivered to replace each watt lost per degree of indoor/outdoor difference, after the DHW and boiler-efficiency corrections available from the data. | Temperatures + real gas kWh; the offline Tado proxy is trend-only |
 | **Loft ratio** | Directional evidence about how closely loft temperature follows indoors versus outdoors; not an insulation payback calculation. | Loft + indoor + outdoor temperatures |
 | **Ventilation vs fabric split (W/K)** | An exploratory split based on a room-derived CO2 decay proxy. A single room is not assumed to be a direct whole-home ACH measurement. | CO2 sensor, floor area, ceiling height, and valid HLC |
-| **Non-space-heating gas baseline (kWh/day, £/day, £/yr)** | Summer gas not explained by space heating. It includes hot water and any gas cooking/pilot load, and is used to de-bias HLC. | Gas meter and enough complete low-heating days |
+| **Non-space-heating gas baseline (kWh/day, £/day, £/yr)** | Gas on heating-off days (measured heating power where available, dT proxy otherwise). It includes hot water and any gas cooking/pilot load, and is used to de-bias HLC. With a water meter, low-water (away) days are excluded and a per-litre daily rate models DHW on heating days from actual usage. | Gas meter and enough complete low-heating days; water meter sharpens it |
+| **Hot water vs space heating usage split (kWh/day, 7/30-day)** | Rolling attributed gas: on heating-off days all gas is hot water, on heating days the water-rate model supplies the DHW share. | Gas meter + DHW baseline; water meter recommended |
+| **Electricity baseload (W) and daily use** | Always-on load from the cheapest hour of each day, daily kWh and cost, and the implied internal heat gains — context only, never mixed into the gas fits. | Electricity meter statistics |
 
 Treat these as household diagnostics rather than a substitute for a calibrated
 co-heating test or professional retrofit survey. The integration suppresses
@@ -68,11 +70,11 @@ statistics are meaningless noise (recorder computes a running delta as if it
 were a meter) — `gas_unit_rate_entity` is read from its **live** state, not
 cached history, for both the offline `dhw` command and the live integration.
 
-## Thermal Storyboard dashboard card
+## Thermal Storyboard dashboard
 
-[`lovelace/thermal-storyboard-card.js`](lovelace/thermal-storyboard-card.js) is
-a dependency-free custom Lovelace card that combines the integration's three
-main visual stories:
+[`lovelace/thermal_efficiency_dashboard.yaml`](lovelace/thermal_efficiency_dashboard.yaml)
+combines the integration's three main visual stories using cards already
+installed on the development Home Assistant instance:
 
 - HLC evidence: fit status, R², heating days, confidence interval and the
   full-versus-recent estimate.
@@ -81,35 +83,11 @@ main visual stories:
 - Room thermal fingerprints: effective cooling time constants ranked from
   fastest to slowest cooling, with fit counts and observation windows.
 
-To install it, copy the JavaScript file to
-`/config/www/thermal-storyboard-card.js`, then add `/local/thermal-storyboard-card.js`
-as a **JavaScript module** under **Settings → Dashboards → Resources**. Paste
-[`lovelace/thermal_efficiency_dashboard.yaml`](lovelace/thermal_efficiency_dashboard.yaml)
+It requires `apexcharts-card` and `lovelace-plotly-graph-card`. Paste the YAML
 into a dashboard's raw configuration editor. The example entity IDs match the
 development instance; edit the `metahome_` variants if Home Assistant assigned
-different IDs on your installation.
-
-The full card configuration is explicit and therefore stable across entity
-renames:
-
-```yaml
-type: custom:thermal-storyboard-card
-title: Thermal efficiency
-hlc: sensor.thermal_efficiency_heat_loss_coefficient
-fabric: sensor.metahome_thermal_efficiency_fabric_heat_loss
-ventilation: sensor.metahome_thermal_efficiency_ventilation_heat_loss
-ach: sensor.metahome_thermal_efficiency_air_change_rate
-hot_water: sensor.metahome_thermal_efficiency_hot_water_gas
-loft: sensor.thermal_efficiency_loft_ratio
-rooms:
-  - sensor.thermal_efficiency_living_room_time_constant
-  - sensor.thermal_efficiency_bedroom_time_constant
-```
-
-`rooms` may be omitted: the card then discovers available time-constant
-entities that expose `nights_fitted`. Clicking any metric or room opens Home
-Assistant's normal entity detail dialog. The evidence panel intentionally does
-not fabricate a regression scatter plot from summary attributes; daily points
+different IDs on your installation. The evidence panel intentionally does not
+fabricate a regression scatter plot from summary attributes; daily points
 remain a future diagnostics-data enhancement.
 
 ## Notes on data depth
@@ -151,12 +129,30 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
   ignored — a sensor that merely sat somewhere else warm won't necessarily
   flatline, so this isn't caught automatically otherwise.
 - `sensor.thermal_efficiency_hot_water_gas` — non-space-heating gas (hot water,
-  plus any gas cooking/pilot), kWh/day,
-  from a robust summer (heating-off) baseline; attributes include
-  `cost_per_day_gbp`/`cost_per_year_gbp` (needs `gas_unit_rate`) and,
-  once enough hourly water history has accrued, an informational
-  `wh_per_litre`/`hot_fraction_of_metered_water_pct` from a gas-vs-water
-  regression (needs `water`).
+  plus any gas cooking/pilot), kWh/day, from a robust heating-off baseline.
+  Heating-off days come from the rooms' heating-power statistics where they
+  exist and from the dT proxy otherwise; with a `water` statistic, days below
+  `min_dhw_water_litres` (default 50 L) count as away days and are excluded,
+  with their median gas reported as `idle_gas_kwh_per_day` (boiler standby —
+  ~0 for a combi). Attributes include `cost_per_day_gbp`/`cost_per_year_gbp`
+  (needs `gas_unit_rate`), the fitted daily
+  `water_rate_wh_per_litre_per_k` used to model DHW on heating days from
+  actual litres, and the informational hourly
+  `wh_per_litre`/`hot_fraction_of_metered_water_pct` regression.
+- `sensor.thermal_efficiency_hot_water_gas_7_day_average` and
+  `..._space_heating_gas_7_day_average` — rolling attributed usage in
+  kWh/day: on heating-off days all gas is hot water (exact in an
+  electric-cooking combi home), on heating days the water-rate model (or the
+  mains-scaled baseline before water history starts) supplies the DHW share
+  and the remainder is space heating. 30-day means and £/day ride along as
+  attributes; HA records the states, so both trend over time.
+- `sensor.thermal_efficiency_electricity_baseload` — always-on electrical
+  load in W (median across days of the cheapest hour), with daily kWh
+  (window/7d/30d), annual cost and baseload cost (needs
+  `electricity_unit_rate`), and `implied_internal_gains_w` — the average
+  electrical draw that ends up as indoor heat, useful context for the HLC
+  free-gains intercept but deliberately never subtracted from the gas fits
+  (needs `electricity_meter`).
 - `sensor.thermal_efficiency_air_change_rate` — median room-derived air-change
   proxy (1/h) from independently fitted CO2 sensors (needs `co2`; configure an
   `outdoor_co2_sensor` or `outdoor_co2_ppm` rather than relying on the
@@ -177,9 +173,10 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
    Efficiency".** The setup wizard is:
    - One form for whole-home sensors: outdoor, gas meter, loft (+
      `loft_since`/`loft_humidity`), floor area, ceiling height, a CO2
-     sensor, a water statistic, a gas tariff sensor and boiler efficiency
-     (the last five are all optional — see the metrics table above for
-     what each unlocks).
+     sensor, a water statistic (+ the away-day litres threshold), a gas
+     tariff sensor, an electricity meter and tariff, and boiler efficiency
+     (everything past the gas meter is optional — see the metrics table
+     above for what each unlocks).
    - Then, per room: pick an existing **Versatile Thermostat climate
      entity** to auto-fill that room's name (from its Area) and
      temperature sensor (its EMA sensor — same device as the climate
@@ -219,7 +216,12 @@ thermal_efficiency:
   # An external statistic id (not a sensor.* entity - see the gotcha above),
   # e.g. from a water-utility integration with genuine hourly usage.
   water: thames_water:thameswater_consumption
+  # Heating-off days with less metered water than this are treated as away
+  # days (excluded from the hot-water baseline and rate fit). Default 50.
+  min_dhw_water_litres: 50
   gas_unit_rate: sensor.smart_meter_gas_import_unit_rate
+  electricity_meter: sensor.smart_meter_electricity_import
+  electricity_unit_rate: sensor.smart_meter_electricity_import_unit_rate
   boiler_efficiency: 0.88
   rooms:
     living_room:

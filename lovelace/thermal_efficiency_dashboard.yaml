@@ -1,19 +1,9 @@
-# Thermal Efficiency dashboard.
+# Thermal Storyboard dashboard using cards already installed on this instance:
+#   - apexcharts-card
+#   - lovelace-plotly-graph-card
 #
-# Install: Settings -> Dashboards -> Add dashboard -> "New dashboard from
-# scratch" -> open it -> pencil icon -> three-dot menu -> "Raw configuration
-# editor" -> paste this whole file.
-#
-# Install the companion card first:
-#   1. Copy lovelace/thermal-storyboard-card.js to
-#      /config/www/thermal-storyboard-card.js.
-#   2. Settings -> Dashboards -> three-dot menu -> Resources -> Add resource:
-#        URL: /local/thermal-storyboard-card.js
-#        Type: JavaScript module
-#
-# No third-party Lovelace cards are required. Entity ids below match this
-# instance; a fresh install may name the newer sensors without the
-# "metahome_" device prefix, so adjust those ids if needed.
+# Install: create a dashboard, open its raw configuration editor, and paste
+# this whole file. No additional JavaScript resource is required.
 
 views:
   - title: Thermal efficiency
@@ -21,21 +11,311 @@ views:
     type: sections
     max_columns: 4
     sections:
+      # Evidence: headline quality and supporting history.
       - type: grid
         column_span: 4
         cards:
-          - type: custom:thermal-storyboard-card
-            title: Thermal efficiency
-            hlc: sensor.thermal_efficiency_heat_loss_coefficient
-            fabric: sensor.metahome_thermal_efficiency_fabric_heat_loss
-            ventilation: sensor.metahome_thermal_efficiency_ventilation_heat_loss
-            ach: sensor.metahome_thermal_efficiency_air_change_rate
-            hot_water: sensor.metahome_thermal_efficiency_hot_water_gas
-            loft: sensor.thermal_efficiency_loft_ratio
-            rooms:
-              - sensor.thermal_efficiency_living_room_time_constant
-              - sensor.thermal_efficiency_bedroom_time_constant
-              - sensor.thermal_efficiency_kids_room_time_constant
-              - sensor.thermal_efficiency_kitchen_time_constant
-              - sensor.thermal_efficiency_bathroom_time_constant
-              - sensor.thermal_efficiency_office_time_constant
+          - type: heading
+            heading: Can I trust the heat-loss number?
+            heading_style: title
+            icon: mdi:chart-scatter-plot
+
+          - type: markdown
+            title: Delivered heat loss
+            grid_options:
+              columns: 6
+              rows: 4
+            content: >-
+              {% set s = 'sensor.thermal_efficiency_heat_loss_coefficient' %}
+              {% set value = states(s) | float(0) %}
+              {% set status = state_attr(s, 'status') | default('unknown', true) %}
+              {% set days = state_attr(s, 'days_used') | int(0) %}
+              {% set r2 = state_attr(s, 'r_squared') | float(0) %}
+              {% set low = state_attr(s, 'confidence_interval_low_w_per_k') | float(0) %}
+              {% set high = state_attr(s, 'confidence_interval_high_w_per_k') | float(0) %}
+              {% set recent = state_attr(s, 'recent_hlc_w_per_k') | float(0) %}
+              {% set recent_window = state_attr(s, 'recent_window_days') | int(0) %}
+              {% set intercept = state_attr(s, 'regression_intercept_kwh_per_day') | float(0) %}
+              {% set change = ((recent - value) / value * 100) if value and recent else none %}
+
+              # {{ value | round(0) }} W/K
+
+              **{{ status | title }}** · {{ days }} heating days · R² {{ r2 | round(3) }}
+
+              Approximate 95% interval: **{{ low | round(0) }}–{{ high | round(0) }} W/K**
+
+              {% if recent %}
+              Recent {{ recent_window }}-day estimate: **{{ recent | round(0) }} W/K**
+              {% if change is not none %}({{ '%+.0f' | format(change) }}% versus the full window){% endif %}
+              {% endif %}
+
+              Regression intercept: **{{ intercept | round(1) }} kWh/day**.
+              {{ state_attr(s, 'dhw_correction') }}
+
+          - type: custom:apexcharts-card
+            section_mode: true
+            grid_options:
+              columns: 6
+              rows: 4
+            graph_span: 365d
+            header:
+              show: true
+              title: HLC history — weekly mean
+              show_states: true
+              colorize_states: true
+            yaxis:
+              - min: 0
+                decimals: 0
+                apex_config:
+                  title:
+                    text: W/K
+            apex_config:
+              chart:
+                height: 260
+              stroke:
+                width: 3
+              annotations:
+                yaxis:
+                  - "y": 300
+                    borderColor: "#fb8c00"
+                    strokeDashArray: 4
+                    label:
+                      text: 300 W/K context line
+            series:
+              - entity: sensor.thermal_efficiency_heat_loss_coefficient
+                name: Delivered HLC
+                color: "#ef6c00"
+                type: area
+                curve: smooth
+                opacity: 0.22
+                stroke_width: 3
+                statistics:
+                  type: mean
+                  period: week
+                  align: middle
+
+      # Diagnosis: a unit-consistent W/K Sankey and separate DHW context.
+      - type: grid
+        column_span: 4
+        cards:
+          - type: heading
+            heading: Where does the heat go?
+            heading_style: title
+            icon: mdi:chart-sankey-variant
+
+          - type: custom:plotly-graph
+            title: Delivered space-heating loss (W/K)
+            grid_options:
+              columns: 8
+              rows: 5
+            raw_plotly_config: true
+            refresh_interval: auto
+            entities:
+              - entity: sensor.thermal_efficiency_heat_loss_coefficient
+                type: sankey
+                orientation: h
+                arrangement: fixed
+                node:
+                  pad: 30
+                  thickness: 28
+                  line:
+                    color: rgba(0,0,0,0.22)
+                    width: 1
+                  label:
+                    - Delivered HLC
+                    - Fabric
+                    - Ventilation
+                  color:
+                    - "#ff8a65"
+                    - "#ef6c00"
+                    - "#1e88e5"
+                  x:
+                    - 0.05
+                    - 0.78
+                    - 0.78
+                  "y":
+                    - 0.5
+                    - 0.22
+                    - 0.76
+                  hovertemplate: "%{label}<extra></extra>"
+                link:
+                  source:
+                    - 0
+                    - 0
+                  target:
+                    - 1
+                    - 2
+                  value: >-
+                    $ex [
+                      Number(hass.states['sensor.metahome_thermal_efficiency_fabric_heat_loss']?.state) || 0,
+                      Number(hass.states['sensor.metahome_thermal_efficiency_ventilation_heat_loss']?.state) || 0
+                    ]
+                  color:
+                    - rgba(239,108,0,0.58)
+                    - rgba(30,136,229,0.58)
+                  customdata: >-
+                    $ex [
+                      Number(hass.states['sensor.metahome_thermal_efficiency_fabric_heat_loss']?.state) || 0,
+                      Number(hass.states['sensor.metahome_thermal_efficiency_ventilation_heat_loss']?.state) || 0
+                    ]
+                  hovertemplate: "%{target.label}: %{customdata:.1f} W/K<extra></extra>"
+            layout:
+              height: 330
+              margin:
+                l: 20
+                r: 20
+                t: 35
+                b: 20
+              font:
+                color: $ex css_vars['primary-text-color']
+              paper_bgcolor: rgba(0,0,0,0)
+              plot_bgcolor: rgba(0,0,0,0)
+            config:
+              displayModeBar: false
+              responsive: true
+
+          - type: vertical-stack
+            grid_options:
+              columns: 4
+              rows: 5
+            cards:
+              - type: tile
+                entity: sensor.metahome_thermal_efficiency_air_change_rate
+                name: Room-derived ACH proxy
+                icon: mdi:weather-windy
+                color: blue
+                vertical: false
+                features_position: bottom
+
+              - type: markdown
+                title: Ventilation evidence
+                content: >-
+                  {% set s = 'sensor.metahome_thermal_efficiency_air_change_rate' %}
+                  **{{ states(s) }}/h** from
+                  **{{ state_attr(s, 'co2_sensors_used') }} CO₂ sensors** and
+                  **{{ state_attr(s, 'decay_windows_used') }} decay windows**.
+
+                  Baseline: **{{ state_attr(s, 'outdoor_co2_baseline_ppm') | round(0) }} ppm**
+                  ({{ state_attr(s, 'co2_baseline_source') }}).
+
+                  This is a room-derived proxy, not a compliance ventilation measurement.
+
+              - type: markdown
+                title: Non-space-heating gas
+                content: >-
+                  {% set s = 'sensor.metahome_thermal_efficiency_hot_water_gas' %}
+                  # {{ states(s) }} kWh/day
+
+                  {% set yearly = state_attr(s, 'cost_per_year_gbp') %}
+                  {% if yearly is not none %}**£{{ yearly | round(0) }}/modelled year** · {% endif %}
+                  {{ state_attr(s, 'days_used') }} low-heating days.
+
+                  Kept separate from the Sankey because this is energy per day,
+                  while the space-heating branches are W/K.
+
+      # Action: room ranking with fit evidence in hover text.
+      - type: grid
+        column_span: 4
+        cards:
+          - type: heading
+            heading: Which rooms cool fastest?
+            heading_style: title
+            icon: mdi:home-thermometer-outline
+
+          - type: custom:plotly-graph
+            title: Room thermal fingerprints — effective τ
+            grid_options:
+              columns: 12
+              rows: 6
+            raw_plotly_config: true
+            refresh_interval: auto
+            entities:
+              - entity: sensor.thermal_efficiency_living_room_time_constant
+                type: bar
+                orientation: h
+                x: >-
+                  $ex {
+                    vars.roomRows = [
+                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
+                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
+                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
+                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
+                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
+                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
+                    ].map(([name, id]) => ({
+                      name,
+                      value: Number(hass.states[id]?.state),
+                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
+                    })).filter(room => Number.isFinite(room.value))
+                       .sort((a, b) => b.value - a.value);
+                    return vars.roomRows.map(room => room.value);
+                  }
+                "y": $ex vars.roomRows.map(room => room.name)
+                customdata: >-
+                  $ex vars.roomRows.map(room => room.nights)
+                marker:
+                  color: >-
+                    $ex vars.roomRows.map((room, index) =>
+                      ['#2e7d32', '#7cb342', '#f9a825', '#ef6c00', '#d84315', '#c62828'][index]
+                    )
+                texttemplate: "%{x:.1f} h"
+                textposition: auto
+                hovertemplate: "%{y}<br>τ %{x:.1f} h<br>%{customdata} fitted nights<extra></extra>"
+            layout:
+              height: 390
+              margin:
+                l: 105
+                r: 25
+                t: 40
+                b: 55
+              bargap: 0.28
+              xaxis:
+                title: Effective overnight cooling time constant τ (hours)
+                rangemode: tozero
+                gridcolor: rgba(127,127,127,0.18)
+              "yaxis":
+                automargin: true
+              font:
+                color: $ex css_vars['primary-text-color']
+              paper_bgcolor: rgba(0,0,0,0)
+              plot_bgcolor: rgba(0,0,0,0)
+            config:
+              displayModeBar: false
+              responsive: true
+
+          - type: markdown
+            title: Interpretation
+            grid_options:
+              columns: 12
+              rows: 3
+            content: >-
+              {% set hlc = states('sensor.thermal_efficiency_heat_loss_coefficient') | float(0) %}
+              {% set fabric = states('sensor.metahome_thermal_efficiency_fabric_heat_loss') | float(0) %}
+              {% set vent = states('sensor.metahome_thermal_efficiency_ventilation_heat_loss') | float(0) %}
+              {% set co2_count = state_attr('sensor.metahome_thermal_efficiency_air_change_rate', 'co2_sensors_used') | int(0) %}
+              {% set status = state_attr('sensor.thermal_efficiency_heat_loss_coefficient', 'status') %}
+              {% set fastest = [
+                ('Office', states('sensor.thermal_efficiency_office_time_constant') | float(999)),
+                ('Living room', states('sensor.thermal_efficiency_living_room_time_constant') | float(999)),
+                ('Bedroom', states('sensor.thermal_efficiency_bedroom_time_constant') | float(999)),
+                ('Kids room', states('sensor.thermal_efficiency_kids_room_time_constant') | float(999)),
+                ('Bathroom', states('sensor.thermal_efficiency_bathroom_time_constant') | float(999)),
+                ('Kitchen', states('sensor.thermal_efficiency_kitchen_time_constant') | float(999))
+              ] | sort(attribute=1) %}
+
+              {% if fabric and vent and fabric > vent * 2 %}
+              **The strongest signal is fabric loss**, not ventilation. Start investigation
+              with **{{ fastest[0][0] }}** and **{{ fastest[1][0] }}**, the fastest-cooling
+              rooms in the current fits. Check glazing seals, penetrations, external walls,
+              and sensor placement before drawing retrofit conclusions.
+              {% elif fabric and vent %}
+              Ventilation is a material part of the observed loss. Investigate controlled
+              ventilation and draught paths alongside room fabric.
+              {% else %}
+              A physically consistent fabric/ventilation split is not currently available.
+              {% endif %}
+
+              Evidence status: **{{ status }}**{% if co2_count %}; ventilation uses
+              {{ co2_count }} room-derived CO₂ proxies{% endif %}. Effective τ combines
+              fabric, draughts, thermal mass, and heat exchange with adjacent rooms—it does
+              not identify a defect by itself.

@@ -20,6 +20,8 @@ from .const import (
     CONF_BOILER_EFFICIENCY,
     CONF_CEILING_HEIGHT,
     CONF_CO2,
+    CONF_ELECTRICITY_METER,
+    CONF_ELECTRICITY_UNIT_RATE,
     CONF_FLOOR_AREA,
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
@@ -28,6 +30,7 @@ from .const import (
     CONF_LOFT_HUMIDITY,
     CONF_LOFT_SINCE,
     CONF_MAX_WINDOW_DAYS,
+    CONF_MIN_DHW_WATER_L,
     CONF_OUTDOOR,
     CONF_OUTDOOR_CO2,
     CONF_OUTDOOR_CO2_SENSOR,
@@ -69,20 +72,22 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             ids.add(self.conf[CONF_OUTDOOR_CO2_SENSOR])
         if self.conf.get(CONF_WATER):
             ids.add(self.conf[CONF_WATER])
+        if self.conf.get(CONF_ELECTRICITY_METER):
+            ids.add(self.conf[CONF_ELECTRICITY_METER])
         for room in self.conf[CONF_ROOMS].values():
             ids.add(room[CONF_TEMPERATURE])
             if room.get(CONF_HEATING_POWER):
                 ids.add(room[CONF_HEATING_POWER])
         return ids
 
-    def _gas_unit_rate(self) -> float | None:
+    def _unit_rate(self, conf_key: str, fuel: str) -> float | None:
         """Return the latest tariff normalized to GBP/kWh.
 
         Tariff integrations commonly expose either pounds or pence per kWh.
         Silently treating the latter as pounds creates a 100x cost error, so an
         unknown or missing unit is rejected instead of guessed.
         """
-        entity_id = self.conf.get(CONF_GAS_UNIT_RATE)
+        entity_id = self.conf.get(conf_key)
         if not entity_id:
             return None
         state = self.hass.states.get(entity_id)
@@ -98,7 +103,8 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
         if not isinstance(unit, str):
             _LOGGER.warning(
-                "Gas tariff %s has no unit; expected GBP/kWh or p/kWh",
+                "%s tariff %s has no unit; expected GBP/kWh or p/kWh",
+                fuel,
                 entity_id,
             )
             return None
@@ -112,7 +118,8 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             return value / 1000.0
 
         _LOGGER.warning(
-            "Gas tariff %s uses unsupported unit %s; expected GBP/kWh or p/kWh",
+            "%s tariff %s uses unsupported unit %s; expected GBP/kWh or p/kWh",
+            fuel,
             entity_id,
             unit,
         )
@@ -155,8 +162,13 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
                 "outdoor_co2_sensor": self.conf.get(CONF_OUTDOOR_CO2_SENSOR),
                 "ceiling_height_m": self.conf.get(CONF_CEILING_HEIGHT),
                 "water": self.conf.get(CONF_WATER),
-                "gas_unit_rate": self._gas_unit_rate(),
+                "min_dhw_water_litres": self.conf.get(CONF_MIN_DHW_WATER_L),
+                "gas_unit_rate": self._unit_rate(CONF_GAS_UNIT_RATE, "Gas"),
                 "boiler_efficiency": self.conf.get(CONF_BOILER_EFFICIENCY),
+                "electricity_meter": self.conf.get(CONF_ELECTRICITY_METER),
+                "electricity_unit_rate": self._unit_rate(
+                    CONF_ELECTRICITY_UNIT_RATE, "Electricity"
+                ),
             },
             dt_util.get_default_time_zone(),
             now,

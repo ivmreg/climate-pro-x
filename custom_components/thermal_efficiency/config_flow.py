@@ -23,6 +23,8 @@ from .const import (
     CONF_BOILER_EFFICIENCY,
     CONF_CEILING_HEIGHT,
     CONF_CO2,
+    CONF_ELECTRICITY_METER,
+    CONF_ELECTRICITY_UNIT_RATE,
     CONF_FLOOR_AREA,
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
@@ -31,6 +33,7 @@ from .const import (
     CONF_LOFT_HUMIDITY,
     CONF_LOFT_SINCE,
     CONF_MAX_WINDOW_DAYS,
+    CONF_MIN_DHW_WATER_L,
     CONF_OUTDOOR,
     CONF_OUTDOOR_CO2,
     CONF_OUTDOOR_CO2_SENSOR,
@@ -39,6 +42,7 @@ from .const import (
     CONF_WATER,
     DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_MAX_WINDOW_DAYS,
+    DEFAULT_MIN_DHW_WATER_L,
     DOMAIN,
 )
 
@@ -125,9 +129,33 @@ def _global_schema(defaults: dict | None = None) -> vol.Schema:
             vol.Optional(
                 CONF_WATER, description=_suggest(defaults.get(CONF_WATER))
             ): selector.StatisticSelector(),
+            # Heating-off days with less metered water than this count as
+            # away days and are kept out of the hot-water baseline.
+            vol.Optional(
+                CONF_MIN_DHW_WATER_L,
+                description=_suggest(
+                    defaults.get(CONF_MIN_DHW_WATER_L, DEFAULT_MIN_DHW_WATER_L)
+                ),
+            ): selector.NumberSelector(
+                selector.NumberSelectorConfig(
+                    min=0,
+                    max=2000,
+                    step=5,
+                    unit_of_measurement="L",
+                    mode=selector.NumberSelectorMode.BOX,
+                )
+            ),
             vol.Optional(
                 CONF_GAS_UNIT_RATE,
                 description=_suggest(defaults.get(CONF_GAS_UNIT_RATE)),
+            ): _entity_selector(device_class="monetary"),
+            vol.Optional(
+                CONF_ELECTRICITY_METER,
+                description=_suggest(defaults.get(CONF_ELECTRICITY_METER)),
+            ): _entity_selector(device_class="energy"),
+            vol.Optional(
+                CONF_ELECTRICITY_UNIT_RATE,
+                description=_suggest(defaults.get(CONF_ELECTRICITY_UNIT_RATE)),
             ): _entity_selector(device_class="monetary"),
             vol.Optional(
                 CONF_BOILER_EFFICIENCY,
@@ -163,6 +191,8 @@ def _normalize_global(user_input: dict) -> dict:
         data[CONF_BOILER_EFFICIENCY] = float(data[CONF_BOILER_EFFICIENCY])
     if CONF_OUTDOOR_CO2 in data:
         data[CONF_OUTDOOR_CO2] = float(data[CONF_OUTDOOR_CO2])
+    if CONF_MIN_DHW_WATER_L in data:
+        data[CONF_MIN_DHW_WATER_L] = float(data[CONF_MIN_DHW_WATER_L])
     return data
 
 
