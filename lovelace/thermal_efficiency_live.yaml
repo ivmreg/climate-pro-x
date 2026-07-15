@@ -1,11 +1,3 @@
-# Thermal Efficiency dashboard for this Home Assistant instance.
-# Requires apexcharts-card and lovelace-plotly-graph-card.
-# Paste this file into a dashboard's raw configuration editor.
-#
-# Entity IDs are intentionally mixed: entities created before the HA device
-# rename kept sensor.thermal_efficiency_*, while newer entities use
-# sensor.metahome_thermal_efficiency_*.
-
 views:
   - title: Thermal efficiency
     icon: mdi:home-thermometer
@@ -13,20 +5,9 @@ views:
     max_columns: 3
     dense_section_placement: true
     sections:
-      # ------------------------------------------------------------------
-      # One-screen status: the three numbers most worth watching.
-      # ------------------------------------------------------------------
       - type: grid
-        column_span: 3
+        column_span: 1
         cards:
-          - type: heading
-            heading: Home performance
-            heading_style: title
-            icon: mdi:home-analytics
-            grid_options:
-              columns: 12
-              rows: 1
-
           - type: gauge
             entity: sensor.thermal_efficiency_heat_loss_coefficient
             name: Delivered heat loss
@@ -47,7 +28,6 @@ views:
                 color: "#ef6c00"
               - from: 400
                 color: "#c62828"
-
           - type: gauge
             entity: sensor.metahome_thermal_efficiency_air_change_rate
             name: Air changes per hour
@@ -66,7 +46,6 @@ views:
                 color: "#f9a825"
               - from: 1
                 color: "#c62828"
-
           - type: gauge
             entity: sensor.metahome_thermal_efficiency_electricity_baseload
             name: Always-on electricity
@@ -85,366 +64,10 @@ views:
                 color: "#f9a825"
               - from: 300
                 color: "#c62828"
-
-          - type: markdown
-            grid_options:
-              columns: 12
-              rows: 2
-            content: >-
-              {% set s = 'sensor.thermal_efficiency_heat_loss_coefficient' %}
-              {% set r2 = state_attr(s, 'r_squared') | float(0) %}
-              {% set days = state_attr(s, 'days_used') | int(0) %}
-              {% set low = state_attr(s, 'confidence_interval_low_w_per_k') %}
-              {% set high = state_attr(s, 'confidence_interval_high_w_per_k') %}
-              {% set through = state_attr(s, 'model_data_through') %}
-              **Heating model:** {{ days }} days · R² {{ r2 | round(2) }}{% if
-              low is not none and high is not none %} · 95% range {{ low |
-              round(0) }}–{{ high | round(0) }} W/K{% endif %} · fixed through
-              **{{ through | default('the latest heating day', true) }}**.
-              Summer hot-water data can update without moving this heating
-              baseline. HLC colours are context bands, not an EPC rating.
-
-      # ------------------------------------------------------------------
-      # Diagnosis: what intervention category matters.
-      # ------------------------------------------------------------------
       - type: grid
         cards:
-          - type: heading
-            heading: Where heat escapes
-            icon: mdi:home-export-outline
-
-          - type: custom:apexcharts-card
-            chart_type: donut
-            header:
-              show: true
-              title: Delivered loss split
-              show_states: true
-              colorize_states: true
-            apex_config:
-              chart:
-                height: 285
-              legend:
-                position: bottom
-              dataLabels:
-                enabled: true
-                formatter: |
-                  EVAL:function(value) { return Math.round(value) + '%'; }
-              plotOptions:
-                pie:
-                  donut:
-                    size: 64%
-            series:
-              - entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
-                name: Fabric
-                color: "#ef5350"
-              - entity: sensor.metahome_thermal_efficiency_ventilation_heat_loss
-                name: Ventilation
-                color: "#42a5f5"
-
-          - type: tile
-            entity: sensor.thermal_efficiency_loft_ratio
-            name: Loft coupling ratio
-            icon: mdi:home-roof
-            color: cyan
-
-          - type: markdown
-            title: What this suggests
-            content: >-
-              {% set fabric = states('sensor.metahome_thermal_efficiency_fabric_heat_loss') | float(0) %}
-              {% set vent = states('sensor.metahome_thermal_efficiency_ventilation_heat_loss') | float(0) %}
-              {% set total = fabric + vent %}
-              {% set share = (fabric / total * 100) if total else 0 %}
-              **{{ share | round(0) }}% fabric / {{ (100 - share) | round(0) }}%
-              ventilation.** The model currently points much more strongly to
-              walls, windows, floor and ceiling than to draughts. The loft
-              ratio is directional evidence, not an insulation score.
-
-      # ------------------------------------------------------------------
-      # Gas: recent actual attribution versus the slow-moving reference.
-      # ------------------------------------------------------------------
-      - type: grid
-        cards:
-          - type: heading
-            heading: Gas use
-            icon: mdi:meter-gas
-
-          - type: tile
-            entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
-            name: Hot water · 7-day average
-            icon: mdi:shower-head
-            color: blue
-            grid_options:
-              columns: 6
-              rows: 2
-
-          - type: tile
-            entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
-            name: Space heating · 7-day average
-            icon: mdi:radiator
-            color: deep-orange
-            grid_options:
-              columns: 6
-              rows: 2
-
-          - type: custom:apexcharts-card
-            chart_type: donut
-            header:
-              show: true
-              title: Last 30 days
-              show_states: true
-              colorize_states: true
-            apex_config:
-              chart:
-                height: 245
-              legend:
-                position: bottom
-              plotOptions:
-                pie:
-                  donut:
-                    size: 65%
-            series:
-              - entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
-                attribute: kwh_per_day_30d
-                name: Hot water
-                color: "#42a5f5"
-              - entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
-                attribute: kwh_per_day_30d
-                name: Space heating
-                color: "#ef6c00"
-
-          - type: custom:apexcharts-card
-            header:
-              show: true
-              title: Attributed gas · 90 days
-            graph_span: 90d
-            span:
-              end: day
-            apex_config:
-              chart:
-                height: 230
-              stroke:
-                curve: smooth
-              legend:
-                position: top
-              yaxis:
-                min: 0
-                decimalsInFloat: 1
-                title:
-                  text: kWh/day
-            series:
-              - entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
-                name: Hot water
-                color: "#42a5f5"
-                type: area
-                stroke_width: 2
-                opacity: 0.18
-                group_by:
-                  duration: 1d
-                  func: avg
-              - entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
-                name: Space heating
-                color: "#ef6c00"
-                type: area
-                stroke_width: 2
-                opacity: 0.14
-                group_by:
-                  duration: 1d
-                  func: avg
-
-          - type: markdown
-            title: Recent vs typical
-            content: >-
-              {% set baseline = 'sensor.metahome_thermal_efficiency_hot_water_gas' %}
-              {% set recent = 'sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average' %}
-              {% set b = states(baseline) | float(0) %}
-              {% set r = states(recent) | float(0) %}
-              {% set delta = ((r - b) / b * 100) if b else none %}
-              {% set outliers = state_attr(recent, 'water_outlier_days_ignored') | int(0) %}
-              {% if delta is not none %}Recent hot-water gas is **{{ delta | abs
-              | round(0) }}% {{ 'below' if delta < 0 else 'above' }}** the
-              typical {{ b | round(1) }} kWh/day baseline.{% else %}Waiting
-              for enough heating-off days to establish the hot-water
-              baseline.{% endif %}{% if outliers %} **{{
-              outliers }}** extreme water-use day{{ '' if outliers == 1 else
-              's' }} used the safer weather baseline instead.{% endif %}
-
-      # ------------------------------------------------------------------
-      # Electricity: one behavioural metric and one persistent-load metric.
-      # ------------------------------------------------------------------
-      - type: grid
-        cards:
-          - type: heading
-            heading: Electricity
-            icon: mdi:transmission-tower-import
-
-          - type: tile
-            entity: sensor.metahome_thermal_efficiency_electricity_use_7_day_average
-            name: Use · 7-day average
-            icon: mdi:flash
-            color: amber
-
-          - type: custom:apexcharts-card
-            header:
-              show: true
-              title: Electricity use · 90 days
-            graph_span: 90d
-            span:
-              end: day
-            apex_config:
-              chart:
-                height: 255
-              stroke:
-                curve: smooth
-              yaxis:
-                min: 0
-                decimalsInFloat: 1
-                title:
-                  text: kWh/day
-            series:
-              - entity: sensor.metahome_thermal_efficiency_electricity_use_7_day_average
-                name: Electricity
-                color: "#f9a825"
-                type: area
-                stroke_width: 2
-                opacity: 0.2
-                group_by:
-                  duration: 1d
-                  func: avg
-
-          - type: markdown
-            title: Cost and persistent load
-            content: >-
-              {% set base = 'sensor.metahome_thermal_efficiency_electricity_baseload' %}
-              {% set use = 'sensor.metahome_thermal_efficiency_electricity_use_7_day_average' %}
-              {% set daily = state_attr(use, 'kwh_per_day_30d') %}
-              {% set change = state_attr(use, 'change_vs_previous_30d_pct') %}
-              {% set share = state_attr(base, 'baseload_share_pct') %}
-              {% set cost = state_attr(use, 'variable_cost_per_year_gbp_30d') %}
-              {% set base_cost = state_attr(base, 'baseload_cost_per_year_gbp') %}
-              {% if daily is not none %}**{{ daily | round(1) }} kWh/day** over
-              30 days{% if change is not
-              none %} · **{{ change | abs | round(0) }}% {{ 'down' if change <
-              0 else 'up' }}** versus the previous 30{% endif %}.{% else
-              %}Waiting for 30 days of electricity statistics.{% endif %}{% if cost is
-              not none %} Annualised variable cost: **£{{ cost | round(0) }}**
-              (standing charge excluded).{% endif %}
-
-              The **{{ states(base) }} W** floor{% if share is not none %} is
-              about {{ share | round(0) }}% of use{% endif %}{% if base_cost is
-              not none %} and costs £{{ base_cost | round(0) }}/year{% endif
-              %}—the part worth investigating first.
-
-      # ------------------------------------------------------------------
-      # Water is kept separate: it is explanatory context, not hot litres.
-      # ------------------------------------------------------------------
-      - type: grid
-        cards:
-          - type: heading
-            heading: Water
-            icon: mdi:water
-
-          - type: tile
-            entity: sensor.metahome_thermal_efficiency_total_water_use_7_day_average
-            name: Total water · latest 7 reported days
-            icon: mdi:water-outline
-            color: cyan
-
-          - type: custom:apexcharts-card
-            header:
-              show: true
-              title: Total water · 90 days
-            graph_span: 90d
-            span:
-              end: day
-            apex_config:
-              chart:
-                height: 255
-              stroke:
-                curve: smooth
-              yaxis:
-                min: 0
-                decimalsInFloat: 0
-                title:
-                  text: L/day
-            series:
-              - entity: sensor.metahome_thermal_efficiency_total_water_use_7_day_average
-                name: Total water
-                color: "#26c6da"
-                type: area
-                stroke_width: 2
-                opacity: 0.18
-                group_by:
-                  duration: 1d
-                  func: avg
-
-          - type: markdown
-            title: Data quality
-            content: >-
-              {% set s = 'sensor.metahome_thermal_efficiency_total_water_use_7_day_average' %}
-              {% set recent = states(s) | float(0) %}
-              {% set typical = state_attr(s, 'typical_day_litres_30d') | float(0) %}
-              {% set high = state_attr(s, 'high_usage_days_30d') | int(0) %}
-              {% set through = state_attr(s, 'latest_complete_day') %}
-              {% set lag = state_attr(s, 'source_lag_days') | int(0) %}
-              {% if high > 0 %}### ⚠ {{ high }} unusually high-use day{{ '' if
-              high == 1 else 's' }}
-              {% endif %}Seven-day mean: **{{ recent | round(0) }} L/day** ·
-              typical 30-day median: **{{ typical | round(0) }} L/day**.
-              Data through **{{ through }}**{% if lag %} ({{ lag }} complete
-              day{{ '' if lag == 1 else 's' }} behind){% endif %}. This is
-              total water—not inferred hot-water litres.
-
-      # ------------------------------------------------------------------
-      # Slow evidence: building trend and room-by-room thermal behaviour.
-      # ------------------------------------------------------------------
-      - type: grid
-        column_span: 3
-        cards:
-          - type: heading
-            heading: Building and room evidence
-            heading_style: title
-            icon: mdi:chart-timeline-variant-shimmer
-            grid_options:
-              columns: 12
-              rows: 1
-
-          - type: custom:apexcharts-card
-            grid_options:
-              columns: 5
-              rows: 6
-            header:
-              show: true
-              title: Delivered HLC · 12 months
-              show_states: true
-            graph_span: 365d
-            span:
-              end: day
-            apex_config:
-              chart:
-                height: 365
-              stroke:
-                curve: smooth
-              yaxis:
-                min: 0
-                decimalsInFloat: 0
-                title:
-                  text: W/K
-            series:
-              - entity: sensor.thermal_efficiency_heat_loss_coefficient
-                name: HLC
-                color: "#7e57c2"
-                type: area
-                stroke_width: 3
-                opacity: 0.15
-                group_by:
-                  duration: 7d
-                  func: avg
-
           - type: custom:plotly-graph
             title: Room thermal fingerprints · effective τ
-            grid_options:
-              columns: 7
-              rows: 6
             raw_plotly_config: true
             refresh_interval: auto
             entities:
@@ -485,8 +108,8 @@ views:
               margin:
                 l: 105
                 r: 24
-                t: 42
-                b: 52
+                t: 35
+                b: 70
               bargap: 0.25
               xaxis:
                 title: Effective cooling time constant τ (hours)
@@ -501,3 +124,206 @@ views:
             config:
               displayModeBar: false
               responsive: true
+      - type: grid
+        column_span: 1
+        cards:
+          - type: custom:apexcharts-card
+            header:
+              show: true
+              title: Delivered HLC and loss split · 12 months
+              show_states: true
+              colorize_states: true
+            graph_span: 365d
+            span:
+              end: day
+            apex_config:
+              chart:
+                height: 255
+              stroke:
+                curve: smooth
+                dashArray:
+                  - 0
+                  - 0
+                  - 5
+              legend:
+                position: top
+              yaxis:
+                min: 0
+                decimalsInFloat: 0
+                title:
+                  text: W/K
+            series:
+              - entity: sensor.thermal_efficiency_heat_loss_coefficient
+                name: Total HLC
+                color: "#7e57c2"
+                type: area
+                stroke_width: 3
+                opacity: 0.1
+                group_by:
+                  duration: 7d
+                  func: avg
+              - entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+                name: Fabric
+                color: "#ef5350"
+                type: line
+                stroke_width: 2
+                group_by:
+                  duration: 7d
+                  func: avg
+              - entity: sensor.metahome_thermal_efficiency_ventilation_heat_loss
+                name: Ventilation
+                color: "#42a5f5"
+                type: line
+                stroke_width: 2
+                group_by:
+                  duration: 7d
+                  func: avg
+      - type: grid
+        cards:
+          - type: heading
+            heading: Gas use
+            icon: mdi:meter-gas
+          - type: tile
+            grid_options:
+              columns: 6
+              rows: 2
+            entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+            name: Hot water · 7-day average
+            icon: mdi:shower-head
+            color: blue
+            vertical: true
+            features_position: bottom
+          - type: tile
+            grid_options:
+              columns: 6
+              rows: 2
+            entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+            name: Space heating · 7-day average
+            icon: mdi:radiator
+            color: deep-orange
+            show_entity_picture: false
+            hide_state: false
+            vertical: true
+            features_position: bottom
+          - type: custom:apexcharts-card
+            header:
+              show: true
+              title: Attributed gas · 90 days
+            graph_span: 90d
+            span:
+              end: day
+            apex_config:
+              chart:
+                height: 255
+              stroke:
+                curve: smooth
+              legend:
+                position: top
+              yaxis:
+                min: 0
+                decimalsInFloat: 1
+                title:
+                  text: kWh/day
+            series:
+              - entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+                name: Hot water
+                color: "#42a5f5"
+                type: area
+                stroke_width: 2
+                opacity: 0.18
+                group_by:
+                  duration: 1d
+                  func: avg
+              - entity: >-
+                  sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+                name: Space heating
+                color: "#ef6c00"
+                type: area
+                stroke_width: 2
+                opacity: 0.14
+                group_by:
+                  duration: 1d
+                  func: avg
+      - type: grid
+        cards:
+          - type: heading
+            heading: Electricity
+            icon: mdi:transmission-tower-import
+          - type: tile
+            grid_options:
+              columns: 6
+              rows: 2
+            entity: sensor.metahome_thermal_efficiency_electricity_use_7_day_average
+            name: Use · 7-day average
+            icon: mdi:flash
+            color: amber
+            vertical: true
+            features_position: bottom
+          - type: custom:apexcharts-card
+            header:
+              show: true
+              title: Electricity use · 90 days
+            graph_span: 90d
+            span:
+              end: day
+            apex_config:
+              chart:
+                height: 255
+              stroke:
+                curve: smooth
+              yaxis:
+                min: 0
+                decimalsInFloat: 1
+                title:
+                  text: kWh/day
+            series:
+              - entity: >-
+                  sensor.metahome_thermal_efficiency_electricity_use_7_day_average
+                name: Electricity
+                color: "#f9a825"
+                type: area
+                stroke_width: 2
+                opacity: 0.2
+                group_by:
+                  duration: 1d
+                  func: avg
+      - type: grid
+        cards:
+          - type: heading
+            heading: Water
+            icon: mdi:water
+          - type: tile
+            entity: sensor.metahome_thermal_efficiency_total_water_use_7_day_average
+            name: Total water · latest 7 reported days
+            icon: mdi:water-outline
+            color: cyan
+            vertical: true
+            features_position: bottom
+          - type: custom:apexcharts-card
+            header:
+              show: true
+              title: Total water · 90 days
+            graph_span: 90d
+            span:
+              end: day
+            apex_config:
+              chart:
+                height: 255
+              stroke:
+                curve: smooth
+              yaxis:
+                min: 0
+                decimalsInFloat: 0
+                title:
+                  text: L/day
+            series:
+              - entity: >-
+                  sensor.metahome_thermal_efficiency_total_water_use_7_day_average
+                name: Total water
+                color: "#26c6da"
+                type: area
+                stroke_width: 2
+                opacity: 0.18
+                group_by:
+                  duration: 1d
+                  func: avg
