@@ -10,6 +10,17 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import ThermalCoordinator
 
+
+def _electricity_unavailable_attributes(coordinator: ThermalCoordinator) -> dict:
+    status = coordinator.data.get("electricity_status", {})
+    if not status.get("configured"):
+        return {"note": "electricity meter is not configured"}
+    return {
+        "note": "not enough complete hourly electricity statistics",
+        "usable_days": status.get("usable_days", 0),
+        "required_days": status.get("required_days", 14),
+    }
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -26,6 +37,8 @@ async def async_setup_entry(
         HotWaterUsageSensor(coordinator),
         SpaceHeatingUsageSensor(coordinator),
         ElectricityBaseloadSensor(coordinator),
+        ElectricityUsageSensor(coordinator),
+        WaterUsageSensor(coordinator),
     ]
     entities += [
         RoomTauSensor(coordinator, room) for room in coordinator.conf["rooms"]
@@ -89,6 +102,13 @@ class HlcSensor(ThermalSensor):
                 if fit["dhw_baseline_kwh_per_day"] is not None
                 else None
             ),
+            "dhw_baseline_days_used": fit.get("dhw_baseline_days_used"),
+            "model_data_through": (
+                fit["model_data_through"].isoformat()
+                if fit.get("model_data_through")
+                else None
+            ),
+            "summer_stability": fit.get("summer_stability"),
             "recent_hlc_w_per_k": (
                 round(fit["recent_hlc_w_per_k"], 1)
                 if "recent_hlc_w_per_k" in fit
@@ -227,7 +247,7 @@ class FabricLossSensor(ThermalSensor):
 
 class HotWaterGasSensor(ThermalSensor):
     _attr_unique_id = f"{DOMAIN}_hot_water_gas"
-    _attr_name = "Non-space-heating gas baseline"
+    _attr_name = "Typical hot-water gas baseline"
     _attr_native_unit_of_measurement = "kWh/d"
     _attr_icon = "mdi:water-boiler"
     _attr_suggested_display_precision = 1
@@ -264,6 +284,25 @@ class HotWaterGasSensor(ThermalSensor):
                 else None
             ),
             "water_rate_days_used": dhw.get("water_rate_days_used"),
+            "water_attribution_days": dhw.get("water_attribution_days"),
+            "baseline_fallback_days": dhw.get("baseline_fallback_days"),
+            "water_outlier_days_ignored": dhw.get("water_outlier_days_ignored"),
+            "water_outlier_limit_litres": (
+                round(dhw["water_outlier_limit_litres"], 0)
+                if dhw.get("water_outlier_limit_litres") is not None
+                else None
+            ),
+            "latest_complete_gas_day": (
+                dhw["latest_complete_gas_day"].isoformat()
+                if dhw.get("latest_complete_gas_day")
+                else None
+            ),
+            "latest_complete_water_day": (
+                dhw["latest_complete_water_day"].isoformat()
+                if dhw.get("latest_complete_water_day")
+                else None
+            ),
+            "water_source_lag_days": dhw.get("water_source_lag_days"),
             "cost_per_day_gbp": (
                 round(dhw["cost_per_day_gbp"], 2)
                 if "cost_per_day_gbp" in dhw
@@ -333,6 +372,19 @@ class HotWaterUsageSensor(ThermalSensor):
             "heating_off_days_from_power_sensors": usage[
                 "heating_off_from_power_days"
             ],
+            "water_attribution_days": usage.get("water_attribution_days"),
+            "baseline_fallback_days": usage.get("baseline_fallback_days"),
+            "water_outlier_days_ignored": usage.get("water_outlier_days_ignored"),
+            "latest_complete_gas_day": (
+                usage["latest_complete_gas_day"].isoformat()
+                if usage.get("latest_complete_gas_day")
+                else None
+            ),
+            "latest_complete_water_day": (
+                usage["latest_complete_water_day"].isoformat()
+                if usage.get("latest_complete_water_day")
+                else None
+            ),
         }
 
 
@@ -387,12 +439,14 @@ class ElectricityBaseloadSensor(ThermalSensor):
     def extra_state_attributes(self) -> dict:
         elec = self.coordinator.data.get("electricity")
         if not elec:
-            return {"note": "configure an electricity meter; needs a couple "
-                            "of weeks of hourly statistics"}
+            return _electricity_unavailable_attributes(self.coordinator)
         return {
-            "method": "median across days of the cheapest hour - the "
+            "method": "median across up to the latest 30 days of each day's "
+                      "cheapest hour - the "
                       "always-on load (fridges, standby, network gear)",
             "kwh_per_day": round(elec["kwh_per_day"], 2),
+            "consumption_period": "latest 30 complete days",
+            "historical_kwh_per_day": round(elec["historical_kwh_per_day"], 2),
             "last_7d_kwh_per_day": (
                 round(elec["last_7d_kwh_per_day"], 2)
                 if elec["last_7d_kwh_per_day"] is not None
@@ -425,6 +479,115 @@ class ElectricityBaseloadSensor(ThermalSensor):
                                    "intercept, deliberately not subtracted "
                                    "from the gas fits",
             "days_used": elec["days_used"],
+            "current_period_days_used": elec["current_period_days_used"],
+            "latest_complete_day": elec["latest_complete_day"].isoformat(),
+            "source_lag_days": elec["source_lag_days"],
+            "days_used_7d": elec["days_used_7d"],
+            "days_used_30d": elec["days_used_30d"],
+            "cost_basis": "variable energy charge only; standing charge excluded",
+        }
+
+
+class ElectricityUsageSensor(ThermalSensor):
+    _attr_unique_id = f"{DOMAIN}_electricity_usage_7d"
+    _attr_name = "Electricity use 7-day average"
+    _attr_native_unit_of_measurement = "kWh/d"
+    _attr_icon = "mdi:transmission-tower-import"
+    _attr_suggested_display_precision = 1
+
+    @property
+    def native_value(self) -> float | None:
+        elec = self.coordinator.data.get("electricity")
+        if not elec or elec["last_7d_kwh_per_day"] is None:
+            return None
+        return round(elec["last_7d_kwh_per_day"], 2)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        elec = self.coordinator.data.get("electricity")
+        if not elec:
+            return _electricity_unavailable_attributes(self.coordinator)
+        return {
+            "kwh_per_day_30d": (
+                round(elec["last_30d_kwh_per_day"], 2)
+                if elec["last_30d_kwh_per_day"] is not None
+                else None
+            ),
+            "previous_30d_kwh_per_day": (
+                round(elec["previous_30d_kwh_per_day"], 2)
+                if elec["previous_30d_kwh_per_day"] is not None
+                else None
+            ),
+            "change_vs_previous_30d_pct": (
+                round(elec["change_vs_previous_30d_pct"], 1)
+                if elec["change_vs_previous_30d_pct"] is not None
+                else None
+            ),
+            "variable_cost_per_day_gbp_30d": (
+                round(elec["cost_per_day_gbp_30d"], 2)
+                if "cost_per_day_gbp_30d" in elec
+                else None
+            ),
+            "variable_cost_per_year_gbp_30d": (
+                round(elec["cost_per_year_gbp_30d"], 0)
+                if "cost_per_year_gbp_30d" in elec
+                else None
+            ),
+            "latest_complete_day": elec["latest_complete_day"].isoformat(),
+            "source_lag_days": elec["source_lag_days"],
+            "days_used_7d": elec["days_used_7d"],
+            "days_used_30d": elec["days_used_30d"],
+            "cost_basis": "variable energy charge only; standing charge excluded",
+        }
+
+
+class WaterUsageSensor(ThermalSensor):
+    _attr_unique_id = f"{DOMAIN}_water_usage_7d"
+    _attr_name = "Total water use 7-day average"
+    _attr_native_unit_of_measurement = "L/d"
+    _attr_icon = "mdi:water"
+    _attr_suggested_display_precision = 0
+
+    @property
+    def native_value(self) -> float | None:
+        water = self.coordinator.data.get("water_usage")
+        return round(water["litres_per_day_7d"], 1) if water else None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        water = self.coordinator.data.get("water_usage")
+        if not water:
+            status = self.coordinator.data.get("water_status", {})
+            if not status.get("configured"):
+                return {"note": "water statistic is not configured"}
+            return {
+                "note": "not enough complete hourly water statistics",
+                "usable_days": status.get("usable_days", 0),
+                "required_days": status.get("required_days", 5),
+            }
+        return {
+            "scope": "total metered water; not inferred hot-water litres",
+            "litres_per_day_30d": (
+                round(water["litres_per_day_30d"], 1)
+                if water["litres_per_day_30d"] is not None
+                else None
+            ),
+            "typical_day_litres_30d": (
+                round(water["typical_day_litres_30d"], 1)
+                if water["typical_day_litres_30d"] is not None
+                else None
+            ),
+            "high_usage_days_30d": water["high_usage_days_30d"],
+            "high_usage_threshold_litres": (
+                round(water["outlier_limit_litres"], 0)
+                if water["outlier_limit_litres"] is not None
+                else None
+            ),
+            "latest_complete_day": water["latest_complete_day"].isoformat(),
+            "source_lag_days": water["source_lag_days"],
+            "days_used_7d": water["days_used_7d"],
+            "days_used_30d": water["days_used_30d"],
+            "days_used": water["days_used"],
         }
 
 

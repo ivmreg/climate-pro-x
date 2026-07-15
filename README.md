@@ -9,12 +9,13 @@ sensor, a loft sensor and a weather integration.
 | Metric | What it tells you | Needs |
 |---|---|---|
 | **Effective overnight cooling time constant τ (hours), per room** | How quickly a room cooled under the observed conditions. It combines fabric, draughts, thermal mass and heat exchange with adjacent rooms. | Temperatures; heating-power coverage strongly recommended |
-| **Delivered Heat Loss Coefficient HLC (W/K), whole home** | Estimated heat delivered to replace each watt lost per degree of indoor/outdoor difference, after the DHW and boiler-efficiency corrections available from the data. | Temperatures + real gas kWh; the offline Tado proxy is trend-only |
+| **Delivered Heat Loss Coefficient HLC (W/K), whole home** | Estimated heat delivered to replace each watt lost per degree of indoor/outdoor difference, after DHW and boiler-efficiency correction. Its window and DHW training data are anchored to the latest qualifying heating day, so accumulating summer data cannot move the heating baseline. | Temperatures + real gas kWh; the offline Tado proxy is trend-only |
 | **Loft ratio** | Directional evidence about how closely loft temperature follows indoors versus outdoors; not an insulation payback calculation. | Loft + indoor + outdoor temperatures |
 | **Ventilation vs fabric split (W/K)** | An exploratory split based on a room-derived CO2 decay proxy. A single room is not assumed to be a direct whole-home ACH measurement. | CO2 sensor, floor area, ceiling height, and valid HLC |
 | **Non-space-heating gas baseline (kWh/day, £/day, £/yr)** | Gas on heating-off days (measured heating power where available, dT proxy otherwise). It includes hot water and any gas cooking/pilot load, and is used to de-bias HLC. With a water meter, low-water (away) days are excluded and a per-litre daily rate models DHW on heating days from actual usage. | Gas meter and enough complete low-heating days; water meter sharpens it |
 | **Hot water vs space heating usage split (kWh/day, 7/30-day)** | Rolling attributed gas: on heating-off days all gas is hot water, on heating days the water-rate model supplies the DHW share. | Gas meter + DHW baseline; water meter recommended |
-| **Electricity baseload (W) and daily use** | Always-on load from the cheapest hour of each day, daily kWh and cost, and the implied internal heat gains — context only, never mixed into the gas fits. | Electricity meter statistics |
+| **Electricity baseload (W) and daily use** | Current always-on floor from the latest 30 days, plus a separate trackable 7-day consumption average, variable cost and implied internal heat gains — context only, never mixed into the gas fits. | Electricity meter statistics |
+| **Total water use (L/day, 7/30-day)** | Total metered water alongside hot-water gas, with a typical-day median, source freshness and high-use-day count. It is never presented as hot-water litres. | Hourly water statistic |
 
 Treat these as household diagnostics rather than a substitute for a calibrated
 co-heating test or professional retrofit survey. The integration suppresses
@@ -117,7 +118,10 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
   `floor_area_m2` to get this — the normalised benchmark assessors use), and
   `space_heating_hlc_w_per_k` — the same fit with hot-water gas subtracted
   day-by-day (needs a gas meter and enough summer history for a DHW
-  baseline; see `hot_water_gas` below).
+  baseline; see `hot_water_gas` below). `model_data_through` identifies the
+  last qualifying heating day: both ends of the fit window and its DHW
+  correction stay anchored there until heating resumes, while the live
+  hot-water metrics can continue learning from summer.
 - `sensor.thermal_efficiency_<room>_time_constant` — median effective overnight
   cooling τ in hours; nights require continuous temperature data and at least
   80% heating-power coverage when that source is configured.
@@ -144,15 +148,26 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
   kWh/day: on heating-off days all gas is hot water (exact in an
   electric-cooking combi home), on heating days the water-rate model (or the
   mains-scaled baseline before water history starts) supplies the DHW share
-  and the remainder is space heating. 30-day means and £/day ride along as
-  attributes; HA records the states, so both trend over time.
+  and the remainder is space heating. Extreme total-water days fall back to
+  the weather-scaled baseline rather than erasing space-heating gas. 30-day
+  means, quality counters and £/day ride along as attributes; HA records the
+  states, so both trend over time.
 - `sensor.thermal_efficiency_electricity_baseload` — always-on electrical
-  load in W (median across days of the cheapest hour), with daily kWh
-  (window/7d/30d), annual cost and baseload cost (needs
+  load in W (median of each day's cheapest hour over the latest 30 complete
+  days), with period-consistent daily kWh, annualised variable cost and
+  baseload cost (needs
   `electricity_unit_rate`), and `implied_internal_gains_w` — the average
   electrical draw that ends up as indoor heat, useful context for the HLC
   free-gains intercept but deliberately never subtracted from the gas fits
   (needs `electricity_meter`).
+- `sensor.thermal_efficiency_electricity_use_7_day_average` — trackable recent
+  electricity consumption in kWh/day, with current/previous 30-day means,
+  change, variable cost and source-freshness attributes. Standing charges are
+  deliberately excluded.
+- `sensor.thermal_efficiency_total_water_use_7_day_average` — trackable total
+  water in L/day, with 30-day mean and median, robust high-use-day count and
+  latest reported date. This is explanatory DHW context, not an estimate of
+  hot-water litres.
 - `sensor.thermal_efficiency_air_change_rate` — median room-derived air-change
   proxy (1/h) from independently fitted CO2 sensors (needs `co2`; configure an
   `outdoor_co2_sensor` or `outdoor_co2_ppm` rather than relying on the

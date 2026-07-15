@@ -1,0 +1,330 @@
+# Live "Thermal efficiency" dashboard (the simpler view actually in use, as
+# opposed to the storyboard in thermal_efficiency_dashboard.yaml). Needs
+# apexcharts-card and lovelace-plotly-graph-card. Paste into a dashboard's
+# raw configuration editor.
+#
+# Entity-ID note: this instance's older entities have no prefix
+# (sensor.thermal_efficiency_heat_loss_coefficient) while later-added ones
+# gained a metahome_ prefix. Later-added sensors
+# assumed to follow the metahome_ pattern — verify in Developer Tools →
+# States after the integration update and adjust if needed.
+views:
+  - title: Thermal efficiency
+    icon: mdi:home-thermometer
+    type: sections
+    max_columns: 3
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: The headline
+          - type: gauge
+            entity: sensor.thermal_efficiency_heat_loss_coefficient
+            name: Heat loss coefficient
+            min: 0
+            max: 500
+            needle: true
+            segments:
+              - from: 0
+                color: "#2e7d32"
+              - from: 100
+                color: "#8bc34a"
+              - from: 180
+                color: "#fdd835"
+              - from: 280
+                color: "#fb8c00"
+              - from: 400
+                color: "#e53935"
+          - type: gauge
+            entity: sensor.metahome_thermal_efficiency_air_change_rate
+            name: Air changes per hour
+            min: 0
+            max: 1.5
+            needle: true
+            segments:
+              - from: 0
+                color: "#fb8c00"
+              - from: 0.35
+                color: "#2e7d32"
+              - from: 0.7
+                color: "#fdd835"
+              - from: 1
+                color: "#e53935"
+          - type: markdown
+            title: Stable heating baseline
+            content: >-
+              {% set s = 'sensor.thermal_efficiency_heat_loss_coefficient' %}
+              Heating model fixed through **{{ state_attr(s, 'model_data_through') }}**.
+              {{ state_attr(s, 'summer_stability') | default('It updates only when new qualifying heating evidence arrives.', true) }}
+              Hot-water usage can keep learning during summer without moving
+              this heat-loss baseline.
+      - type: grid
+        cards:
+          - type: heading
+            heading: Where the heat goes
+          - type: custom:apexcharts-card
+            chart_type: donut
+            header:
+              show: true
+              title: Delivered heat loss split (W/K)
+            series:
+              - entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+                name: Fabric (walls & windows)
+                color: "#e53935"
+              - entity: sensor.metahome_thermal_efficiency_ventilation_heat_loss
+                name: Ventilation (draughts)
+                color: "#42a5f5"
+          - type: markdown
+            title: Hot water gas
+            content: >-
+              {% set s = 'sensor.metahome_thermal_efficiency_hot_water_gas' %}
+              {% set away = state_attr(s, 'low_water_days_excluded') %}
+              {% set idle = state_attr(s, 'idle_gas_kwh_per_day') %}
+              {% set rate = state_attr(s, 'water_rate_wh_per_litre_per_k') %}
+              **{{ states(s) }} kWh/day** on a typical occupied day →
+              £{{ state_attr(s, 'cost_per_day_gbp') }}/day,
+              **£{{ state_attr(s, 'cost_per_year_gbp') | round(0) }}/yr**
+              (pure hot water — electric hob; from
+              {{ state_attr(s, 'days_used') }} heating-off days{%- if away %},
+              {{ away }} away day{{ 's' if away != 1 }} excluded{%- endif %}).
+
+              {% if rate is not none -%}
+              Water-meter rate: **{{ rate | round(2) }} Wh/L/K** over
+              {{ state_attr(s, 'water_rate_days_used') }} days — models DHW on
+              heating days from actual litres.
+              {%- endif %}
+
+              {% if idle is not none -%}
+              Boiler idle gas while away: {{ idle }} kWh/day.
+              {%- endif %}
+      - type: grid
+        cards:
+          - type: heading
+            heading: Hot water vs space heating
+          - type: tile
+            entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+            name: Hot water (7-day avg)
+            icon: mdi:shower-head
+            color: blue
+          - type: tile
+            entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+            name: Space heating (7-day avg)
+            icon: mdi:radiator
+            color: deep-orange
+          - type: tile
+            entity: sensor.metahome_thermal_efficiency_total_water_use_7_day_average
+            name: Total water (latest 7 reported days)
+            icon: mdi:water
+            color: cyan
+          - type: custom:apexcharts-card
+            chart_type: donut
+            header:
+              show: true
+              title: Last 30 days — gas split (kWh/day)
+            series:
+              - entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+                attribute: kwh_per_day_30d
+                name: Hot water
+                color: "#42a5f5"
+              - entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+                attribute: kwh_per_day_30d
+                name: Space heating
+                color: "#ef6c00"
+          - type: statistics-graph
+            title: Attributed gas use over time (daily mean)
+            entities:
+              - entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+                name: Hot water
+              - entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+                name: Space heating
+            period: day
+            stat_types:
+              - mean
+            days_to_show: 90
+          - type: statistics-graph
+            title: Total water use over time
+            entities:
+              - sensor.metahome_thermal_efficiency_total_water_use_7_day_average
+            period: day
+            stat_types:
+              - mean
+            days_to_show: 90
+          - type: markdown
+            title: Water context
+            content: >-
+              {% set s = 'sensor.metahome_thermal_efficiency_total_water_use_7_day_average' %}
+              {% set typical = state_attr(s, 'typical_day_litres_30d') %}
+              {% set high = state_attr(s, 'high_usage_days_30d') | int(0) %}
+              {% set through = state_attr(s, 'latest_complete_day') %}
+              {% if typical is not none -%}
+              Latest reported seven-day mean: **{{ states(s) | float(0) | round(0) }} L/day**;
+              typical 30-day median: **{{ typical | round(0) }} L/day**.
+              {% if high %}There {{ 'was' if high == 1 else 'were' }}
+              **{{ high }} unusually high-use day{{ '' if high == 1 else 's' }}**
+              in that period.{% endif %} Data through **{{ through }}**.
+              This is total water, not inferred hot-water litres.
+              {%- else -%}
+              Waiting for enough complete water statistics.
+              {%- endif %}
+          - type: markdown
+            title: How the split is made
+            content: >-
+              {% set s = 'sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average' %}
+              {% set off = state_attr(s, 'heating_off_days_in_window') %}
+              {% set power = state_attr(s, 'heating_off_days_from_power_sensors') %}
+              {% set modelled = state_attr(s, 'modelled_days_in_window') %}
+              {% set outliers = state_attr(s, 'water_outlier_days_ignored') | int(0) %}
+              {% if off is not none -%}
+              On **{{ off }}** heating-off days all gas is counted as hot
+              water ({{ power }} classified from the TRV heating-power
+              statistics, the rest by the ΔT proxy); on **{{ modelled }}**
+              heating days the water-meter rate supplies the hot-water share
+              and the remainder is space heating. Extreme total-water days
+              fall back to the weather-scaled baseline{% if outliers %};
+              **{{ outliers }}** such day{{ 's' if outliers != 1 }} currently
+              excluded{% endif %}.
+              {%- else -%}
+              Waiting for a hot-water baseline (needs a gas meter and enough
+              heating-off days).
+              {%- endif %}
+      - type: grid
+        cards:
+          - type: heading
+            heading: Electricity
+          - type: gauge
+            entity: sensor.metahome_thermal_efficiency_electricity_baseload
+            name: Always-on baseload
+            min: 0
+            max: 400
+            needle: true
+            segments:
+              - from: 0
+                color: "#2e7d32"
+              - from: 120
+                color: "#8bc34a"
+              - from: 200
+                color: "#fdd835"
+              - from: 300
+                color: "#e53935"
+          - type: tile
+            entity: sensor.metahome_thermal_efficiency_electricity_use_7_day_average
+            name: Electricity use (7-day avg)
+            icon: mdi:transmission-tower-import
+            color: amber
+          - type: statistics-graph
+            title: Electricity use over time
+            entities:
+              - sensor.metahome_thermal_efficiency_electricity_use_7_day_average
+            period: day
+            stat_types:
+              - mean
+            days_to_show: 90
+          - type: markdown
+            title: Electricity use & cost
+            content: >-
+              {% set s = 'sensor.metahome_thermal_efficiency_electricity_baseload' %}
+              {% set use = 'sensor.metahome_thermal_efficiency_electricity_use_7_day_average' %}
+              {% set daily = state_attr(use, 'kwh_per_day_30d') or state_attr(s, 'kwh_per_day') %}
+              {% set base_kwh = state_attr(s, 'baseload_kwh_per_day') %}
+              {% set share = state_attr(s, 'baseload_share_pct') %}
+              {% set cost_yr = state_attr(use, 'variable_cost_per_year_gbp_30d') %}
+              {% set base_cost = state_attr(s, 'baseload_cost_per_year_gbp') %}
+              {% set gains = state_attr(s, 'implied_internal_gains_w') %}
+              {% set hlc_intercept = state_attr('sensor.thermal_efficiency_heat_loss_coefficient', 'regression_intercept_kwh_per_day') %}
+              {% if daily is not none -%}
+              **{{ daily | round(1) }} kWh/day**{% if cost_yr is not none %} →
+              **£{{ cost_yr | round(0) }}/yr** variable cost at the current
+              tariff{% endif %} (standing charge excluded).
+
+              The always-on load ({{ states(s) }} W ≈
+              {{ base_kwh | round(1) }} kWh/day{% if share is not none %},
+              {{ share | round(0) }}% of use{% endif %}){% if base_cost is not none %}
+              costs **£{{ base_cost | round(0) }}/yr** on its own{% endif %} —
+              fridges, standby and network gear; the cheapest thing to hunt
+              down.
+
+              {% if gains is not none -%}
+              Nearly all of this ends up as **{{ gains | round(0) }} W of
+              free indoor heat**{% if hlc_intercept is not none and hlc_intercept < 0 %}
+              (the HLC fit independently sees
+              ~{{ (-hlc_intercept * 1000 / 24) | round(0) }} W of free gains —
+              electricity, cooking, bodies and sun combined){% endif %}; it is
+              context for the gas numbers, never subtracted from them.
+              {%- endif %}
+              {%- else -%}
+              Configure an electricity meter in the Thermal Efficiency
+              integration; needs about two weeks of hourly statistics.
+              {%- endif %}
+      - type: grid
+        cards:
+          - type: heading
+            heading: Trends & rooms
+          - type: statistics-graph
+            title: HLC over time (weekly mean)
+            entities:
+              - sensor.thermal_efficiency_heat_loss_coefficient
+            period: week
+            stat_types:
+              - mean
+            days_to_show: 365
+          - type: custom:plotly-graph
+            title: Room thermal fingerprints — effective τ
+            grid_options:
+              columns: 12
+              rows: 6
+            raw_plotly_config: true
+            refresh_interval: auto
+            entities:
+              - entity: sensor.thermal_efficiency_living_room_time_constant
+                type: bar
+                orientation: h
+                x: |-
+                  $ex {
+                    vars.roomRows = [
+                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
+                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
+                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
+                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
+                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
+                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
+                    ].map(([name, id]) => ({
+                      name,
+                      value: Number(hass.states[id]?.state),
+                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
+                    })).filter(room => Number.isFinite(room.value))
+                       .sort((a, b) => b.value - a.value);
+                    return vars.roomRows.map(room => room.value);
+                  }
+                "y": $ex vars.roomRows.map(room => room.name)
+                customdata: $ex vars.roomRows.map(room => room.nights)
+                marker:
+                  color: |-
+                    $ex vars.roomRows.map((room, index) =>
+                      ['#2e7d32', '#7cb342', '#f9a825', '#ef6c00', '#d84315', '#c62828'][index]
+                    )
+                texttemplate: "%{x:.1f} h"
+                textposition: auto
+                hovertemplate: >-
+                  %{y}<br>τ %{x:.1f} h<br>%{customdata} fitted
+                  nights<extra></extra>
+            layout:
+              height: 390
+              margin:
+                l: 105
+                r: 25
+                t: 40
+                b: 55
+              bargap: 0.28
+              xaxis:
+                title: Effective overnight cooling time constant τ (hours)
+                rangemode: tozero
+                gridcolor: rgba(127,127,127,0.18)
+              yaxis:
+                automargin: true
+              font:
+                color: $ex css_vars['primary-text-color']
+              paper_bgcolor: rgba(0,0,0,0)
+              plot_bgcolor: rgba(0,0,0,0)
+            config:
+              displayModeBar: false
+              responsive: true

@@ -136,9 +136,17 @@ def test_compute_all_full_year_multi_sensor_pipeline(thermal_math):
     assert electricity["last_7d_kwh_per_day"] == pytest.approx(
         electricity["kwh_per_day"], rel=0.05
     )
+    assert electricity["current_period_days_used"] >= 20
+    assert electricity["latest_complete_day"] is not None
     assert electricity["baseload_cost_per_year_gbp"] == pytest.approx(
         0.1 * 24 * 0.18 * 365, rel=0.05
     )
     assert electricity["implied_internal_gains_w"] == pytest.approx(
         electricity["kwh_per_day"] * 1000 / 24, rel=0.01
     )
+    water_usage = result["water_usage"]
+    assert water_usage is not None
+    assert water_usage["litres_per_day_7d"] == pytest.approx(500.0, rel=0.05)
+    assert water_usage["typical_day_litres_30d"] == pytest.approx(500.0, rel=0.05)
+    assert result["hlc"]["model_data_through"] is not None
+    assert result["hlc"]["summer_stability"]

@@ -69,6 +69,10 @@ DHW_RATE_MAX_WH_PER_L_PER_K = 1.5
 HEATING_OFF_MAX_PCT = 1.0  # daily mean of the busiest room's heating power
 ELEC_MAX_STEP_KWH = 20.0  # bigger hourly steps are meter/statistics artifacts
 ELEC_MIN_DAYS = 14
+CURRENT_BASELINE_DAYS = 30
+WATER_USAGE_MIN_DAYS = 5
+WATER_OUTLIER_MEDIAN_MULTIPLIER = 3.0
+WATER_OUTLIER_IQR_MULTIPLIER = 3.0
 RECENT_7D_MIN_DAYS = 5
 RECENT_30D_MIN_DAYS = 20
 DHW_REGRESSION_MIN_HOURS = 200
@@ -243,9 +247,17 @@ def heating_off_days(dt_by_day: dict, heat_pct_by_day: dict) -> set:
 
 
 def fit_hlc(
-    q_by_day: dict, dt_by_day: dict, since, dhw_by_day: dict | None = None
+    q_by_day: dict,
+    dt_by_day: dict,
+    since,
+    dhw_by_day: dict | None = None,
+    until=None,
 ) -> dict | None:
-    days = sorted(d for d in q_by_day if d in dt_by_day and d >= since)
+    days = sorted(
+        d
+        for d in q_by_day
+        if d in dt_by_day and d >= since and (until is None or d <= until)
+    )
     pairs = []
     for d in days:
         if dt_by_day[d] <= HLC_MIN_DT or q_by_day[d] <= HLC_MIN_Q:
@@ -277,7 +289,10 @@ def fit_hlc(
         return None
     baseline_days = [
         q_by_day[d] for d in q_by_day
-        if d >= since and d in dt_by_day and dt_by_day[d] < DHW_BASELINE_MAX_DT
+        if d >= since
+        and (until is None or d <= until)
+        and d in dt_by_day
+        and dt_by_day[d] < DHW_BASELINE_MAX_DT
     ]
     return {
         "hlc_w_per_k": hlc,
@@ -380,6 +395,7 @@ def fit_dhw_water_rate(
     heating_off: set,
     since,
     min_water_l: float = DHW_OCCUPIED_MIN_WATER_L,
+    max_water_l: float | None = None,
 ) -> dict | None:
     """Daily gas-per-litre rate from days where all gas is known to be hot
     water: heating off (so no space-heating gas) and enough metered water that
@@ -394,7 +410,11 @@ def fit_dhw_water_rate(
         if d < since or d not in heating_off or d not in outdoor_by_day or q <= 0:
             continue
         litres = water_by_day.get(d)
-        if litres is None or litres < min_water_l:
+        if (
+            litres is None
+            or litres < min_water_l
+            or (max_water_l is not None and litres > max_water_l)
+        ):
             continue
         rise = MAINS_TANK_TEMP_C - mains_temp_c(outdoor_by_day[d])
         if rise <= 0:
@@ -418,6 +438,57 @@ def dhw_kwh_from_water(litres: float, outdoor_c: float, water_rate: dict) -> flo
     """DHW gas for a day, from its metered litres and the fitted daily rate."""
     rise = MAINS_TANK_TEMP_C - mains_temp_c(outdoor_c)
     return litres * water_rate["wh_per_litre_per_k"] * rise / 1000
+
+
+def attribute_dhw_by_day(
+    q_by_day: dict,
+    outdoor_by_day: dict,
+    heating_off: set,
+    baseline: dict,
+    water_by_day: dict | None = None,
+    water_rate: dict | None = None,
+    water_outlier_limit_l: float | None = None,
+    until=None,
+) -> tuple[dict, dict]:
+    """Split daily gas into DHW using measured heating-off days, guarded
+    water attribution on heating days, and the weather-scaled baseline as the
+    fallback. Extreme whole-house water days are cold-use ambiguous and must
+    not erase genuine space-heating gas."""
+    attributed = {}
+    quality = {
+        "water_attribution_days": 0,
+        "baseline_fallback_days": 0,
+        "water_outlier_days_ignored": 0,
+    }
+    water_by_day = water_by_day or {}
+    for d, q in q_by_day.items():
+        if until is not None and d > until:
+            continue
+        if d in heating_off:
+            attributed[d] = q
+            continue
+        litres = water_by_day.get(d)
+        water_is_outlier = (
+            litres is not None
+            and water_outlier_limit_l is not None
+            and litres > water_outlier_limit_l
+        )
+        if water_is_outlier:
+            quality["water_outlier_days_ignored"] += 1
+        if (
+            water_rate
+            and litres is not None
+            and not water_is_outlier
+            and d in outdoor_by_day
+        ):
+            attributed[d] = min(
+                dhw_kwh_from_water(litres, outdoor_by_day[d], water_rate), q
+            )
+            quality["water_attribution_days"] += 1
+        elif d in outdoor_by_day:
+            attributed[d] = min(dhw_daily_kwh(outdoor_by_day[d], baseline), q)
+            quality["baseline_fallback_days"] += 1
+    return attributed, quality
 
 
 def fit_water_gas(
@@ -465,6 +536,86 @@ def recent_daily_mean(by_day: dict, end_day, days_back: int, min_days: int) -> f
     return sum(window) / len(window)
 
 
+def recent_daily_median(
+    by_day: dict, end_day, days_back: int, min_days: int
+) -> float | None:
+    """Median over a recent calendar window, with the same coverage rule as
+    `recent_daily_mean`. Useful for a typical day when isolated high-use days
+    should remain visible in the mean but not redefine normal behaviour."""
+    window = [
+        v for d, v in by_day.items()
+        if end_day - timedelta(days=days_back - 1) <= d <= end_day
+    ]
+    if len(window) < min_days:
+        return None
+    return median(window)
+
+
+def recent_daily_count(by_day: dict, end_day, days_back: int) -> int:
+    """Number of usable dates represented in a recent calendar window."""
+    return sum(
+        1
+        for d in by_day
+        if end_day - timedelta(days=days_back - 1) <= d <= end_day
+    )
+
+
+def previous_period_mean(
+    by_day: dict, end_day, days_back: int, min_days: int
+) -> float | None:
+    """Mean for the immediately preceding calendar period."""
+    return recent_daily_mean(
+        by_day, end_day - timedelta(days=days_back), days_back, min_days
+    )
+
+
+def water_outlier_limit_litres(
+    water_by_day: dict, end_day, days_back: int = CURRENT_BASELINE_DAYS
+) -> float | None:
+    """Conservative upper bound for using total water as a DHW predictor.
+
+    Whole-house water includes cold-only events such as garden use. Such a day
+    must not be allowed to turn all winter gas into apparent hot water. The
+    larger of 3x the median and Tukey's far-out fence keeps ordinary busy days
+    while rejecting extreme events.
+    """
+    values = sorted(
+        v
+        for d, v in water_by_day.items()
+        if end_day - timedelta(days=days_back - 1) <= d <= end_day
+    )
+    if len(values) < WATER_USAGE_MIN_DAYS:
+        return None
+    med = median(values)
+    q1 = values[len(values) // 4]
+    q3 = values[(3 * len(values)) // 4]
+    return max(
+        med * WATER_OUTLIER_MEDIAN_MULTIPLIER,
+        q3 + WATER_OUTLIER_IQR_MULTIPLIER * (q3 - q1),
+    )
+
+
+def latest_heating_day(
+    q_by_day: dict, dt_by_day: dict, heat_pct_by_day: dict, since
+):
+    """Latest HLC-eligible day with evidence that heating ran.
+
+    Measured heating power controls where available. Before that history
+    begins, the same cold-day proxy used by the HLC fit is used. Anchoring the
+    heating model to this date means subsequent summer days cannot move its
+    window or retrain its DHW correction.
+    """
+    candidates = []
+    for d, q in q_by_day.items():
+        dt = dt_by_day.get(d)
+        if d < since or dt is None or dt <= HLC_MIN_DT or q <= HLC_MIN_Q:
+            continue
+        pct = heat_pct_by_day.get(d)
+        if pct is None or pct > HEATING_OFF_MAX_PCT:
+            candidates.append(d)
+    return max(candidates) if candidates else None
+
+
 def electricity_summary(elec_sum: Series, tz: tzinfo, since, until) -> dict | None:
     """Descriptive electricity metrics that need no disaggregation guesswork:
     daily kWh, and an always-on baseload estimate (median over days of the
@@ -482,19 +633,77 @@ def electricity_summary(elec_sum: Series, tz: tzinfo, since, until) -> dict | No
     if len(per_day) < ELEC_MIN_DAYS:
         return None
     daily_kwh = {d: sum(steps) for d, steps in per_day.items()}
-    mean_daily = sum(daily_kwh.values()) / len(daily_kwh)
-    baseload_kw = median(min(steps) for steps in per_day.values())
+    latest_day = max(daily_kwh)
+    recent_days = {
+        d: steps
+        for d, steps in per_day.items()
+        if latest_day - timedelta(days=CURRENT_BASELINE_DAYS - 1) <= d <= latest_day
+    }
+    if len(recent_days) < ELEC_MIN_DAYS:
+        return None
+    historical_mean = sum(daily_kwh.values()) / len(daily_kwh)
+    recent_daily = {d: sum(steps) for d, steps in recent_days.items()}
+    mean_daily = sum(recent_daily.values()) / len(recent_daily)
+    baseload_kw = median(min(steps) for steps in recent_days.values())
     out = {
         "kwh_per_day": mean_daily,
+        "historical_kwh_per_day": historical_mean,
         "baseload_w": baseload_kw * 1000,
         "baseload_kwh_per_day": baseload_kw * 24,
         "implied_internal_gains_w": mean_daily * 1000 / 24,
         "days_used": len(per_day),
+        "current_period_days_used": len(recent_days),
+        "latest_complete_day": latest_day,
         "daily_kwh": daily_kwh,
     }
     if mean_daily > 0:
         out["baseload_share_pct"] = min(100.0, baseload_kw * 24 / mean_daily * 100)
     return out
+
+
+def water_usage_summary(water_sum: Series, tz: tzinfo, since, until) -> dict | None:
+    """Rolling total-water context for DHW, without pretending all litres are
+    hot. The mean preserves actual consumption; the median describes a typical
+    day and an outlier count explains when the two diverge."""
+    per_day = _daily_meter_steps(water_sum, tz, WATER_MAX_STEP_L)
+    daily_litres = {
+        d: sum(steps) for d, steps in per_day.items() if since <= d < until
+    }
+    if len(daily_litres) < WATER_USAGE_MIN_DAYS:
+        return None
+    latest_day = max(daily_litres)
+    mean_7d = recent_daily_mean(
+        daily_litres, latest_day, 7, RECENT_7D_MIN_DAYS
+    )
+    if mean_7d is None:
+        return None
+    mean_30d = recent_daily_mean(
+        daily_litres, latest_day, 30, RECENT_30D_MIN_DAYS
+    )
+    median_30d = recent_daily_median(
+        daily_litres, latest_day, 30, RECENT_30D_MIN_DAYS
+    )
+    limit = water_outlier_limit_litres(daily_litres, latest_day)
+    return {
+        "litres_per_day_7d": mean_7d,
+        "days_used_7d": recent_daily_count(daily_litres, latest_day, 7),
+        "litres_per_day_30d": mean_30d,
+        "days_used_30d": recent_daily_count(daily_litres, latest_day, 30),
+        "typical_day_litres_30d": median_30d,
+        "high_usage_days_30d": (
+            sum(
+                1
+                for d, value in daily_litres.items()
+                if latest_day - timedelta(days=29) <= d <= latest_day
+                and limit is not None
+                and value > limit
+            )
+        ),
+        "outlier_limit_litres": limit,
+        "latest_complete_day": latest_day,
+        "days_used": len(daily_litres),
+        "daily_litres": daily_litres,
+    }
 
 
 def night_taus(
@@ -686,10 +895,9 @@ def compute_all(
     outdoor_by_day = daily_mean(outdoor, tz)
     water_by_day = daily_water_litres(water, tz)
     heat_pct_by_day = daily_heating_pct(list(room_heat.values()), tz)
-    # Primary HLC over the full window: season-blended and stable. A
-    # shorter-window "recent" estimate rides along as extra data — useful for
-    # seeing improvements (draught-proofing etc.) without destabilising the
-    # main sensor value in shoulder seasons.
+    # General rolling window for usage/context metrics. The heating model gets
+    # a separate window below, anchored to the latest evidenced heating day so
+    # summer data cannot move it.
     result["hlc"] = None
     since_full = (now - timedelta(days=windows_days[-1])).astimezone(tz).date()
     current_day = now.astimezone(tz).date()
@@ -710,24 +918,40 @@ def compute_all(
     # scaling of the baseline where water history doesn't reach.
     result["dhw"] = None
     dhw_by_day: dict = {}
+    dhw_quality = {
+        "water_attribution_days": 0,
+        "baseline_fallback_days": 0,
+        "water_outlier_days_ignored": 0,
+    }
+    water_latest_day = max(water_by_day) if water_by_day else None
+    water_limit_l = (
+        water_outlier_limit_litres(water_by_day, water_latest_day)
+        if water_latest_day
+        else None
+    )
     baseline = dhw_baseline(
         q_by_day, dt_by_day, outdoor_by_day, since_full,
         heating_off, water_by_day, min_water_l,
     )
     water_rate = fit_dhw_water_rate(
-        q_by_day, water_by_day, outdoor_by_day, heating_off, since_full, min_water_l
+        q_by_day,
+        water_by_day,
+        outdoor_by_day,
+        heating_off,
+        since_full,
+        min_water_l,
+        water_limit_l,
     )
     if baseline:
-        for d, q in q_by_day.items():
-            if d in heating_off:
-                dhw_by_day[d] = q
-            elif water_rate and d in water_by_day and d in outdoor_by_day:
-                dhw_by_day[d] = min(
-                    dhw_kwh_from_water(water_by_day[d], outdoor_by_day[d], water_rate),
-                    q,
-                )
-            elif d in outdoor_by_day:
-                dhw_by_day[d] = min(dhw_daily_kwh(outdoor_by_day[d], baseline), q)
+        dhw_by_day, dhw_quality = attribute_dhw_by_day(
+            q_by_day,
+            outdoor_by_day,
+            heating_off,
+            baseline,
+            water_by_day,
+            water_rate,
+            water_limit_l,
+        )
         result["dhw"] = {
             "kwh_per_day": baseline["kwh_per_day"],
             "days_used": baseline["days_used"],
@@ -735,6 +959,13 @@ def compute_all(
             "low_water_days_excluded": baseline["low_water_days_excluded"],
             "min_occupied_water_litres": min_water_l,
             "status": "valid" if baseline["days_used"] >= 14 else "provisional",
+            "latest_complete_gas_day": max(q_by_day) if q_by_day else None,
+            "latest_complete_water_day": water_latest_day,
+            "water_source_lag_days": (
+                (yesterday - water_latest_day).days if water_latest_day else None
+            ),
+            "water_outlier_limit_litres": water_limit_l,
+            **dhw_quality,
         }
         if "idle_gas_kwh_per_day" in baseline:
             result["dhw"]["idle_gas_kwh_per_day"] = baseline["idle_gas_kwh_per_day"]
@@ -793,6 +1024,9 @@ def compute_all(
             "heating_off_from_power_days": sum(
                 1 for d in heating_off if d in heat_pct_by_day
             ),
+            **dhw_quality,
+            "latest_complete_gas_day": max(q_by_day) if q_by_day else None,
+            "latest_complete_water_day": water_latest_day,
         }
         gas_rate = conf.get("gas_unit_rate")
         if gas_rate:
@@ -803,36 +1037,142 @@ def compute_all(
                     )
         result["usage"] = usage
 
-    # Electricity: descriptive only (daily use, baseload, implied internal
-    # gains) - kept out of the gas-side thermal fits on purpose.
+    # Total-water context: deliberately labelled as total water rather than
+    # inferred hot-water litres. The source commonly arrives a few days late.
+    result["water_usage"] = None
+    result["water_status"] = {"configured": bool(conf.get("water"))}
+    if conf.get("water"):
+        water_summary = water_usage_summary(water, tz, since_full, current_day)
+        if water_summary:
+            water_summary.pop("daily_litres")
+            water_summary["source_lag_days"] = (
+                yesterday - water_summary["latest_complete_day"]
+            ).days
+            result["water_usage"] = water_summary
+        else:
+            result["water_status"]["usable_days"] = len(water_by_day)
+            result["water_status"]["required_days"] = WATER_USAGE_MIN_DAYS
+
+    # Electricity: descriptive only (daily use, current baseload, implied
+    # internal gains) - kept out of the gas-side thermal fits on purpose.
     result["electricity"] = None
+    result["electricity_status"] = {
+        "configured": bool(conf.get("electricity_meter"))
+    }
     if conf.get("electricity_meter"):
         elec = series_from_stats(stats.get(conf["electricity_meter"], []), "sum")
         summary = electricity_summary(elec, tz, since_full, current_day)
         if summary:
             elec_daily = summary.pop("daily_kwh")
             summary["last_7d_kwh_per_day"] = recent_daily_mean(
-                elec_daily, yesterday, 7, RECENT_7D_MIN_DAYS
+                elec_daily, summary["latest_complete_day"], 7, RECENT_7D_MIN_DAYS
             )
             summary["last_30d_kwh_per_day"] = recent_daily_mean(
-                elec_daily, yesterday, 30, RECENT_30D_MIN_DAYS
+                elec_daily, summary["latest_complete_day"], 30, RECENT_30D_MIN_DAYS
             )
+            summary["days_used_7d"] = recent_daily_count(
+                elec_daily, summary["latest_complete_day"], 7
+            )
+            summary["days_used_30d"] = recent_daily_count(
+                elec_daily, summary["latest_complete_day"], 30
+            )
+            summary["previous_30d_kwh_per_day"] = previous_period_mean(
+                elec_daily,
+                summary["latest_complete_day"],
+                30,
+                RECENT_30D_MIN_DAYS,
+            )
+            current_30d = summary["last_30d_kwh_per_day"]
+            previous_30d = summary["previous_30d_kwh_per_day"]
+            summary["change_vs_previous_30d_pct"] = (
+                (current_30d - previous_30d) / previous_30d * 100
+                if current_30d is not None and previous_30d
+                else None
+            )
+            summary["source_lag_days"] = (
+                yesterday - summary["latest_complete_day"]
+            ).days
             elec_rate = conf.get("electricity_unit_rate")
             if elec_rate:
                 summary["cost_per_day_gbp"] = summary["kwh_per_day"] * elec_rate
                 summary["cost_per_year_gbp"] = summary["kwh_per_day"] * elec_rate * 365
+                if summary["last_30d_kwh_per_day"] is not None:
+                    summary["cost_per_day_gbp_30d"] = (
+                        summary["last_30d_kwh_per_day"] * elec_rate
+                    )
+                    summary["cost_per_year_gbp_30d"] = (
+                        summary["last_30d_kwh_per_day"] * elec_rate * 365
+                    )
                 summary["baseload_cost_per_year_gbp"] = (
                     summary["baseload_kwh_per_day"] * elec_rate * 365
                 )
             result["electricity"] = summary
+        else:
+            elec_days = _daily_meter_steps(elec, tz, ELEC_MAX_STEP_KWH)
+            result["electricity_status"].update(
+                {"usable_days": len(elec_days), "required_days": ELEC_MIN_DAYS}
+            )
 
-    fit = fit_hlc(q_by_day, dt_by_day, since_full)
+    # Freeze the primary heating model at its latest evidenced heating day.
+    # Both ends of the HLC window and the DHW model used to correct it are
+    # anchored there. Summer hot-water observations can continue improving
+    # the live DHW sensors above without changing the heating baseline.
+    model_day = latest_heating_day(q_by_day, dt_by_day, heat_pct_by_day, since_full)
+    hlc_since_full = (
+        model_day - timedelta(days=windows_days[-1]) if model_day else since_full
+    )
+    hlc_dhw_by_day: dict = {}
+    hlc_baseline = None
+    if model_day:
+        locked_q = {d: v for d, v in q_by_day.items() if d <= model_day}
+        locked_dt = {d: v for d, v in dt_by_day.items() if d <= model_day}
+        locked_outdoor = {d: v for d, v in outdoor_by_day.items() if d <= model_day}
+        locked_water = {d: v for d, v in water_by_day.items() if d <= model_day}
+        locked_off = {d for d in heating_off if d <= model_day}
+        locked_water_limit = water_outlier_limit_litres(locked_water, model_day)
+        hlc_baseline = dhw_baseline(
+            locked_q,
+            locked_dt,
+            locked_outdoor,
+            hlc_since_full,
+            locked_off,
+            locked_water,
+            min_water_l,
+        )
+        locked_water_rate = fit_dhw_water_rate(
+            locked_q,
+            locked_water,
+            locked_outdoor,
+            locked_off,
+            hlc_since_full,
+            min_water_l,
+            locked_water_limit,
+        )
+        if hlc_baseline:
+            hlc_dhw_by_day, _ = attribute_dhw_by_day(
+                locked_q,
+                locked_outdoor,
+                locked_off,
+                hlc_baseline,
+                locked_water,
+                locked_water_rate,
+                locked_water_limit,
+                model_day,
+            )
+
+    fit = fit_hlc(q_by_day, dt_by_day, hlc_since_full, until=model_day)
     if fit:
         boiler_eff = conf.get("boiler_efficiency") or DEFAULT_BOILER_EFFICIENCY
         gas_side_fit = fit
         corrected = (
-            fit_hlc(q_by_day, dt_by_day, since_full, dhw_by_day)
-            if dhw_by_day
+            fit_hlc(
+                q_by_day,
+                dt_by_day,
+                hlc_since_full,
+                hlc_dhw_by_day,
+                model_day,
+            )
+            if hlc_dhw_by_day
             else None
         )
         space_heating_fit = corrected or gas_side_fit
@@ -854,6 +1194,14 @@ def compute_all(
             "boiler_efficiency_used": boiler_eff,
             "window_days": windows_days[-1],
             "status": space_heating_fit["status"],
+            "model_data_through": model_day,
+            "summer_stability": "held until a new qualifying heating day",
+            "dhw_baseline_kwh_per_day": (
+                hlc_baseline["kwh_per_day"] if hlc_baseline else None
+            ),
+            "dhw_baseline_days_used": (
+                hlc_baseline["days_used"] if hlc_baseline else None
+            ),
         }
         floor_area = conf.get("floor_area_m2")
         if floor_area:
@@ -861,18 +1209,23 @@ def compute_all(
         if corrected:
             result["hlc"]["space_heating_hlc_w_per_k"] = delivered_hlc
             result["hlc"]["space_heating_r_squared"] = corrected["r_squared"]
-        for window in windows_days[:-1]:
-            since = (now - timedelta(days=window)).astimezone(tz).date()
-            recent = fit_hlc(
-                q_by_day, dt_by_day, since, dhw_by_day if dhw_by_day else None
-            )
-            if recent and recent["days_used"] >= HLC_MIN_DAYS:
-                result["hlc"]["recent_hlc_w_per_k"] = (
-                    recent["hlc_w_per_k"] * boiler_eff
+        if model_day:
+            for window in windows_days[:-1]:
+                since = model_day - timedelta(days=window)
+                recent = fit_hlc(
+                    q_by_day,
+                    dt_by_day,
+                    since,
+                    hlc_dhw_by_day if hlc_dhw_by_day else None,
+                    model_day,
                 )
-                result["hlc"]["recent_window_days"] = window
-                result["hlc"]["recent_days_used"] = recent["days_used"]
-                break
+                if recent and recent["days_used"] >= HLC_MIN_DAYS:
+                    result["hlc"]["recent_hlc_w_per_k"] = (
+                        recent["hlc_w_per_k"] * boiler_eff
+                    )
+                    result["hlc"]["recent_window_days"] = window
+                    result["hlc"]["recent_days_used"] = recent["days_used"]
+                    break
 
     # Ventilation/fabric split: air-change rate from CO2 decay curves, times
     # the flat's volume, gives ventilation W/K; the rest of the delivered

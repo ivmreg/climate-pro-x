@@ -152,6 +152,35 @@ def test_water_rate_needs_enough_days_and_physical_bounds(thermal_math):
     days, q, water, outdoor = _rate_fixture(0.6, count=9)
     assert thermal_math.fit_dhw_water_rate(q, water, outdoor, set(days), SINCE) is None
 
+
+def test_extreme_total_water_falls_back_instead_of_erasing_heating(thermal_math):
+    day = SINCE
+    q = {day: 45.0}
+    outdoor = {day: 5.0}
+    water = {day: 5000.0}
+    baseline = {"kwh_per_day": 10.0, "outdoor_mean": 15.0}
+    rate = {"wh_per_litre_per_k": 0.4}
+
+    attributed, quality = thermal_math.attribute_dhw_by_day(
+        q,
+        outdoor,
+        set(),
+        baseline,
+        water,
+        rate,
+        water_outlier_limit_l=2000.0,
+    )
+
+    assert attributed[day] < q[day]
+    assert attributed[day] == pytest.approx(
+        thermal_math.dhw_daily_kwh(outdoor[day], baseline)
+    )
+    assert quality == {
+        "water_attribution_days": 0,
+        "baseline_fallback_days": 1,
+        "water_outlier_days_ignored": 1,
+    }
+
     days, q, water, outdoor = _rate_fixture(2.5)  # more than pure hot water
     assert thermal_math.fit_dhw_water_rate(q, water, outdoor, set(days), SINCE) is None
 
@@ -209,3 +238,103 @@ def test_electricity_summary_needs_two_weeks(thermal_math):
         )
         is None
     )
+
+
+def test_electricity_summary_uses_current_30_days_consistently(thermal_math):
+    start = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    total = 1000.0
+    series = {}
+    for hour in range(24 * 70):
+        day = hour // 24
+        # Older history uses twice as much electricity and has a higher floor.
+        increment = 0.4 if day < 35 else 0.2
+        total += increment
+        series[int(start.timestamp()) + hour * 3600] = total
+
+    result = thermal_math.electricity_summary(
+        series, TZ, date(2026, 4, 1), date(2026, 7, 1)
+    )
+
+    assert result is not None
+    assert result["baseload_w"] == pytest.approx(200.0)
+    assert result["kwh_per_day"] == pytest.approx(4.8)
+    assert result["historical_kwh_per_day"] > result["kwh_per_day"]
+    assert result["baseload_share_pct"] == pytest.approx(100.0)
+
+
+def test_water_usage_reports_mean_typical_day_and_high_days(thermal_math):
+    start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    total = 5000.0
+    series = {}
+    for hour in range(24 * 35):
+        day = hour // 24
+        daily = 5000.0 if day == 30 else 800.0
+        total += daily / 24
+        series[int(start.timestamp()) + hour * 3600] = total
+
+    result = thermal_math.water_usage_summary(
+        series, TZ, date(2026, 6, 1), date(2026, 7, 15)
+    )
+
+    assert result is not None
+    assert result["litres_per_day_7d"] > 800.0
+    assert result["typical_day_litres_30d"] == pytest.approx(800.0)
+    assert result["high_usage_days_30d"] == 1
+
+
+def test_hlc_is_unchanged_as_non_heating_season_accumulates(thermal_math):
+    """The live DHW baseline may learn from summer, but the heating model and
+    its correction stay anchored to the last evidenced heating day."""
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    stats = {key: [] for key in ("room", "outdoor", "heat", "gas", "water")}
+    gas_total = 1000.0
+    water_total = 5000.0
+    for hour in range(120 * 24):
+        day = hour // 24
+        ts = int(start.timestamp()) + hour * 3600
+        if day < 20:  # pre-season baseline available to the locked model
+            outdoor, heating_pct, daily_gas = 18.0, 0.0, 10.0
+        elif day < 60:  # heating season with a range of cold conditions
+            outdoor = 4.0 + (day % 10) * 0.8
+            heating_pct = 40.0
+            daily_gas = 10.0 + 7.2 * (20.0 - outdoor)
+        elif day < 90:  # first summer block changes the live baseline upward
+            outdoor, heating_pct, daily_gas = 18.0, 0.0, 20.0
+        else:  # more summer data changes it again
+            outdoor, heating_pct, daily_gas = 18.0, 0.0, 5.0
+        gas_total += daily_gas / 24
+        water_total += 500.0 / 24
+        stats["room"].append({"start": ts, "mean": 20.0})
+        stats["outdoor"].append({"start": ts, "mean": outdoor})
+        stats["heat"].append({"start": ts, "mean": heating_pct})
+        stats["gas"].append({"start": ts, "sum": gas_total})
+        stats["water"].append({"start": ts, "sum": water_total})
+
+    conf = {
+        "rooms": {"room": {"temperature": "room", "heating_power": "heat"}},
+        "outdoor": "outdoor",
+        "gas_meter": "gas",
+        "water": "water",
+        "boiler_efficiency": 0.9,
+    }
+
+    def result_through(day_count: int):
+        cutoff = int(start.timestamp()) + day_count * 24 * 3600
+        partial = {
+            key: [row for row in rows if row["start"] < cutoff]
+            for key, rows in stats.items()
+        }
+        now = start + timedelta(days=day_count)
+        return thermal_math.compute_all(partial, conf, TZ, now, (60, 120))
+
+    early_summer = result_through(90)
+    late_summer = result_through(120)
+
+    assert early_summer["hlc"] is not None and late_summer["hlc"] is not None
+    assert early_summer["dhw"]["kwh_per_day"] != late_summer["dhw"]["kwh_per_day"]
+    assert early_summer["hlc"]["hlc_w_per_k"] == pytest.approx(
+        late_summer["hlc"]["hlc_w_per_k"], rel=1e-12
+    )
+    assert early_summer["hlc"]["model_data_through"] == late_summer["hlc"][
+        "model_data_through"
+    ]
