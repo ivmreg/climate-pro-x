@@ -29,6 +29,12 @@ HLC_MIN_DAYS = 30  # for the shorter-window "recent" estimate
 HLC_FALLBACK_MIN_DAYS = 20
 HLC_MIN_R2 = 0.5
 HLC_MIN_DT_SPREAD = 3.0
+# Consecutive days share a weather system, so regression residuals are serially
+# correlated and the naive OLS standard error understates the real uncertainty.
+# An AR(1) effective-sample-size correction (measured r1 ~0.4 on a real season,
+# i.e. a ~1.5x wider interval) keeps the published CI honest.
+HLC_AC_MIN_PAIRS = 10
+HLC_AC_MAX_R1 = 0.9  # beyond this the AR(1) correction explodes; clamp instead
 HLC_MIN_W_PER_K = 10.0
 HLC_MAX_W_PER_K = 1500.0
 DHW_BASELINE_MAX_DT = 3.0
@@ -39,6 +45,10 @@ TAU_MIN_DROP = 0.3
 TAU_MIN_R2 = 0.8
 TAU_MAX_HEATING_PCT = 1.0
 TAU_MIN_NIGHTS = 3
+TAU_MIN_HOURS = 1.0
+TAU_MAX_HOURS = 200.0  # search bound; a fit landing here is censored, not measured
+TAU_SEARCH_STEP_H = 0.25
+TAU_MAX_GAP_S = 5400  # 1.5h; bigger gaps break the exponential-decay assumption
 LOFT_NIGHT_HOURS = range(1, 6)
 LOFT_MIN_DT = 6.0
 LOFT_MIN_HOURS = 12
@@ -119,6 +129,39 @@ def linear_fit(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
 
 def _local(ts: int, tz: tzinfo) -> datetime:
     return datetime.fromtimestamp(ts, tz)
+
+
+def lag1_autocorrelation(days: list, residuals: list[float]) -> float:
+    """Lag-1 autocorrelation of `residuals`, paired over adjacent calendar days.
+
+    Days that survive the fit's filters are not contiguous (mild and low-gas
+    days are dropped), so only genuinely adjacent dates are treated as a lagged
+    pair - a gap of a week carries no AR(1) information.
+    """
+    pairs = [
+        (residuals[i], residuals[i + 1])
+        for i in range(len(days) - 1)
+        if (days[i + 1] - days[i]).days == 1
+    ]
+    if len(pairs) < HLC_AC_MIN_PAIRS:
+        return 0.0
+    mean = sum(residuals) / len(residuals)
+    variance = sum((r - mean) ** 2 for r in residuals) / len(residuals)
+    if variance <= 0:
+        return 0.0
+    covariance = sum((a - mean) * (b - mean) for a, b in pairs) / len(pairs)
+    return covariance / variance
+
+
+def _variance_inflation(r1: float) -> float:
+    """AR(1) variance inflation factor for a mean/slope standard error.
+
+    Only positive autocorrelation is corrected for: negative r1 would shrink
+    the interval, and claiming *more* precision than the independent-sample
+    case on this evidence is not a trade worth making.
+    """
+    r1 = min(max(r1, 0.0), HLC_AC_MAX_R1)
+    return (1 + r1) / (1 - r1)
 
 
 def drop_flatlines(series: Series, window: int = 24, eps: float = 0.05) -> Series:
@@ -265,11 +308,12 @@ def fit_hlc(
         adjusted = q_by_day[d] - (dhw_by_day.get(d, 0.0) if dhw_by_day else 0.0)
         if adjusted <= 0:
             continue
-        pairs.append((dt_by_day[d], adjusted))
+        pairs.append((d, dt_by_day[d], adjusted))
     if len(pairs) < HLC_FALLBACK_MIN_DAYS:
         return None
-    xs = [p[0] for p in pairs]
-    ys = [p[1] for p in pairs]
+    fit_days = [p[0] for p in pairs]
+    xs = [p[1] for p in pairs]
+    ys = [p[2] for p in pairs]
     if max(xs) - min(xs) < HLC_MIN_DT_SPREAD:
         return None
     slope, intercept, r2 = linear_fit(xs, ys)
@@ -279,10 +323,15 @@ def fit_hlc(
 
     mx = sum(xs) / len(xs)
     sxx = sum((x - mx) ** 2 for x in xs)
-    residual_sum = sum(
-        (y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys)
-    )
+    residuals = [y - (slope * x + intercept) for x, y in zip(xs, ys)]
+    residual_sum = sum(r**2 for r in residuals)
     slope_se = sqrt(residual_sum / (len(xs) - 2) / sxx) if len(xs) > 2 and sxx else 0.0
+    # Widen for serially correlated residuals: consecutive days share weather,
+    # so the fit has fewer independent observations than it has days.
+    r1 = lag1_autocorrelation(fit_days, residuals)
+    vif = _variance_inflation(r1)
+    slope_se *= sqrt(vif)
+    effective_days = len(xs) / vif
     lower_slope = slope - 1.96 * slope_se
     upper_slope = slope + 1.96 * slope_se
     if lower_slope <= 0:
@@ -300,6 +349,8 @@ def fit_hlc(
         "hlc_ci_high_w_per_k": upper_slope * 1000 / 24,
         "r_squared": r2,
         "days_used": len(pairs),
+        "residual_autocorrelation": r1,
+        "effective_independent_days": effective_days,
         "free_gains_kwh_per_day": -intercept,
         "regression_intercept_kwh_per_day": intercept,
         "status": "valid" if len(pairs) >= HLC_MIN_DAYS else "provisional",
@@ -720,7 +771,7 @@ def night_taus(
     for date, hours in nights.items():
         if len(hours) < TAU_MIN_POINTS:
             continue
-        if any(b - a > CO2_MAX_GAP_S for a, b in zip(hours, hours[1:])):
+        if any(b - a > TAU_MAX_GAP_S for a, b in zip(hours, hours[1:])):
             continue
         if heating is not None:
             h_vals = [heating[ts] for ts in hours if ts in heating]
@@ -736,25 +787,40 @@ def night_taus(
             continue
         if temps[0] - temps[-1] < TAU_MIN_DROP:
             continue
+        # The step geometry does not depend on tau, so build it once instead of
+        # rebuilding it inside every candidate-tau iteration.
+        steps = [
+            (
+                (hours[i] - hours[i - 1]) / 3600,
+                (outdoor[hours[i - 1]] + outdoor[hours[i]]) / 2,
+            )
+            for i in range(1, len(hours))
+        ]
         best_tau = None
         best_residual = float("inf")
-        for quarter_hours in range(4, 801):  # 1h to 200h in 0.25h steps
-            tau = quarter_hours / 4
-            predicted = [temps[0]]
-            for index in range(1, len(hours)):
-                elapsed = (hours[index] - hours[index - 1]) / 3600
-                boundary = (outdoor[hours[index - 1]] + outdoor[hours[index]]) / 2
-                predicted.append(
-                    boundary + (predicted[-1] - boundary) * exp(-elapsed / tau)
-                )
-            residual = sum((actual - model) ** 2 for actual, model in zip(temps, predicted))
+        for quarter_hours in range(
+            round(TAU_MIN_HOURS / TAU_SEARCH_STEP_H),
+            round(TAU_MAX_HOURS / TAU_SEARCH_STEP_H) + 1,
+        ):
+            tau = quarter_hours * TAU_SEARCH_STEP_H
+            model = temps[0]
+            residual = 0.0
+            for (elapsed, boundary), actual in zip(steps, temps[1:]):
+                model = boundary + (model - boundary) * exp(-elapsed / tau)
+                residual += (actual - model) ** 2
             if residual < best_residual:
                 best_residual = residual
                 best_tau = tau
+        if best_tau is None or best_tau >= TAU_MAX_HOURS:
+            # Pinned at the search bound: the room barely cooled, so the night
+            # only bounds tau from below rather than measuring it. Letting the
+            # bound itself into the median would report the search range as a
+            # result.
+            continue
         mean_temp = sum(temps) / len(temps)
         total = sum((value - mean_temp) ** 2 for value in temps)
         r2 = 1 - best_residual / total if total > 0 else 0.0
-        if best_tau is None or r2 < TAU_MIN_R2:
+        if r2 < TAU_MIN_R2:
             continue
         fits.append({"date": str(date), "tau_hours": best_tau, "r_squared": r2})
     return fits
@@ -1183,7 +1249,25 @@ def compute_all(
             "hlc_ci_high_w_per_k": space_heating_fit["hlc_ci_high_w_per_k"] * boiler_eff,
             "r_squared": space_heating_fit["r_squared"],
             "days_used": space_heating_fit["days_used"],
-            "free_gains_kwh_per_day": space_heating_fit["free_gains_kwh_per_day"],
+            "residual_autocorrelation": space_heating_fit["residual_autocorrelation"],
+            "effective_independent_days": space_heating_fit[
+                "effective_independent_days"
+            ],
+            # The regression runs on gas, so its intercept is fuel input. Free
+            # gains are a heat flow, and every other heat figure here is
+            # delivered heat - so report them in that frame (x boiler
+            # efficiency), which is also the frame electricity's
+            # implied_internal_gains_w is already in, making the two
+            # comparable. The raw fuel-side value stays available alongside.
+            "free_gains_kwh_per_day": (
+                space_heating_fit["free_gains_kwh_per_day"] * boiler_eff
+            ),
+            "free_gains_w": (
+                space_heating_fit["free_gains_kwh_per_day"] * boiler_eff * 1000 / 24
+            ),
+            "fuel_input_free_gains_kwh_per_day": space_heating_fit[
+                "free_gains_kwh_per_day"
+            ],
             "regression_intercept_kwh_per_day": space_heating_fit[
                 "regression_intercept_kwh_per_day"
             ],

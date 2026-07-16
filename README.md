@@ -21,6 +21,14 @@ Treat these as household diagnostics rather than a substitute for a calibrated
 co-heating test or professional retrofit survey. The integration suppresses
 results that fail coverage, fit-quality, confidence or physical-bound checks.
 
+Reported confidence intervals account for the fact that consecutive days share
+a weather system: daily regression residuals are serially correlated, so a
+season of days carries less independent evidence than its day count suggests
+(on real data here, lag-1 residual autocorrelation ≈ 0.4, leaving ~73 effective
+days out of 163 and widening the interval by ~1.5x versus treating days as
+independent). The `residual_autocorrelation` and `effective_independent_days`
+attributes report this directly.
+
 ## Setup
 
 1. In Home Assistant: your profile → **Security** → **Long-lived access
@@ -113,7 +121,9 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
 - `sensor.thermal_efficiency_heat_loss_coefficient` — delivered W/K over the
   full window after available DHW and boiler-efficiency corrections, with
   attributes for the fuel-input slopes, confidence interval, R² and days used,
-  DHW baseline, a shorter-window `recent_hlc_w_per_k` for spotting
+  DHW baseline, `free_gains_w` (the regression's free-gains intercept as
+  delivered heat, so it is directly comparable with the electricity sensor's
+  `implied_internal_gains_w`), a shorter-window `recent_hlc_w_per_k` for spotting
   improvements after e.g. draught-proofing, `hlc_w_per_k_per_m2` (set
   `floor_area_m2` to get this — the normalised benchmark assessors use), and
   `space_heating_hlc_w_per_k` — the same fit with hot-water gas subtracted

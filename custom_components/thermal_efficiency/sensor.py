@@ -84,6 +84,13 @@ class HlcSensor(ThermalSensor):
             "window_days": fit["window_days"],
             "confidence_interval_low_w_per_k": round(fit["hlc_ci_low_w_per_k"], 1),
             "confidence_interval_high_w_per_k": round(fit["hlc_ci_high_w_per_k"], 1),
+            # Consecutive days share weather, so the interval above is widened
+            # for serial correlation; these two explain how much.
+            "residual_autocorrelation": round(fit["residual_autocorrelation"], 2),
+            "effective_independent_days": round(fit["effective_independent_days"]),
+            # Delivered-heat frame, directly comparable with the electricity
+            # sensor's implied_internal_gains_w.
+            "free_gains_w": round(fit["free_gains_w"]),
             "fuel_input_hlc_w_per_k": round(fit["fuel_input_hlc_w_per_k"], 1),
             "space_heating_fuel_input_hlc_w_per_k": round(
                 fit["space_heating_fuel_input_hlc_w_per_k"], 1

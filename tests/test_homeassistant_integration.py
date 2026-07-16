@@ -135,6 +135,40 @@ async def test_electricity_meter_and_tariff_are_wired(hass):
     ) == pytest.approx(0.184)
 
 
+async def test_analysis_does_not_run_on_the_event_loop(hass, monkeypatch):
+    """compute_all is ~1s of pure CPU on a full season of hourly statistics.
+    Running it on the event loop stalls all of Home Assistant for that long,
+    so it must be handed to the executor."""
+    import threading
+
+    from custom_components.thermal_efficiency import coordinator as coordinator_module
+
+    loop_thread = threading.get_ident()
+    ran_on: dict = {}
+
+    def _fake_statistics(*args, **kwargs):
+        return {}
+
+    def _fake_compute_all(stats, conf, tz, now, windows):
+        ran_on["thread"] = threading.get_ident()
+        return {"rooms": {}}
+
+    # No recorder is running in this fixture; borrow hass's own executor so the
+    # statistics fetch resolves and the compute hand-off is what gets tested.
+    monkeypatch.setattr(coordinator_module, "get_instance", lambda hass_: hass_)
+    monkeypatch.setattr(
+        coordinator_module, "statistics_during_period", _fake_statistics
+    )
+    monkeypatch.setattr(
+        coordinator_module.thermal_math, "compute_all", _fake_compute_all
+    )
+
+    coordinator = ThermalCoordinator(hass, _config())
+    await coordinator._async_update_data()
+
+    assert ran_on["thread"] != loop_thread
+
+
 async def test_options_entry_can_hold_legacy_scalar_co2(hass):
     config = _config()
     config[CONF_CO2] = "sensor.bedroom_co2"

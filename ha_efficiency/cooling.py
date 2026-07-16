@@ -18,6 +18,9 @@ MIN_WINDOW_HOURS = 3.0
 MIN_DELTA_T = 3.0  # K between room and outdoor; below this the fit is noise
 MIN_DROP = 0.3  # room must actually cool by this much (degC)
 MAX_HEATING_PCT = 1.0  # tado heating power must stay <= this during window
+MIN_TAU_HOURS = 1.0
+MAX_TAU_HOURS = 200.0  # search bound; a fit landing here is censored, not measured
+TAU_SEARCH_STEP_H = 0.25
 
 
 @dataclass
@@ -63,23 +66,28 @@ def fit_window(room: pd.Series, outdoor: pd.Series) -> NightFit | None:
     elapsed = room.index.to_series().diff().dt.total_seconds().div(3600).to_numpy()
     room_values = room.to_numpy(dtype=float)
     outdoor_values = outdoor.to_numpy(dtype=float)
+    # The boundary temperature of each step does not depend on tau, so build it
+    # once rather than inside every candidate-tau iteration.
+    boundaries = (outdoor_values[:-1] + outdoor_values[1:]) / 2
     best_tau = None
     best_residual = float("inf")
-    for tau in np.arange(1.0, 200.25, 0.25):
+    for tau in np.arange(MIN_TAU_HOURS, MAX_TAU_HOURS + TAU_SEARCH_STEP_H, TAU_SEARCH_STEP_H):
         predicted = np.empty(len(room_values))
         predicted[0] = room_values[0]
+        decay = np.exp(-elapsed[1:] / tau)
         for i in range(1, len(room_values)):
-            boundary = (outdoor_values[i - 1] + outdoor_values[i]) / 2
-            predicted[i] = boundary + (predicted[i - 1] - boundary) * np.exp(
-                -elapsed[i] / tau
-            )
+            predicted[i] = boundaries[i - 1] + (
+                predicted[i - 1] - boundaries[i - 1]
+            ) * decay[i - 1]
         residual = float(np.sum((room_values - predicted) ** 2))
         if residual < best_residual:
             best_tau, best_residual = float(tau), residual
+    if best_tau is None or best_tau >= MAX_TAU_HOURS:
+        return None  # pinned at the search bound: a lower bound, not a measurement
     ss_res = best_residual
     ss_tot = float(np.sum((room_values - room_values.mean()) ** 2))
     r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    if best_tau is None or r2 < 0.8:
+    if r2 < 0.8:
         return None  # non-exponential (door opened, sun, heating blip)
 
     return NightFit(

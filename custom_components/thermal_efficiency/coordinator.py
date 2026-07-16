@@ -143,33 +143,38 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             },
             {"mean", "sum"},
         )
-        return thermal_math.compute_all(
+        # compute_all is pure CPU and takes ~1s on a full season of hourly
+        # statistics, so it must not run on the event loop. Tariffs are read
+        # from the state machine here, before handing off to the executor.
+        conf = {
+            "rooms": self.conf[CONF_ROOMS],
+            "outdoor": self.conf[CONF_OUTDOOR],
+            "gas_meter": self.conf.get(CONF_GAS_METER),
+            "loft": self.conf.get(CONF_LOFT),
+            "loft_since": (
+                dt_util.parse_date(self.conf[CONF_LOFT_SINCE])
+                if self.conf.get(CONF_LOFT_SINCE)
+                else None
+            ),
+            "loft_humidity": self.conf.get(CONF_LOFT_HUMIDITY),
+            "floor_area_m2": self.conf.get(CONF_FLOOR_AREA),
+            "co2": self.conf.get(CONF_CO2),
+            "outdoor_co2_ppm": self.conf.get(CONF_OUTDOOR_CO2),
+            "outdoor_co2_sensor": self.conf.get(CONF_OUTDOOR_CO2_SENSOR),
+            "ceiling_height_m": self.conf.get(CONF_CEILING_HEIGHT),
+            "water": self.conf.get(CONF_WATER),
+            "min_dhw_water_litres": self.conf.get(CONF_MIN_DHW_WATER_L),
+            "gas_unit_rate": self._unit_rate(CONF_GAS_UNIT_RATE, "Gas"),
+            "boiler_efficiency": self.conf.get(CONF_BOILER_EFFICIENCY),
+            "electricity_meter": self.conf.get(CONF_ELECTRICITY_METER),
+            "electricity_unit_rate": self._unit_rate(
+                CONF_ELECTRICITY_UNIT_RATE, "Electricity"
+            ),
+        }
+        return await self.hass.async_add_executor_job(
+            thermal_math.compute_all,
             stats,
-            {
-                "rooms": self.conf[CONF_ROOMS],
-                "outdoor": self.conf[CONF_OUTDOOR],
-                "gas_meter": self.conf.get(CONF_GAS_METER),
-                "loft": self.conf.get(CONF_LOFT),
-                "loft_since": (
-                    dt_util.parse_date(self.conf[CONF_LOFT_SINCE])
-                    if self.conf.get(CONF_LOFT_SINCE)
-                    else None
-                ),
-                "loft_humidity": self.conf.get(CONF_LOFT_HUMIDITY),
-                "floor_area_m2": self.conf.get(CONF_FLOOR_AREA),
-                "co2": self.conf.get(CONF_CO2),
-                "outdoor_co2_ppm": self.conf.get(CONF_OUTDOOR_CO2),
-                "outdoor_co2_sensor": self.conf.get(CONF_OUTDOOR_CO2_SENSOR),
-                "ceiling_height_m": self.conf.get(CONF_CEILING_HEIGHT),
-                "water": self.conf.get(CONF_WATER),
-                "min_dhw_water_litres": self.conf.get(CONF_MIN_DHW_WATER_L),
-                "gas_unit_rate": self._unit_rate(CONF_GAS_UNIT_RATE, "Gas"),
-                "boiler_efficiency": self.conf.get(CONF_BOILER_EFFICIENCY),
-                "electricity_meter": self.conf.get(CONF_ELECTRICITY_METER),
-                "electricity_unit_rate": self._unit_rate(
-                    CONF_ELECTRICITY_UNIT_RATE, "Electricity"
-                ),
-            },
+            conf,
             dt_util.get_default_time_zone(),
             now,
             windows,

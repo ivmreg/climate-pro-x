@@ -36,6 +36,7 @@ views:
               {% set recent = state_attr(s, 'recent_hlc_w_per_k') | float(0) %}
               {% set recent_window = state_attr(s, 'recent_window_days') | int(0) %}
               {% set intercept = state_attr(s, 'regression_intercept_kwh_per_day') | float(0) %}
+              {% set effective = state_attr(s, 'effective_independent_days') | int(0) %}
               {% set change = ((recent - value) / value * 100) if value and recent else none %}
 
               # {{ value | round(0) }} W/K
@@ -43,6 +44,7 @@ views:
               **{{ status | title }}** · {{ days }} heating days · R² {{ r2 | round(3) }}
 
               Approximate 95% interval: **{{ low | round(0) }}–{{ high | round(0) }} W/K**
+              {% if effective %}(consecutive days share weather, so these {{ days }} days carry about {{ effective }} days of independent evidence){% endif %}
 
               {% if recent %}
               Recent {{ recent_window }}-day estimate: **{{ recent | round(0) }} W/K**

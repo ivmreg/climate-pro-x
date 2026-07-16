@@ -31,5 +31,16 @@ def test_sanitized_heating_fixture_matches_independent_ols_reference():
     assert result["hlc_w_per_k"] == pytest.approx(reference_hlc, rel=1e-12)
     assert result["hlc_w_per_k"] == pytest.approx(324, abs=2)
     assert result["r_squared"] == pytest.approx(0.657, abs=0.01)
-    assert result["hlc_ci_low_w_per_k"] > 250
-    assert result["hlc_ci_high_w_per_k"] < 400
+
+    # These are real consecutive heating days, so their residuals are serially
+    # correlated (shared weather) and the interval is widened accordingly: 60
+    # days carry only ~31 days' worth of independent evidence. The naive
+    # independent-sample interval here would be the visibly overconfident
+    # 250-399 W/K.
+    assert result["residual_autocorrelation"] == pytest.approx(0.32, abs=0.05)
+    assert result["effective_independent_days"] == pytest.approx(31, abs=3)
+    assert result["hlc_ci_low_w_per_k"] > 230
+    assert result["hlc_ci_high_w_per_k"] < 420
+    assert (
+        result["hlc_ci_low_w_per_k"] < reference_hlc < result["hlc_ci_high_w_per_k"]
+    )

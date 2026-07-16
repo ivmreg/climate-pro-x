@@ -24,6 +24,33 @@ MIN_HLC_W_PER_K = 10.0
 MAX_HLC_W_PER_K = 1500.0
 MAX_METER_GAP = pd.Timedelta("1.5h")
 MIN_DAILY_COVERAGE = 0.9
+# Consecutive days share a weather system, so daily regression residuals are
+# serially correlated and the naive OLS standard error understates the real
+# uncertainty. Mirrors thermal_math's AR(1) effective-sample-size correction.
+AC_MIN_PAIRS = 10
+AC_MAX_R1 = 0.9
+
+
+def _lag1_autocorrelation(days: pd.DatetimeIndex, residuals: np.ndarray) -> float:
+    """Lag-1 autocorrelation over adjacent calendar days only: the days that
+    survive the fit's filters are not contiguous, and a week-long gap carries
+    no AR(1) information."""
+    adjacent = np.diff(days.to_numpy()) == np.timedelta64(1, "D")
+    if adjacent.sum() < AC_MIN_PAIRS:
+        return 0.0
+    centred = residuals - residuals.mean()
+    variance = float(np.mean(centred**2))
+    if variance <= 0:
+        return 0.0
+    covariance = float(np.mean((centred[:-1] * centred[1:])[adjacent]))
+    return covariance / variance
+
+
+def _variance_inflation(r1: float) -> float:
+    """AR(1) variance inflation for a slope standard error. Negative r1 is not
+    credited: claiming more precision than the independent-sample case on this
+    evidence is not a trade worth making."""
+    return (1 + min(max(r1, 0.0), AC_MAX_R1)) / (1 - min(max(r1, 0.0), AC_MAX_R1))
 
 
 def _expected_day_hours(day: pd.Timestamp) -> int:
@@ -104,12 +131,18 @@ def fit_hlc(q_daily: pd.Series, dt_daily: pd.Series) -> dict:
                 "note": "Usable days do not span enough indoor-outdoor temperature variation."}
     slope, intercept = np.polyfit(df.dt, df.q, 1)
     pred = slope * df.dt + intercept
-    ss_res = float(np.sum((df.q - pred) ** 2))
+    residuals = (df.q - pred).to_numpy(dtype=float)
+    ss_res = float(np.sum(residuals**2))
     ss_tot = float(np.sum((df.q - df.q.mean()) ** 2))
     r_squared = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
     hlc_w_per_k = slope * 1000 / 24
     sxx = float(np.sum((df.dt - df.dt.mean()) ** 2))
     slope_se = float(np.sqrt(ss_res / (len(df) - 2) / sxx)) if sxx > 0 else float("inf")
+    # Widen for serially correlated residuals: the fit has fewer independent
+    # observations than it has days.
+    r1 = _lag1_autocorrelation(df.index, residuals)
+    vif = _variance_inflation(r1)
+    slope_se *= np.sqrt(vif)
     ci_low = (slope - 1.96 * slope_se) * 1000 / 24
     ci_high = (slope + 1.96 * slope_se) * 1000 / 24
     if (
@@ -129,6 +162,8 @@ def fit_hlc(q_daily: pd.Series, dt_daily: pd.Series) -> dict:
         "free_gains_kwh_per_day": -intercept,
         "regression_intercept_kwh_per_day": intercept,
         "r_squared": r_squared,
+        "residual_autocorrelation": r1,
+        "effective_independent_days": len(df) / vif,
         "status": "valid" if len(df) >= 30 else "provisional",
         "data": df,
     }
