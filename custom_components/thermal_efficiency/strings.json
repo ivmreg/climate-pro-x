@@ -15,8 +15,11 @@
           "co2": "Indoor CO2 sensors (optional – enables the ventilation/fabric estimate)",
           "outdoor_co2_ppm": "Outdoor CO2 baseline in ppm (optional – safer than estimating it indoors)",
           "outdoor_co2_sensor": "Outdoor CO2 sensor (optional – preferred over a fixed baseline)",
-          "water": "Water meter statistic, hourly (optional – enables the informational gas/water regression)",
+          "water": "Water meter statistic, hourly (optional – enables away-day filtering and water-aware DHW estimates)",
+          "min_dhw_water_litres": "Minimum daily water use for an occupied day, in litres (optional – 0 disables the away-day filter)",
           "gas_unit_rate": "Gas tariff sensor, GBP/kWh or p/kWh (optional – enables non-space-heating gas cost)",
+          "electricity_meter": "Electricity meter, cumulative kWh (optional)",
+          "electricity_unit_rate": "Electricity tariff sensor, GBP/kWh or p/kWh (optional)",
           "boiler_efficiency": "Boiler efficiency, 0-1 (optional – default 0.88)",
           "max_window_days": "Maximum lookback window, in days"
         }
@@ -34,14 +37,15 @@
         "data": {
           "name": "Room name",
           "temperature": "Temperature sensor",
-          "heating_power": "Heating power sensor (optional)",
+          "heating_power": "Heating demand sensor, 0–100% (optional)",
           "add_another": "Add another room"
         }
       }
     },
     "error": {
       "invalid_name": "Enter a room name",
-      "duplicate_room": "A room with this name was already added"
+      "duplicate_room": "A room with this name was already added",
+      "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100"
     },
     "abort": {
       "single_instance_allowed": "Only one Thermal Efficiency instance is allowed"
@@ -62,8 +66,11 @@
           "co2": "Indoor CO2 sensors (optional – enables the ventilation/fabric estimate)",
           "outdoor_co2_ppm": "Outdoor CO2 baseline in ppm (optional – safer than estimating it indoors)",
           "outdoor_co2_sensor": "Outdoor CO2 sensor (optional – preferred over a fixed baseline)",
-          "water": "Water meter statistic, hourly (optional – enables the informational gas/water regression)",
+          "water": "Water meter statistic, hourly (optional – enables away-day filtering and water-aware DHW estimates)",
+          "min_dhw_water_litres": "Minimum daily water use for an occupied day, in litres (optional – 0 disables the away-day filter)",
           "gas_unit_rate": "Gas tariff sensor, GBP/kWh or p/kWh (optional – enables non-space-heating gas cost)",
+          "electricity_meter": "Electricity meter, cumulative kWh (optional)",
+          "electricity_unit_rate": "Electricity tariff sensor, GBP/kWh or p/kWh (optional)",
           "boiler_efficiency": "Boiler efficiency, 0-1 (optional – default 0.88)",
           "max_window_days": "Maximum lookback window, in days"
         }
@@ -74,7 +81,7 @@
         "data": {
           "name": "Room name",
           "temperature": "Temperature sensor",
-          "heating_power": "Heating power sensor (optional)",
+          "heating_power": "Heating demand sensor, 0–100% (optional)",
           "remove_room": "Remove this room"
         }
       },
@@ -91,14 +98,16 @@
         "data": {
           "name": "Room name",
           "temperature": "Temperature sensor",
-          "heating_power": "Heating power sensor (optional)",
+          "heating_power": "Heating demand sensor, 0–100% (optional)",
           "add_another": "Add another room"
         }
       }
     },
     "error": {
       "invalid_name": "Enter a room name",
-      "duplicate_room": "A room with this name was already added"
+      "duplicate_room": "A room with this name was already added",
+      "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100",
+      "at_least_one_room": "Keep or add at least one room before finishing"
     }
   }
 }

@@ -18,6 +18,7 @@ MIN_WINDOW_HOURS = 3.0
 MIN_DELTA_T = 3.0  # K between room and outdoor; below this the fit is noise
 MIN_DROP = 0.3  # room must actually cool by this much (degC)
 MAX_HEATING_PCT = 1.0  # tado heating power must stay <= this during window
+MIN_NIGHTS = 3
 MIN_TAU_HOURS = 1.0
 MAX_TAU_HOURS = 200.0  # search bound; a fit landing here is censored, not measured
 TAU_SEARCH_STEP_H = 0.25
@@ -124,13 +125,14 @@ def summarise(fits_by_room: dict[str, list[NightFit]]) -> pd.DataFrame:
     rows = []
     for room, fits in fits_by_room.items():
         taus = [f.tau_hours for f in fits]
+        publishable = len(taus) >= MIN_NIGHTS
         rows.append(
             {
                 "room": room,
                 "nights_fitted": len(fits),
-                "tau_median_h": float(np.median(taus)) if taus else float("nan"),
-                "tau_min_h": min(taus) if taus else float("nan"),
-                "tau_max_h": max(taus) if taus else float("nan"),
+                "tau_median_h": float(np.median(taus)) if publishable else float("nan"),
+                "tau_min_h": min(taus) if publishable else float("nan"),
+                "tau_max_h": max(taus) if publishable else float("nan"),
             }
         )
     return pd.DataFrame(rows).sort_values("tau_median_h")

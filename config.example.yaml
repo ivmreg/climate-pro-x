@@ -30,11 +30,14 @@ ceiling_height_m: null
 
 # Optional: an external statistic id (not a sensor.* entity — check HA's
 # Developer Tools > Statistics) with genuine hourly water usage, e.g. from a
-# water-utility integration. Enables the informational hot-water-fraction
-# regression in the `dhw` command. A recorder-tracked sensor.* meter that
-# only updates once/day (a daily batch import) will NOT work here — diffing
-# it gives one large daily spike, not real hourly usage.
+# water-utility integration. It excludes low-water away days from the DHW
+# baseline, models heating-day DHW from actual usage, and also enables the
+# informational hot-water-fraction regression. A recorder-tracked sensor.*
+# meter that only updates once/day will NOT work here — diffing it gives one
+# large daily spike, not real hourly usage.
 water_stat: null
+# Set 0 to disable away-day filtering while retaining water-based attribution.
+min_dhw_water_litres: 50
 
 outdoor_entity: sensor.outdoor_temperature
 loft_entity: sensor.loft_temperature

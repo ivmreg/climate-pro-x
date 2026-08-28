@@ -59,13 +59,29 @@ def categorise(states: list[dict]) -> dict[str, list[dict]]:
     return cats
 
 
+def _gas_kwh_candidate(states: list[dict]) -> dict | None:
+    for state in states:
+        attrs = state.get("attributes", {})
+        name = (attrs.get("friendly_name") or state["entity_id"]).casefold()
+        unit = str(attrs.get("unit_of_measurement", "")).casefold().replace(" ", "")
+        is_gas = (
+            attrs.get("device_class") == "gas"
+            or any(hint in name or hint in state["entity_id"] for hint in GAS_RATE_HINTS)
+        )
+        if is_gas and unit == "kwh":
+            return state
+    return None
+
+
 def draft_config(cats: dict[str, list[dict]]) -> dict:
     def eid(s):
         return s["entity_id"]
 
     heating_by_zone = {}
     for s in cats["heating_power"]:
-        zone = eid(s).removeprefix("sensor.").removesuffix("_heating")
+        zone = eid(s).removeprefix("sensor.")
+        for suffix in ("_heating_power", "_heating"):
+            zone = zone.removesuffix(suffix)
         heating_by_zone[zone] = eid(s)
 
     rooms = {}
@@ -78,10 +94,12 @@ def draft_config(cats: dict[str, list[dict]]) -> dict:
             "heating_power": heating_by_zone.get(room),
         }
 
+    gas_kwh = _gas_kwh_candidate(cats["energy"])
+
     return {
         "boiler_output_kw": 28,
         "boiler_efficiency": 0.88,
-        "gas_kwh_entity": eid(cats["energy"][0]) if cats["energy"] else None,
+        "gas_kwh_entity": eid(gas_kwh) if gas_kwh else None,
         "gas_unit_rate_entity": eid(cats["gas_rate"][0]) if cats["gas_rate"] else None,
         "outdoor_entity": eid(cats["outdoor_temperature"][0]) if cats["outdoor_temperature"] else "FILL_ME_IN",
         "loft_entity": eid(cats["loft_temperature"][0]) if cats["loft_temperature"] else "FILL_ME_IN",
@@ -91,6 +109,7 @@ def draft_config(cats: dict[str, list[dict]]) -> dict:
         # /api/states. Find it in HA's Developer Tools > Statistics, e.g.
         # "thames_water:thameswater_consumption".
         "water_stat": None,
+        "min_dhw_water_litres": 50.0,
         "ceiling_height_m": None,
         "weather_entity": eid(cats["weather"][0]) if cats["weather"] else None,
         "night_start": "23:30",
@@ -121,4 +140,5 @@ def run(config_path: str = "config.yaml") -> None:
           "the `ventilation` command (ventilation vs fabric loss split)")
     print("  * fill in water_stat (an external statistic id, not a sensor.* "
           "entity - see Developer Tools > Statistics) to unlock the "
-          "informational hot-water-fraction regression in `dhw`")
+          "away-day filter, water-aware DHW attribution, and informational "
+          "hot-water-fraction regression in `dhw`")

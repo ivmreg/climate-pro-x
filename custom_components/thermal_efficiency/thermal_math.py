@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, tzinfo
-from math import exp, log, sqrt
+from math import exp, isfinite, log, sqrt
 from statistics import median
 
 Series = dict[int, float]
@@ -943,16 +943,43 @@ def compute_all(
 ) -> dict:
     """Run every analysis, widening the lookback window until data suffices."""
     room_confs = conf["rooms"]
+    heating_power_issues = dict(
+        conf.get("invalid_heating_power_entities") or {}
+    )
+    invalid_heating_power = set(heating_power_issues)
     room_temp: dict[str, Series] = {}
     room_heat: dict[str, Series] = {}
     for name, spec in room_confs.items():
         room_temp[name] = series_from_stats(stats.get(spec["temperature"], []), "mean")
-        if spec.get("heating_power"):
-            room_heat[name] = series_from_stats(stats.get(spec["heating_power"], []), "mean")
+        heating_entity = spec.get("heating_power")
+        if heating_entity:
+            if heating_entity in invalid_heating_power:
+                room_heat[name] = {}
+                continue
+            heating_history = series_from_stats(
+                stats.get(heating_entity, []), "mean"
+            )
+            room_heat[name] = {
+                ts: value
+                for ts, value in heating_history.items()
+                if isfinite(value) and 0.0 <= value <= 100.0
+            }
+            invalid_points = len(heating_history) - len(room_heat[name])
+            if invalid_points:
+                heating_power_issues[heating_entity] = (
+                    f"{invalid_points} historical observation(s) were outside "
+                    "the finite 0-100% range and were ignored"
+                )
     outdoor = series_from_stats(stats.get(conf["outdoor"], []), "mean")
     all_rooms = list(room_temp.values())
 
-    result: dict = {"rooms": {}}
+    result: dict = {
+        "rooms": {},
+        "heating_power_issues": heating_power_issues,
+        "invalid_heating_power_entities": dict(
+            conf.get("invalid_heating_power_entities") or {}
+        ),
+    }
 
     gas = series_from_stats(stats.get(conf["gas_meter"], []), "sum") if conf.get("gas_meter") else {}
     water = series_from_stats(stats.get(conf["water"], []), "sum") if conf.get("water") else {}
@@ -973,7 +1000,12 @@ def compute_all(
         by_day.pop(current_day, None)
 
     heating_off = heating_off_days(dt_by_day, heat_pct_by_day)
-    min_water_l = conf.get("min_dhw_water_litres") or DHW_OCCUPIED_MIN_WATER_L
+    configured_min_water_l = conf.get("min_dhw_water_litres")
+    min_water_l = (
+        DHW_OCCUPIED_MIN_WATER_L
+        if configured_min_water_l is None
+        else float(configured_min_water_l)
+    )
 
     # Hot water: a robust heating-off gas baseline, used both as the headline
     # "hot water gas" cost figure and to strip DHW out of the winter HLC fit
@@ -1376,15 +1408,14 @@ def compute_all(
         for window in windows_days:
             since = (now - timedelta(days=window)).astimezone(tz).date()
             fits = night_taus(temps, outdoor, room_heat.get(name), tz, since)
-            if len(fits) >= TAU_MIN_NIGHTS or window == windows_days[-1]:
-                if fits:
-                    taus = sorted(f["tau_hours"] for f in fits)
-                    result["rooms"][name] = {
-                        "tau_median_h": median(taus),
-                        "nights_fitted": len(fits),
-                        "last_night": fits[-1]["date"],
-                        "window_days": window,
-                    }
+            if len(fits) >= TAU_MIN_NIGHTS:
+                taus = sorted(f["tau_hours"] for f in fits)
+                result["rooms"][name] = {
+                    "tau_median_h": median(taus),
+                    "nights_fitted": len(fits),
+                    "last_night": fits[-1]["date"],
+                    "window_days": window,
+                }
                 break
 
     # Loft ratio needs cold nights, so use the full window; drop_flatlines

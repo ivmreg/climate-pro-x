@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from math import exp
+from math import exp, isnan
+
+from ha_efficiency import cooling
 
 
 def _cooling_series(days: int = 4, tau: float = 15.0):
@@ -66,3 +68,83 @@ def test_configured_but_missing_heating_history_suppresses_tau(thermal_math):
     )
 
     assert fits == []
+
+
+def test_compute_all_withholds_tau_with_only_two_nights(thermal_math, monkeypatch):
+    monkeypatch.setattr(
+        thermal_math,
+        "night_taus",
+        lambda *args: [
+            {"date": "2026-01-01", "tau_hours": 12.0, "r_squared": 0.9},
+            {"date": "2026-01-02", "tau_hours": 14.0, "r_squared": 0.9},
+        ],
+    )
+
+    result = thermal_math.compute_all(
+        {},
+        {
+            "rooms": {"room": {"temperature": "sensor.room"}},
+            "outdoor": "sensor.outdoor",
+        },
+        timezone.utc,
+        datetime(2026, 2, 1, tzinfo=timezone.utc),
+        (60, 120, 365),
+    )
+
+    assert result["rooms"]["room"] is None
+
+
+def test_out_of_range_heating_history_is_filtered(thermal_math, monkeypatch):
+    captured = {}
+
+    def _capture_heating(room, outdoor, heating, tz, since):
+        captured["heating"] = heating
+        return []
+
+    monkeypatch.setattr(thermal_math, "night_taus", _capture_heating)
+    valid_ts = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+    invalid_ts = valid_ts + 3600
+    result = thermal_math.compute_all(
+        {
+            "sensor.heat": [
+                {"start": valid_ts, "mean": 25.0},
+                {"start": invalid_ts, "mean": 250.0},
+            ]
+        },
+        {
+            "rooms": {
+                "room": {
+                    "temperature": "sensor.room",
+                    "heating_power": "sensor.heat",
+                }
+            },
+            "outdoor": "sensor.outdoor",
+        },
+        timezone.utc,
+        datetime(2026, 2, 1, tzinfo=timezone.utc),
+        (60,),
+    )
+
+    assert captured["heating"] == {valid_ts: 25.0}
+    assert "sensor.heat" in result["heating_power_issues"]
+
+
+def test_offline_summary_also_requires_three_nights():
+    fits = [
+        cooling.NightFit(
+            date=f"2026-01-0{day}",
+            tau_hours=10.0 + day,
+            r_squared=0.9,
+            t_start=20.0,
+            t_end=18.0,
+            outdoor_mean=5.0,
+        )
+        for day in range(1, 4)
+    ]
+
+    two_nights = cooling.summarise({"room": fits[:2]}).iloc[0]
+    three_nights = cooling.summarise({"room": fits}).iloc[0]
+
+    assert two_nights["nights_fitted"] == 2
+    assert isnan(two_nights["tau_median_h"])
+    assert three_nights["tau_median_h"] == 12.0

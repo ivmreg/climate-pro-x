@@ -97,6 +97,7 @@ def test_compute_all_full_year_multi_sensor_pipeline(thermal_math):
             "co2": ["sensor.co2_a", "sensor.co2_b"],
             "outdoor_co2_sensor": "sensor.outdoor_co2",
             "water": "utility:water",
+            "min_dhw_water_litres": 0.0,
             "gas_unit_rate": 0.05,
             "boiler_efficiency": 0.9,
             "electricity_meter": "sensor.electricity",
@@ -113,6 +114,7 @@ def test_compute_all_full_year_multi_sensor_pipeline(thermal_math):
     assert result["dhw"] is not None
     assert result["dhw"]["days_used"] >= 14
     assert result["dhw"]["kwh_per_day"] == pytest.approx(12.0, rel=0.05)
+    assert result["dhw"]["min_occupied_water_litres"] == 0.0
     assert result["dhw"]["modelled_annual_kwh"] > 0
     assert result["dhw"]["water_rate_days_used"] >= 10
     assert result["dhw"]["water_rate_wh_per_litre_per_k"] > 0

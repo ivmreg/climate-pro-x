@@ -7,8 +7,9 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import CONF_HEATING_POWER, CONF_ROOMS, DOMAIN
 from .coordinator import ThermalCoordinator
+from .thermal_math import TAU_MIN_NIGHTS
 
 
 def _electricity_unavailable_attributes(coordinator: ThermalCoordinator) -> dict:
@@ -75,7 +76,11 @@ class HlcSensor(ThermalSensor):
     def extra_state_attributes(self) -> dict:
         fit = self.coordinator.data.get("hlc")
         if not fit:
-            return {"note": "not enough heating days yet"}
+            return {
+                "note": "not enough qualifying heating days; the fit needs complete "
+                "gas and indoor/outdoor temperature data with sustained temperature "
+                "difference and a positive, credible regression",
+            }
         return {
             "rating": "not benchmarked; building type and floor area context required",
             "status": fit.get("status", "provisional"),
@@ -152,7 +157,11 @@ class LoftSensor(ThermalSensor):
     def extra_state_attributes(self) -> dict:
         fit = self.coordinator.data.get("loft")
         if not fit:
-            return {"note": "not enough cold night hours yet"}
+            return {
+                "note": "not enough valid cold-night overlap; indoor, loft and "
+                "outdoor sensors must all report while the indoor-outdoor "
+                "temperature difference is large enough",
+            }
         ratio = fit["ratio"]
         if ratio > 0.5:
             verdict = "loft stayed relatively warm; ceiling heat transfer may be significant"
@@ -620,7 +629,27 @@ class RoomTauSensor(ThermalSensor):
     def extra_state_attributes(self) -> dict:
         fit = self.coordinator.data["rooms"].get(self._room)
         if not fit:
-            return {"note": "no usable cooling nights yet"}
+            room_conf = self.coordinator.conf.get(CONF_ROOMS, {}).get(
+                self._room, {}
+            )
+            heating_entity = room_conf.get(CONF_HEATING_POWER)
+            heating_issue = self.coordinator.data.get(
+                "invalid_heating_power_entities", {}
+            ).get(heating_entity)
+            if heating_issue:
+                return {
+                    "note": "configured heating-demand source is invalid, so cooling "
+                    "fits are suppressed until it reports 0-100%",
+                    "source_issue": heating_issue,
+                    "required_nights": TAU_MIN_NIGHTS,
+                }
+            return {
+                "note": (
+                    f"fewer than {TAU_MIN_NIGHTS} usable unheated cooling nights "
+                    "passed the coverage, temperature-drop and fit-quality checks"
+                ),
+                "required_nights": TAU_MIN_NIGHTS,
+            }
         return {
             "nights_fitted": fit["nights_fitted"],
             "last_night": fit["last_night"],

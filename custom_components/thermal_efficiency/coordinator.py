@@ -39,8 +39,10 @@ from .const import (
     CONF_WATER,
     DOMAIN,
     EXPANDING_WINDOWS_DAYS,
+    HLC_STATISTICS_LOOKBACK_MULTIPLIER,
     UPDATE_INTERVAL_HOURS,
 )
+from .validation import heating_power_issue
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -127,12 +129,17 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
 
     async def _async_update_data(self) -> dict:
         max_days = self.conf[CONF_MAX_WINDOW_DAYS]
-        windows = tuple(d for d in EXPANDING_WINDOWS_DAYS if d < max_days) + (max_days,)
+        windows = (
+            tuple(d for d in EXPANDING_WINDOWS_DAYS if d < max_days)
+            + (max_days,)
+        )
         now = dt_util.utcnow()
         stats = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
-            now - timedelta(days=max_days),
+            # Keep a complete model window before the latest heating day while
+            # that day remains inside the configured lookback.
+            now - timedelta(days=max_days * HLC_STATISTICS_LOOKBACK_MULTIPLIER),
             now,
             self._statistic_ids(),
             "hour",
@@ -146,6 +153,24 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         # compute_all is pure CPU and takes ~1s on a full season of hourly
         # statistics, so it must not run on the event loop. Tariffs are read
         # from the state machine here, before handing off to the executor.
+        invalid_heating_power: dict[str, str] = {}
+        for room in self.conf[CONF_ROOMS].values():
+            entity_id = room.get(CONF_HEATING_POWER)
+            if not entity_id:
+                continue
+            issue = heating_power_issue(
+                self.hass,
+                entity_id,
+                allow_missing=True,
+            )
+            if issue:
+                invalid_heating_power[entity_id] = issue
+                _LOGGER.warning(
+                    "Ignoring invalid heating-power source %s: %s",
+                    entity_id,
+                    issue,
+                )
+
         conf = {
             "rooms": self.conf[CONF_ROOMS],
             "outdoor": self.conf[CONF_OUTDOOR],
@@ -170,6 +195,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             "electricity_unit_rate": self._unit_rate(
                 CONF_ELECTRICITY_UNIT_RATE, "Electricity"
             ),
+            "invalid_heating_power_entities": invalid_heating_power,
         }
         return await self.hass.async_add_executor_job(
             thermal_math.compute_all,

@@ -27,3 +27,8 @@ DEFAULT_MIN_DHW_WATER_L = 50.0
 # Windows tried in order until enough usable data is found.
 EXPANDING_WINDOWS_DAYS = (60, 120, 365)
 UPDATE_INTERVAL_HOURS = 6
+
+# The heating model is anchored to the latest qualifying heating day. Fetching
+# only one model window relative to "now" makes its oldest heating data slide
+# away during summer, so the coordinator retrieves one additional window.
+HLC_STATISTICS_LOOKBACK_MULTIPLIER = 2

@@ -33,8 +33,15 @@ attributes report this directly.
 
 1. In Home Assistant: your profile → **Security** → **Long-lived access
    tokens** → create one.
-2. `cp .env.example .env` and fill in `HA_URL` and `HA_TOKEN`.
-3. Discover your entities and generate a config skeleton:
+2. Create an environment and install the CLI dependencies:
+
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/python -m pip install -r requirements.txt
+   ```
+
+3. `cp .env.example .env` and fill in `HA_URL` and `HA_TOKEN`.
+4. Discover your entities and generate a config skeleton:
 
    ```bash
    .venv/bin/python -m ha_efficiency discover
@@ -46,7 +53,7 @@ attributes report this directly.
    entities, and set `boiler_output_kw` (your Worcester Bosch's rated output —
    check the model plate; typically 24–30 kW).
 
-4. Pull history into a local cache, then analyse:
+5. Pull history into a local cache, then analyse:
 
    ```bash
    .venv/bin/python -m ha_efficiency pull --days 10
@@ -61,10 +68,12 @@ Plots land in `output/`, cached history in `data/`.
 
 `ventilation` needs `co2_entity`, `floor_area_m2` and `ceiling_height_m` in
 `config.yaml`, plus a gas meter for the HLC it splits. `dhw` needs a gas
-meter and enough cached summer (heating-off) days; `gas_unit_rate_entity`
-adds the £/day figure (fetched live — see the gotcha below), and `water_stat`
-adds an informational Wh/L regression. Both are pulled via `pull --lts`,
-same as the loft/HLC winter analyses.
+meter and enough cached heating-off days; configured heating-demand sensors
+classify those days where coverage exists, with dT as the fallback.
+`gas_unit_rate_entity` adds the £/day figure (fetched live — see the gotcha
+below). `water_stat` excludes low-water away days, models heating-day DHW
+from actual use, and adds the informational Wh/L regression. Meter histories
+are pulled via `pull --lts`, as for the loft/HLC winter analyses.
 
 **Gotcha:** a household water meter integration may expose *two* things that
 look similar but aren't: a recorder-tracked `sensor.*` entity that only
@@ -206,9 +215,11 @@ Entities (updated every 6 h, all under one "Thermal Efficiency" device):
      entity** to auto-fill that room's name (from its Area) and
      temperature sensor (its EMA sensor — same device as the climate
      entity), or leave it blank to enter everything by hand. A
-     heating-power sensor is auto-suggested too, but only when there's
-     exactly one unambiguous candidate in that area. Check "Add another
-     room" to keep going, uncheck it once you've added the last one.
+     heating-demand sensor is auto-suggested too, but only when there's
+     exactly one unambiguous candidate in that area. It must report a
+     percentage with values from 0 to 100; incompatible sources are rejected
+     rather than interpreted as demand. Check "Add another room" to keep
+     going, uncheck it once you've added the last one.
 
    Sensors appear within a minute of finishing the wizard (first
    computation runs over up to a year of statistics). To change anything

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 homeassistant = pytest.importorskip("homeassistant")
@@ -11,7 +13,10 @@ from homeassistant.const import UnitOfEnergy
 from homeassistant.data_entry_flow import FlowResultType
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.thermal_efficiency.config_flow import ThermalEfficiencyConfigFlow
+from custom_components.thermal_efficiency.config_flow import (
+    ThermalEfficiencyConfigFlow,
+    ThermalEfficiencyOptionsFlow,
+)
 from custom_components.thermal_efficiency.const import (
     CONF_BOILER_EFFICIENCY,
     CONF_CO2,
@@ -19,6 +24,7 @@ from custom_components.thermal_efficiency.const import (
     CONF_ELECTRICITY_UNIT_RATE,
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
+    CONF_HEATING_POWER,
     CONF_MAX_WINDOW_DAYS,
     CONF_OUTDOOR,
     CONF_OUTDOOR_CO2_SENSOR,
@@ -28,6 +34,7 @@ from custom_components.thermal_efficiency.const import (
     DOMAIN,
 )
 from custom_components.thermal_efficiency.coordinator import ThermalCoordinator
+from custom_components.thermal_efficiency.validation import heating_power_issue
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +87,63 @@ async def test_config_flow_accepts_multiple_co2_sensors(hass):
         "sensor.bedroom_co2",
         "sensor.living_room_co2",
     ]
+
+
+async def test_config_flow_rejects_non_percent_heating_source(hass):
+    hass.states.async_set(
+        "sensor.radiator_watts",
+        "350",
+        {"unit_of_measurement": "W"},
+    )
+    flow = ThermalEfficiencyConfigFlow()
+    flow.hass = hass
+    await flow.async_step_user({CONF_OUTDOOR: "sensor.outdoor_temperature"})
+    await flow.async_step_room({})
+
+    result = await flow.async_step_room_details(
+        {
+            "name": "Living room",
+            CONF_TEMPERATURE: "sensor.living_temperature",
+            CONF_HEATING_POWER: "sensor.radiator_watts",
+            "add_another": False,
+        }
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {
+        CONF_HEATING_POWER: "heating_power_must_be_percent"
+    }
+
+
+async def test_options_flow_cannot_finish_without_a_room(hass):
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass = hass
+    flow._rooms = {}
+
+    result = await flow.async_step_new_room({"finish": True})
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "new_room"
+    assert result["errors"] == {"base": "at_least_one_room"}
+
+
+async def test_heating_power_runtime_validation(hass):
+    hass.states.async_set("sensor.valid_demand", "42", {"unit_of_measurement": "%"})
+    hass.states.async_set("sensor.watts", "42", {"unit_of_measurement": "W"})
+    hass.states.async_set("sensor.out_of_range", "142", {"unit_of_measurement": "%"})
+
+    assert heating_power_issue(hass, "sensor.valid_demand") is None
+    assert "unit must be %" in heating_power_issue(hass, "sensor.watts")
+    assert (
+        heating_power_issue(
+            hass, "sensor.temporarily_missing", allow_missing=True
+        )
+        is None
+    )
+    assert heating_power_issue(hass, "sensor.temporarily_missing") is not None
+    assert "between 0 and 100" in heating_power_issue(
+        hass, "sensor.out_of_range"
+    )
 
 
 async def test_coordinator_collects_multi_co2_and_outdoor_ids(hass):
@@ -147,6 +211,7 @@ async def test_analysis_does_not_run_on_the_event_loop(hass, monkeypatch):
     ran_on: dict = {}
 
     def _fake_statistics(*args, **kwargs):
+        ran_on["lookback"] = args[2] - args[1]
         return {}
 
     def _fake_compute_all(stats, conf, tz, now, windows):
@@ -167,6 +232,9 @@ async def test_analysis_does_not_run_on_the_event_loop(hass, monkeypatch):
     await coordinator._async_update_data()
 
     assert ran_on["thread"] != loop_thread
+    assert ran_on["lookback"] == timedelta(
+        days=DEFAULT_MAX_WINDOW_DAYS * 2
+    )
 
 
 async def test_options_entry_can_hold_legacy_scalar_co2(hass):

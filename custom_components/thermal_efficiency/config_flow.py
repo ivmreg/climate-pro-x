@@ -45,6 +45,7 @@ from .const import (
     DEFAULT_MIN_DHW_WATER_L,
     DOMAIN,
 )
+from .validation import heating_power_issue
 
 
 def _entity_selector(**kwargs: Any) -> selector.EntitySelector:
@@ -295,6 +296,16 @@ def _validate_room_name(name: str, taken: dict) -> tuple[str | None, dict[str, s
     return slug, {}
 
 
+def _validate_room_input(
+    hass: HomeAssistant, user_input: dict, taken: dict
+) -> tuple[str | None, dict[str, str]]:
+    slug, errors = _validate_room_name(user_input["name"], taken)
+    heating_power = user_input.get(CONF_HEATING_POWER)
+    if heating_power and heating_power_issue(hass, heating_power):
+        errors[CONF_HEATING_POWER] = "heating_power_must_be_percent"
+    return slug, errors
+
+
 class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Home settings, then rooms one at a time, each optionally piggybacking
     on a Versatile Thermostat climate entity."""
@@ -327,8 +338,8 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            slug, errors = _validate_room_name(user_input["name"], self._rooms)
-            if slug:
+            slug, errors = _validate_room_input(self.hass, user_input, self._rooms)
+            if slug and not errors:
                 self._rooms[slug] = _room_from_input(user_input)
                 if user_input.get("add_another"):
                     return await self.async_step_room()
@@ -404,8 +415,8 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             if user_input.get("remove_room"):
                 return await self._async_advance_room()
-            slug, errors = _validate_room_name(user_input["name"], self._rooms)
-            if slug:
+            slug, errors = _validate_room_input(self.hass, user_input, self._rooms)
+            if slug and not errors:
                 self._rooms[slug] = _room_from_input(user_input)
                 return await self._async_advance_room()
         name, room = self._current_room
@@ -422,6 +433,12 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
     ) -> config_entries.ConfigFlowResult:
         if user_input is not None:
             if user_input.get("finish"):
+                if not self._rooms:
+                    return self.async_show_form(
+                        step_id="new_room",
+                        data_schema=_vtrv_picker_schema(allow_finish=True),
+                        errors={"base": "at_least_one_room"},
+                    )
                 return self._async_finish()
             self._pending_vtrv = user_input.get("vtrv_climate")
             return await self.async_step_new_room_details()
@@ -434,8 +451,8 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
     ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            slug, errors = _validate_room_name(user_input["name"], self._rooms)
-            if slug:
+            slug, errors = _validate_room_input(self.hass, user_input, self._rooms)
+            if slug and not errors:
                 self._rooms[slug] = _room_from_input(user_input)
                 if user_input.get("add_another"):
                     return await self.async_step_new_room()

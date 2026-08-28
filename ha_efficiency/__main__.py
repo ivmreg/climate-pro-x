@@ -103,11 +103,13 @@ def cmd_cooling(args) -> None:
     summary = cooling.summarise(fits)
     print("\nPer-room thermal time constants (low tau = fast-cooling = leaky):\n")
     print(summary.to_string(index=False))
-    total = int(summary["nights_fitted"].sum())
-    if total == 0:
-        print("\nNo usable cooling windows found. Common causes: heating runs "
-              "overnight (no free cooldown), mild weather (dT < 3 K), or "
-              "less history than one full night — pull more days.")
+    candidate_nights = int(summary["nights_fitted"].sum())
+    published_rooms = int(summary["tau_median_h"].notna().sum())
+    if published_rooms == 0:
+        print(f"\nNo room has the required three usable cooling nights yet "
+              f"({candidate_nights} candidate night(s) found). Common causes: "
+              "heating runs overnight, mild weather (dT < 3 K), or too little "
+              "history — pull more days.")
     else:
         print("\nRule of thumb: tau > 20 h is good for a solid-wall flat, "
               "10–20 h typical, < 10 h suggests draughts/poor glazing in that room.")
@@ -144,7 +146,10 @@ def cmd_hlc(args) -> None:
     efficiency = 1.0
     if gas_entity:
         outdoor_daily = outdoor.resample("1D").mean()
-        corrected = dhw.corrected_hlc(q_daily, dt_daily, outdoor_daily)
+        dhw_context = _dhw_context(cfg, dt_daily)
+        corrected = dhw.corrected_hlc(
+            q_daily, dt_daily, outdoor_daily, **dhw_context
+        )
         fitted = corrected or result
         efficiency = cfg.get("boiler_efficiency", 0.88)
     fuel_or_proxy_value = fitted["hlc_w_per_k"]
@@ -213,6 +218,31 @@ def _gas_daily_inputs(cfg: dict) -> tuple[pd.Series, pd.Series, pd.Series, pd.Se
     return q_daily, dt_daily, outdoor_daily, gas
 
 
+def _dhw_context(cfg: dict, dt_daily: pd.Series) -> dict:
+    """Inputs that keep the offline DHW decision order aligned with live HA."""
+    heating = _room_series(cfg, "heating_power")
+    heating_pct = dhw.daily_heating_pct(heating)
+    heating_off = dhw.heating_off_days(dt_daily, heating_pct)
+
+    water_daily = None
+    water_stat = cfg.get("water_stat")
+    if water_stat:
+        water = store.load(water_stat)
+        if water is not None:
+            water_daily = hlc.daily_heat_input_from_meter(
+                water, dhw.WATER_MAX_STEP_L
+            )
+
+    min_water_l = cfg.get("min_dhw_water_litres")
+    if min_water_l is None:
+        min_water_l = dhw.DHW_OCCUPIED_MIN_WATER_L
+    return {
+        "heating_off": heating_off,
+        "water_daily": water_daily,
+        "min_water_l": float(min_water_l),
+    }
+
+
 def cmd_ventilation(args) -> None:
     cfg = load_config()
     co2_entities = [
@@ -252,7 +282,10 @@ def cmd_ventilation(args) -> None:
         return
 
     q_daily, dt_daily, outdoor_daily, _gas = _gas_daily_inputs(cfg)
-    corrected = dhw.corrected_hlc(q_daily, dt_daily, outdoor_daily)
+    dhw_context = _dhw_context(cfg, dt_daily)
+    corrected = dhw.corrected_hlc(
+        q_daily, dt_daily, outdoor_daily, **dhw_context
+    )
     if corrected:
         space_heating_hlc = corrected["hlc_w_per_k"]
         print(f"Using DHW-corrected space-heating HLC: {space_heating_hlc:.0f} W/K")
@@ -283,12 +316,17 @@ def cmd_ventilation(args) -> None:
 def cmd_dhw(args) -> None:
     cfg = load_config()
     q_daily, dt_daily, outdoor_daily, gas = _gas_daily_inputs(cfg)
+    dhw_context = _dhw_context(cfg, dt_daily)
 
-    baseline = dhw.dhw_baseline(q_daily, dt_daily, outdoor_daily)
+    baseline = dhw.dhw_baseline(
+        q_daily, dt_daily, outdoor_daily, **dhw_context
+    )
     if not baseline:
-        sys.exit("Not enough summer (heating-off) days cached yet for a DHW baseline.")
+        sys.exit(
+            "Not enough qualifying heating-off days cached yet for a DHW baseline."
+        )
     print(f"\nNon-space-heating gas baseline: {baseline['kwh_per_day']:.1f} kWh/day "
-          f"({baseline['days_used']} summer days used)")
+          f"({baseline['days_used']} heating-off days used)")
 
     rate_entity = cfg.get("gas_unit_rate_entity")
     if rate_entity:
@@ -352,7 +390,9 @@ def cmd_dhw(args) -> None:
                 print("\n(informational) not enough overlapping gas/water hours yet "
                       "for the Wh-per-litre regression.")
 
-    corrected = dhw.corrected_hlc(q_daily, dt_daily, outdoor_daily)
+    corrected = dhw.corrected_hlc(
+        q_daily, dt_daily, outdoor_daily, **dhw_context
+    )
     if corrected:
         efficiency = cfg.get("boiler_efficiency", 0.88)
         print(f"\nDHW-corrected delivered HLC: "

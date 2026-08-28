@@ -37,6 +37,62 @@ def test_measured_heating_power_overrides_dt_proxy_both_ways(thermal_math):
     assert d_warm in off
 
 
+def test_offline_heating_off_classification_matches_live_rule():
+    days = pd.date_range("2026-06-01", periods=4, freq="D", tz="UTC")
+    dt_daily = pd.Series([2.0, 5.0, 12.0, 1.5], index=days)
+    heating_pct = pd.Series([4.0, 0.2], index=days[:2])
+
+    off = dhw.heating_off_days(dt_daily, heating_pct)
+
+    assert days[0] not in off
+    assert days[1] in off
+    assert days[2] not in off
+    assert days[3] in off
+
+
+def test_offline_measured_heating_day_does_not_require_dt_coverage():
+    days = pd.date_range("2026-06-01", periods=2, freq="D", tz="UTC")
+    dt_daily = pd.Series([2.0], index=days[:1])
+    heating_pct = pd.Series([0.2], index=days[1:])
+
+    off = dhw.heating_off_days(dt_daily, heating_pct)
+
+    assert days[0] in off
+    assert days[1] in off
+
+
+def test_offline_zero_water_threshold_disables_away_filter():
+    days = pd.date_range("2026-06-01", periods=14, freq="D", tz="UTC")
+    q_daily = pd.Series([0.3] * 7 + [12.0] * 7, index=days)
+    dt_daily = pd.Series(1.0, index=days)
+    outdoor_daily = pd.Series(18.0, index=days)
+    water_daily = pd.Series([5.0] * 7 + [400.0] * 7, index=days)
+    heating_off = set(days)
+
+    filtered = dhw.dhw_baseline(
+        q_daily,
+        dt_daily,
+        outdoor_daily,
+        heating_off=heating_off,
+        water_daily=water_daily,
+        min_water_l=50.0,
+    )
+    disabled = dhw.dhw_baseline(
+        q_daily,
+        dt_daily,
+        outdoor_daily,
+        heating_off=heating_off,
+        water_daily=water_daily,
+        min_water_l=0.0,
+    )
+
+    assert filtered is not None and disabled is not None
+    assert filtered["kwh_per_day"] == pytest.approx(12.0)
+    assert filtered["low_water_days_excluded"] == 7
+    assert disabled["days_used"] == 14
+    assert disabled["low_water_days_excluded"] == 0
+
+
 def test_daily_heating_pct_requires_full_sensor_population(thermal_math):
     base = int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp())
     room_a = {base + h * 3600: 0.0 for h in range(24)}
@@ -180,6 +236,19 @@ def test_extreme_total_water_falls_back_instead_of_erasing_heating(thermal_math)
         "baseline_fallback_days": 1,
         "water_outlier_days_ignored": 1,
     }
+
+    offline = dhw.attribute_dhw_by_day(
+        pd.Series(q),
+        pd.Series(outdoor),
+        set(),
+        baseline,
+        pd.Series(water),
+        rate,
+        water_outlier_limit_l=2000.0,
+    )
+    assert offline[day] == pytest.approx(
+        dhw.dhw_daily_kwh(outdoor[day], baseline)
+    )
 
     days, q, water, outdoor = _rate_fixture(2.5)  # more than pure hot water
     assert thermal_math.fit_dhw_water_rate(q, water, outdoor, set(days), SINCE) is None
