@@ -1,379 +1,540 @@
 views:
-  - title: Thermal efficiency
-    icon: mdi:home-thermometer
-    type: sections
-    max_columns: 3
-    dense_section_placement: true
-    sections:
-      - type: grid
-        column_span: 1
-        cards:
-          - type: gauge
-            entity: sensor.thermal_efficiency_heat_loss_coefficient
-            name: Delivered heat loss
-            min: 0
-            max: 500
-            needle: true
-            grid_options:
-              columns: 4
-              rows: 4
-            segments:
-              - from: 0
-                color: "#2e7d32"
-              - from: 100
-                color: "#7cb342"
-              - from: 180
-                color: "#f9a825"
-              - from: 280
-                color: "#ef6c00"
-              - from: 400
-                color: "#c62828"
-          - type: gauge
-            entity: sensor.metahome_thermal_efficiency_air_change_rate
-            name: Air changes per hour
-            min: 0
-            max: 1.5
-            needle: true
-            grid_options:
-              columns: 4
-              rows: 4
-            segments:
-              - from: 0
-                color: "#ef6c00"
-              - from: 0.35
-                color: "#2e7d32"
-              - from: 0.7
-                color: "#f9a825"
-              - from: 1
-                color: "#c62828"
-          - type: gauge
-            entity: sensor.metahome_thermal_efficiency_electricity_baseload
-            name: Always-on electricity
-            min: 0
-            max: 400
-            needle: true
-            grid_options:
-              columns: 4
-              rows: 4
-            segments:
-              - from: 0
-                color: "#2e7d32"
-              - from: 120
-                color: "#7cb342"
-              - from: 200
-                color: "#f9a825"
-              - from: 300
-                color: "#c62828"
-      - type: grid
-        cards:
-          - type: custom:plotly-graph
-            title: Room thermal fingerprints · effective τ
-            raw_plotly_config: true
-            refresh_interval: auto
-            entities:
-              - entity: sensor.thermal_efficiency_living_room_time_constant
-                type: bar
-                orientation: h
-                x: >-
-                  $ex {
-                    const getRows = () => [
-                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
-                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
-                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
-                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
-                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
-                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
-                    ].map(([name, id]) => ({
-                      name,
-                      value: Number(hass.states[id]?.state),
-                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
-                    })).filter(room => Number.isFinite(room.value))
-                       .sort((a, b) => b.value - a.value);
-                    return getRows().map(room => room.value);
-                  }
-                "y": >-
-                  $ex {
-                    const getRows = () => [
-                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
-                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
-                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
-                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
-                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
-                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
-                    ].map(([name, id]) => ({
-                      name,
-                      value: Number(hass.states[id]?.state),
-                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
-                    })).filter(room => Number.isFinite(room.value))
-                       .sort((a, b) => b.value - a.value);
-                    return getRows().map(room => room.name);
-                  }
-                customdata: >-
-                  $ex {
-                    const getRows = () => [
-                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
-                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
-                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
-                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
-                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
-                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
-                    ].map(([name, id]) => ({
-                      name,
-                      value: Number(hass.states[id]?.state),
-                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
-                    })).filter(room => Number.isFinite(room.value))
-                       .sort((a, b) => b.value - a.value);
-                    return getRows().map(room => room.nights);
-                  }
-                marker:
-                  color: >-
-                    $ex {
-                      const getRows = () => [
-                        ['Office', 'sensor.thermal_efficiency_office_time_constant'],
-                        ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
-                        ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
-                        ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
-                        ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
-                        ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
-                      ].map(([name, id]) => ({
-                        name,
-                        value: Number(hass.states[id]?.state),
-                        nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
-                      })).filter(room => Number.isFinite(room.value))
-                         .sort((a, b) => b.value - a.value);
-                      return getRows().map((room, index) =>
-                        ['#2e7d32', '#7cb342', '#f9a825', '#ef6c00', '#d84315', '#c62828'][index % 6]
-                      );
-                    }
-                texttemplate: "%{x:.1f} h"
-                textposition: auto
-                hovertemplate: >-
-                  %{y}<br>τ %{x:.1f} h<br>%{customdata} fitted
-                  nights<extra></extra>
-            layout:
-              height: 365
-              margin:
-                l: 105
-                r: 24
-                t: 35
-                b: 70
-              bargap: 0.25
-              xaxis:
-                title: Effective cooling time constant τ (hours)
-                rangemode: tozero
-                gridcolor: rgba(127,127,127,0.16)
-              yaxis:
-                automargin: true
-              font:
-                color: $ex css_vars['primary-text-color']
-              paper_bgcolor: rgba(0,0,0,0)
-              plot_bgcolor: rgba(0,0,0,0)
-            config:
-              displayModeBar: false
-              responsive: true
-      - type: grid
-        column_span: 1
-        cards:
-          - type: custom:apexcharts-card
-            header:
-              show: true
-              title: Delivered HLC and loss split · 12 months
-              show_states: true
-              colorize_states: true
-            graph_span: 365d
-            span:
-              end: day
-            apex_config:
-              chart:
-                height: 255
-              stroke:
-                curve: smooth
-                dashArray:
-                  - 0
-                  - 0
-                  - 5
-              legend:
-                position: top
-              yaxis:
-                min: 0
-                decimalsInFloat: 0
-                title:
-                  text: W/K
-            series:
-              - entity: sensor.thermal_efficiency_heat_loss_coefficient
-                name: Total HLC
-                color: "#7e57c2"
-                type: area
-                stroke_width: 3
-                opacity: 0.1
-                statistics:
-                  type: mean
-                  period: week
-                  align: middle
-              - entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
-                name: Fabric
-                color: "#ef5350"
-                type: line
-                stroke_width: 2
-                statistics:
-                  type: mean
-                  period: week
-                  align: middle
-              - entity: sensor.metahome_thermal_efficiency_ventilation_heat_loss
-                name: Ventilation
-                color: "#42a5f5"
-                type: line
-                stroke_width: 2
-                statistics:
-                  type: mean
-                  period: week
-                  align: middle
-      - type: grid
-        cards:
-          - type: heading
-            heading: Gas use
-            icon: mdi:meter-gas
-          - type: tile
-            grid_options:
-              columns: 6
-              rows: 2
-            entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
-            name: Hot water · 7-day average
-            icon: mdi:shower-head
-            color: blue
-            vertical: true
-            features_position: bottom
-          - type: tile
-            grid_options:
-              columns: 6
-              rows: 2
-            entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
-            name: Space heating · 7-day average
-            icon: mdi:radiator
-            color: deep-orange
-            show_entity_picture: false
-            hide_state: false
-            vertical: true
-            features_position: bottom
-          - type: custom:apexcharts-card
-            header:
-              show: true
-              title: Attributed gas · 90 days
-            graph_span: 90d
-            span:
-              end: day
-            apex_config:
-              chart:
-                height: 255
-              stroke:
-                curve: smooth
-              legend:
-                position: top
-              yaxis:
-                min: 0
-                decimalsInFloat: 1
-                title:
-                  text: kWh/day
-            series:
-              - entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
-                name: Hot water
-                color: "#42a5f5"
-                type: area
-                stroke_width: 2
-                opacity: 0.18
-                statistics:
-                  type: mean
-                  period: day
-              - entity: >-
-                  sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
-                name: Space heating
-                color: "#ef6c00"
-                type: area
-                stroke_width: 2
-                opacity: 0.14
-                statistics:
-                  type: mean
-                  period: day
-      - type: grid
-        cards:
-          - type: heading
-            heading: Electricity
-            icon: mdi:transmission-tower-import
-          - type: tile
-            grid_options:
-              columns: 6
-              rows: 2
-            entity: sensor.metahome_thermal_efficiency_electricity_use_7_day_average
-            name: Use · 7-day average
-            icon: mdi:flash
-            color: amber
-            vertical: true
-            features_position: bottom
-          - type: custom:apexcharts-card
-            header:
-              show: true
-              title: Electricity use · 90 days
-            graph_span: 90d
-            span:
-              end: day
-            apex_config:
-              chart:
-                height: 255
-              stroke:
-                curve: smooth
-              yaxis:
-                min: 0
-                decimalsInFloat: 1
-                title:
-                  text: kWh/day
-            series:
-              - entity: >-
-                  sensor.metahome_thermal_efficiency_electricity_use_7_day_average
-                name: Electricity
-                color: "#f9a825"
-                type: area
-                stroke_width: 2
-                opacity: 0.2
-                statistics:
-                  type: mean
-                  period: day
-      - type: grid
-        cards:
-          - type: heading
-            heading: Water
-            icon: mdi:water
-          - type: tile
-            entity: sensor.metahome_thermal_efficiency_total_water_use_7_day_average
-            name: Total water · latest 7 reported days
-            icon: mdi:water-outline
-            color: cyan
-            vertical: true
-            features_position: bottom
-          - type: custom:apexcharts-card
-            header:
-              show: true
-              title: Total water · 90 days
-            graph_span: 90d
-            span:
-              end: day
-            apex_config:
-              chart:
-                height: 255
-              stroke:
-                curve: smooth
-              yaxis:
-                min: 0
-                decimalsInFloat: 0
-                title:
-                  text: L/day
-            series:
-              - entity: >-
-                  sensor.metahome_thermal_efficiency_total_water_use_7_day_average
-                name: Total water
-                color: "#26c6da"
-                type: area
-                stroke_width: 2
-                opacity: 0.18
-                statistics:
-                  type: mean
-                  period: day
+- badges:
+  - color: purple
+    entity: sensor.thermal_efficiency_heat_loss_coefficient
+    icon: mdi:home-thermometer-outline
+    name: Delivered HLC
+    show_icon: true
+    show_name: true
+    show_state: true
+    visibility:
+    - condition: state
+      entity: sensor.thermal_efficiency_heat_loss_coefficient
+      state_not: unknown
+    - condition: state
+      entity: sensor.thermal_efficiency_heat_loss_coefficient
+      state_not: unavailable
+  - color: teal
+    entity: sensor.metahome_thermal_efficiency_air_change_rate
+    icon: mdi:weather-windy
+    name: Air Changes
+    show_icon: true
+    show_name: true
+    show_state: true
+    visibility:
+    - condition: state
+      entity: sensor.metahome_thermal_efficiency_air_change_rate
+      state_not: unknown
+    - condition: state
+      entity: sensor.metahome_thermal_efficiency_air_change_rate
+      state_not: unavailable
+  - color: amber
+    entity: sensor.thermal_efficiency_loft_ratio
+    icon: mdi:home-roof
+    name: Loft Coupling
+    show_icon: true
+    show_name: true
+    show_state: true
+  - color: blue
+    entity: sensor.metahome_thermal_efficiency_electricity_baseload
+    icon: mdi:power-plug-outline
+    name: Baseload
+    show_icon: true
+    show_name: true
+    show_state: true
+  - color: deep-orange
+    entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+    icon: mdi:radiator
+    name: Space Heating
+    show_icon: true
+    show_name: true
+    show_state: true
+  - color: light-blue
+    entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+    icon: mdi:shower-head
+    name: Hot Water
+    show_icon: true
+    show_name: true
+    show_state: true
+  - color: cyan
+    entity: sensor.thames_water_sensor
+    icon: mdi:water
+    name: Daily Water
+    show_icon: true
+    show_name: true
+    show_state: true
+  dense_section_placement: true
+  icon: mdi:home-thermometer
+  max_columns: 3
+  path: thermal-efficiency
+  sections:
+  - cards:
+    - heading: Building Thermal Envelope
+      heading_style: title
+      icon: mdi:home-thermometer
+      type: heading
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.thermal_efficiency_heat_loss_coefficient
+        state_not: unknown
+      - condition: state
+        entity: sensor.thermal_efficiency_heat_loss_coefficient
+        state_not: unavailable
+      card:
+        type: gauge
+        entity: sensor.thermal_efficiency_heat_loss_coefficient
+        name: Delivered HLC
+        min: 0
+        max: 500
+        needle: true
+        segments:
+        - from: 0
+          color: '#2e7d32'
+        - from: 100
+          color: '#7cb342'
+        - from: 180
+          color: '#f9a825'
+        - from: 280
+          color: '#ef6c00'
+        - from: 400
+          color: '#c62828'
+      grid_options:
+        columns: 6
+        rows: 3
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.thermal_efficiency_heat_loss_coefficient
+        state: unknown
+      card:
+        type: tile
+        entity: sensor.thermal_efficiency_heat_loss_coefficient
+        name: Delivered HLC
+        icon: mdi:home-thermometer-outline
+        color: purple
+        vertical: true
+      grid_options:
+        columns: 6
+        rows: 3
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.metahome_thermal_efficiency_air_change_rate
+        state_not: unknown
+      - condition: state
+        entity: sensor.metahome_thermal_efficiency_air_change_rate
+        state_not: unavailable
+      card:
+        type: gauge
+        entity: sensor.metahome_thermal_efficiency_air_change_rate
+        name: Air Infiltration
+        min: 0
+        max: 1.5
+        needle: true
+        segments:
+        - from: 0
+          color: '#ef6c00'
+        - from: 0.35
+          color: '#2e7d32'
+        - from: 0.7
+          color: '#f9a825'
+        - from: 1
+          color: '#c62828'
+      grid_options:
+        columns: 6
+        rows: 3
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.metahome_thermal_efficiency_air_change_rate
+        state: unknown
+      card:
+        type: tile
+        entity: sensor.metahome_thermal_efficiency_air_change_rate
+        name: Air Infiltration
+        icon: mdi:weather-windy
+        color: teal
+        vertical: true
+      grid_options:
+        columns: 6
+        rows: 3
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+        state_not: unknown
+      - condition: state
+        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+        state_not: unavailable
+      card:
+        type: gauge
+        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+        name: Fabric Loss
+        min: 0
+        max: 450
+        needle: true
+        segments:
+        - from: 0
+          color: '#2e7d32'
+        - from: 100
+          color: '#7cb342'
+        - from: 180
+          color: '#f9a825'
+        - from: 280
+          color: '#ef6c00'
+        - from: 380
+          color: '#c62828'
+      grid_options:
+        columns: 6
+        rows: 3
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+        state: unknown
+      card:
+        type: tile
+        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+        name: Fabric Loss
+        icon: mdi:wall
+        color: deep-orange
+        vertical: true
+      grid_options:
+        columns: 6
+        rows: 3
+    - type: gauge
+      entity: sensor.thermal_efficiency_loft_ratio
+      name: Loft Coupling
+      min: 0
+      max: 1
+      needle: true
+      grid_options:
+        columns: 6
+        rows: 3
+      segments:
+      - from: 0
+        color: '#2e7d32'
+      - from: 0.2
+        color: '#f9a825'
+      - from: 0.45
+        color: '#c62828'
+    column_span: 1
+    type: grid
+  - cards:
+    - heading: Room Cooling Fingerprints
+      heading_style: title
+      icon: mdi:fingerprint
+      type: heading
+    - config:
+        displayModeBar: false
+        responsive: true
+      entities:
+      - customdata: '$ex { const getRows = () => [["Office", "sensor.thermal_efficiency_office_time_constant"], ["Living room", "sensor.thermal_efficiency_living_room_time_constant"], ["Bedroom", "sensor.thermal_efficiency_bedroom_time_constant"], ["Kids room", "sensor.thermal_efficiency_kids_room_time_constant"], ["Bathroom", "sensor.thermal_efficiency_bathroom_time_constant"], ["Kitchen", "sensor.thermal_efficiency_kitchen_time_constant"]].map(([n, id]) => ({ name: n, value: Number(hass.states[id]?.state), nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0 })).filter(r => Number.isFinite(r.value)).sort((a, b) => b.value - a.value); return getRows().map(r => r.nights); }'
+        entity: sensor.thermal_efficiency_living_room_time_constant
+        hovertemplate: '<b>%{y}</b><br>Cooling time: <b>%{x:.1f} h</b><br>Fitted: %{customdata} nights<extra></extra>'
+        marker:
+          color: '$ex { const getRows = () => [["Office", "sensor.thermal_efficiency_office_time_constant"], ["Living room", "sensor.thermal_efficiency_living_room_time_constant"], ["Bedroom", "sensor.thermal_efficiency_bedroom_time_constant"], ["Kids room", "sensor.thermal_efficiency_kids_room_time_constant"], ["Bathroom", "sensor.thermal_efficiency_bathroom_time_constant"], ["Kitchen", "sensor.thermal_efficiency_kitchen_time_constant"]].map(([n, id]) => ({ name: n, value: Number(hass.states[id]?.state), nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0 })).filter(r => Number.isFinite(r.value)).sort((a, b) => b.value - a.value); return getRows().map((r, i) => ["#2e7d32", "#689f38", "#fbc02d", "#f57c00", "#e64a19", "#d32f2f"][i]); }'
+          opacity: 0.88
+        orientation: h
+        textposition: auto
+        texttemplate: '%{x:.1f} h'
+        type: bar
+        x: '$ex { const getRows = () => [["Office", "sensor.thermal_efficiency_office_time_constant"], ["Living room", "sensor.thermal_efficiency_living_room_time_constant"], ["Bedroom", "sensor.thermal_efficiency_bedroom_time_constant"], ["Kids room", "sensor.thermal_efficiency_kids_room_time_constant"], ["Bathroom", "sensor.thermal_efficiency_bathroom_time_constant"], ["Kitchen", "sensor.thermal_efficiency_kitchen_time_constant"]].map(([n, id]) => ({ name: n, value: Number(hass.states[id]?.state), nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0 })).filter(r => Number.isFinite(r.value)).sort((a, b) => b.value - a.value); return getRows().map(r => r.value); }'
+        y: '$ex { const getRows = () => [["Office", "sensor.thermal_efficiency_office_time_constant"], ["Living room", "sensor.thermal_efficiency_living_room_time_constant"], ["Bedroom", "sensor.thermal_efficiency_bedroom_time_constant"], ["Kids room", "sensor.thermal_efficiency_kids_room_time_constant"], ["Bathroom", "sensor.thermal_efficiency_bathroom_time_constant"], ["Kitchen", "sensor.thermal_efficiency_kitchen_time_constant"]].map(([n, id]) => ({ name: n, value: Number(hass.states[id]?.state), nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0 })).filter(r => Number.isFinite(r.value)).sort((a, b) => b.value - a.value); return getRows().map(r => r.name); }'
+      layout:
+        bargap: 0.28
+        font:
+          color: $ex css_vars['primary-text-color']
+        height: 390
+        margin:
+          b: 65
+          l: 100
+          r: 25
+          t: 15
+        paper_bgcolor: rgba(0,0,0,0)
+        plot_bgcolor: rgba(0,0,0,0)
+        xaxis:
+          gridcolor: rgba(127,127,127,0.16)
+          rangemode: tozero
+          title:
+            text: Cooling Time Constant τ (hours)
+            standoff: 12
+        yaxis:
+          automargin: true
+          autorange: reversed
+      raw_plotly_config: true
+      refresh_interval: auto
+      type: custom:plotly-graph
+    type: grid
+  - cards:
+    - heading: Long-Term Heat Loss Model
+      heading_style: title
+      icon: mdi:chart-bell-curve-cumulative
+      type: heading
+    - apex_config:
+        chart:
+          height: 310
+        legend:
+          fontSize: 12px
+          position: top
+        stroke:
+          curve: smooth
+          dashArray:
+          - 0
+          - 0
+          - 4
+        yaxis:
+          decimalsInFloat: 0
+          min: 0
+          title:
+            text: W/K
+      graph_span: 365d
+      header:
+        colorize_states: true
+        show: true
+        show_states: true
+        title: Delivered HLC & Loss Split (365 Days)
+      series:
+      - color: '#7e57c2'
+        entity: sensor.thermal_efficiency_heat_loss_coefficient
+        group_by:
+          duration: 7d
+          func: avg
+        name: Total HLC
+        opacity: 0.12
+        stroke_width: 3
+        type: area
+        statistics:
+          type: mean
+          period: week
+          align: middle
+      - color: '#ef5350'
+        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+        group_by:
+          duration: 7d
+          func: avg
+        name: Fabric Loss
+        stroke_width: 2.5
+        type: line
+        statistics:
+          type: mean
+          period: week
+          align: middle
+      - color: '#42a5f5'
+        entity: sensor.metahome_thermal_efficiency_ventilation_heat_loss
+        group_by:
+          duration: 7d
+          func: avg
+        name: Ventilation Loss
+        stroke_width: 2
+        type: line
+        statistics:
+          type: mean
+          period: week
+          align: middle
+      span:
+        end: day
+      type: custom:apexcharts-card
+    column_span: 1
+    type: grid
+  - cards:
+    - heading: Gas Consumption
+      heading_style: title
+      icon: mdi:meter-gas
+      type: heading
+    - color: blue
+      entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+      grid_options:
+        columns: 6
+        rows: 2
+      icon: mdi:shower-head
+      name: Hot Water (7d)
+      tap_action:
+        action: more-info
+      type: tile
+      vertical: true
+    - color: deep-orange
+      entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+      grid_options:
+        columns: 6
+        rows: 2
+      icon: mdi:radiator
+      name: Space Heating (7d)
+      tap_action:
+        action: more-info
+      type: tile
+      vertical: true
+    - apex_config:
+        chart:
+          height: 225
+        legend:
+          position: top
+        stroke:
+          curve: smooth
+        yaxis:
+          decimalsInFloat: 1
+          min: 0
+          title:
+            text: kWh/day
+      graph_span: 90d
+      header:
+        colorize_states: true
+        show: true
+        show_states: true
+        title: Attributed Gas Use (90 Days)
+      series:
+      - color: '#42a5f5'
+        entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+        group_by:
+          duration: 1d
+          func: avg
+        name: Hot Water
+        opacity: 0.18
+        stroke_width: 2
+        type: area
+        statistics:
+          type: mean
+          period: day
+      - color: '#ef6c00'
+        entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+        group_by:
+          duration: 1d
+          func: avg
+        name: Space Heating
+        opacity: 0.14
+        stroke_width: 2
+        type: area
+        statistics:
+          type: mean
+          period: day
+      span:
+        end: day
+      type: custom:apexcharts-card
+    type: grid
+  - cards:
+    - badges:
+      - entity: sensor.smart_meter_electricity_power
+        name: Live Demand
+        show_state: true
+        type: entity
+      heading: Electricity & Baseload
+      heading_style: title
+      icon: mdi:transmission-tower-import
+      type: heading
+    - color: amber
+      entity: sensor.metahome_thermal_efficiency_electricity_use_7_day_average
+      grid_options:
+        columns: 6
+        rows: 2
+      icon: mdi:flash
+      name: Electricity (7d)
+      tap_action:
+        action: more-info
+      type: tile
+      vertical: true
+    - color: blue
+      entity: sensor.metahome_thermal_efficiency_electricity_baseload
+      grid_options:
+        columns: 6
+        rows: 2
+      icon: mdi:power-plug-outline
+      name: Baseload (Always-on)
+      tap_action:
+        action: more-info
+      type: tile
+      vertical: true
+    - apex_config:
+        chart:
+          height: 225
+        stroke:
+          curve: smooth
+        yaxis:
+          decimalsInFloat: 1
+          min: 0
+          title:
+            text: kWh/day
+      graph_span: 90d
+      header:
+        colorize_states: true
+        show: true
+        show_states: true
+        title: Electricity Consumption (90 Days)
+      series:
+      - color: '#f9a825'
+        entity: sensor.metahome_thermal_efficiency_electricity_use_7_day_average
+        group_by:
+          duration: 1d
+          func: avg
+        name: Daily Electricity
+        opacity: 0.2
+        stroke_width: 2
+        type: area
+        statistics:
+          type: mean
+          period: day
+      span:
+        end: day
+      type: custom:apexcharts-card
+    type: grid
+  - cards:
+    - heading: Water Consumption
+      heading_style: title
+      icon: mdi:water
+      type: heading
+    - color: cyan
+      entity: sensor.thames_water_sensor
+      grid_options:
+        columns: 6
+        rows: 2
+      icon: mdi:water
+      name: Thames Water (Daily)
+      tap_action:
+        action: more-info
+      type: tile
+      vertical: true
+    - color: teal
+      entity: sensor.metahome_thermal_efficiency_total_water_use_7_day_average
+      grid_options:
+        columns: 6
+        rows: 2
+      icon: mdi:water-outline
+      name: Water Avg (7d)
+      tap_action:
+        action: more-info
+      type: tile
+      vertical: true
+    - apex_config:
+        chart:
+          height: 225
+        stroke:
+          curve: smooth
+        yaxis:
+          decimalsInFloat: 0
+          min: 0
+          title:
+            text: L/day
+      graph_span: 90d
+      header:
+        colorize_states: true
+        show: true
+        show_states: true
+        title: Total Water Trend (90 Days)
+      series:
+      - color: '#00acc1'
+        entity: sensor.metahome_thermal_efficiency_total_water_use_7_day_average
+        group_by:
+          duration: 1d
+          func: avg
+        name: Water (7d avg)
+        opacity: 0.18
+        stroke_width: 2
+        type: area
+        statistics:
+          type: mean
+          period: day
+      span:
+        end: day
+      type: custom:apexcharts-card
+    type: grid
+  title: Thermal efficiency
