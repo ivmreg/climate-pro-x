@@ -14,7 +14,6 @@ ROLES = ("temperature", "heating_power")
 GLOBAL_INPUTS = (
     "outdoor", "gas_meter", "loft", "loft_humidity", "co2",
     "outdoor_co2_sensor", "water", "electricity_meter",
-    "gas_unit_rate", "electricity_unit_rate",
 )
 
 
@@ -45,9 +44,13 @@ def configured_inputs(config: dict) -> set[str]:
     values = set()
     for key in GLOBAL_INPUTS:
         value = config.get(key)
-        values.update(value if isinstance(value, list) else [value] if value else [])
+        candidates = value if isinstance(value, list) else [value]
+        values.update(item for item in candidates if isinstance(item, str) and item)
     for room in config["rooms"].values():
-        values.update(room[role] for role in ROLES if room.get(role))
+        values.update(
+            room[role] for role in ROLES
+            if isinstance(room.get(role), str) and room[role]
+        )
     return values
 
 

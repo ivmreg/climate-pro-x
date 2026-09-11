@@ -52,6 +52,10 @@ def test_pure_validation():
         timestamp("2026-01-01")
     assert timestamp("1970-01-01T00:00:00+00:00") == 0
     assert configured_inputs({"rooms": {}, "co2": ["sensor.a", "sensor.b"], "water": "water:all"}) == {"sensor.a", "sensor.b", "water:all"}
+    assert configured_inputs({
+        "rooms": {}, "gas_unit_rate": "sensor.gas_rate",
+        "electricity_unit_rate": 0.18,
+    }) == set()
     for visits in (
         [{"role": "temperature", "start": 3, "end": 2}],
         [{"role": "temperature", "start": 1, "end": float("inf")}],
@@ -649,6 +653,3 @@ async def test_async_correct_only_closes_matching_source_gap(hass, manager):
     gap_other = next(v for v in manager.data["rooms"]["other"]["visits"] if v["id"] == "gap_other")
     assert gap_other["end"] is None
     await manager.async_shutdown()
-
-
-

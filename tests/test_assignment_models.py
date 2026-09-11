@@ -311,5 +311,3 @@ def test_compose_pre_cutover_move_preserves_archived_history():
     # New room must contain hours 4..12 (including hours 4..9 between move and cutoff claimed from archive)
     expected_new_hours = [int((base + timedelta(hours=h)).timestamp()) for h in range(4, 13)]
     assert new_room_hours == expected_new_hours
-
-

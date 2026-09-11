@@ -139,8 +139,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await history.async_initialize()
     coordinator = ThermalCoordinator(hass, dict(entry.data), history)
     # Recorder availability or a slow archive must not delay live capture.
+    initial_config = dict(entry.data)
+    if initial_config.get(CONF_LOFT_SINCE):
+        initial_config[CONF_LOFT_SINCE] = dt_util.parse_date(
+            initial_config[CONF_LOFT_SINCE]
+        )
     coordinator.async_set_updated_data(compute_all(
-        {}, dict(entry.data), dt_util.get_default_time_zone(), dt_util.utcnow(), (365,)
+        {}, initial_config, dt_util.get_default_time_zone(), dt_util.utcnow(), (365,)
     ))
     entry.runtime_data = ThermalRuntime(coordinator, history)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

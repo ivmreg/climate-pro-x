@@ -213,5 +213,3 @@ def test_night_taus_full_hour_containment(thermal_math):
         expected_intervals=interval_start
     )
     assert len(fits_start) == 1
-
-

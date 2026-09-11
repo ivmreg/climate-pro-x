@@ -63,6 +63,30 @@ def canonical(rows):
     ] for r in rows]
 
 
+def fingerprint(rows, kind):
+    """Return an order-independent inventory of distinct recorder rows.
+
+    Raw daily queries can both include a state at their shared boundary. Treating
+    exact duplicates as one observation lets the pre-copy range query be compared
+    with the union of the immutable daily chunks without masking changed values.
+    """
+    values = serializable(rows) if kind == "raw" else canonical(rows)
+    encoded = sorted({
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        for value in values
+    })
+    times = [
+        timestamp(row["last_updated"] if kind == "raw" else row["start"])
+        for row in rows
+    ]
+    return {
+        "count": len(encoded),
+        "digest": digest(encoded),
+        "first_observation": min(times) if times else None,
+        "last_observation": max(times) if times else None,
+    }
+
+
 def import_rows(rows):
     result = []
     for row in rows:
@@ -121,6 +145,17 @@ class HistoryMigrator:
             statistics_during_period, self.hass, start, end, {source}, period, units, FIELDS
         )).get(source, [])
 
+    async def _raw_query(self, source, start, end):
+        def read_states():
+            states = get_significant_states(
+                self.hass, start - timedelta(microseconds=1), end, [source],
+                include_start_time_state=False, significant_changes_only=False,
+                minimal_response=False, no_attributes=False,
+            ).get(source, [])
+            return [state.as_dict() if hasattr(state, "as_dict") else state for state in states]
+
+        return await get_instance(self.hass).async_add_executor_job(read_states)
+
     async def _archive(self, source, kind, start, end, metadata):
         key = f"{kind}_{int(start.timestamp())}_{int(end.timestamp())}"
         record = self.data["migration"]["sources"][source]
@@ -137,14 +172,7 @@ class HistoryMigrator:
         if key in record["chunks"]:
             raise ValueError("A recorded migration archive chunk is missing")
         if kind == "raw":
-            def read_states():
-                states = get_significant_states(
-                    self.hass, start - timedelta(microseconds=1), end, [source], include_start_time_state=False,
-                    significant_changes_only=False, minimal_response=False,
-                    no_attributes=False,
-                ).get(source, [])
-                return [state.as_dict() if hasattr(state, "as_dict") else state for state in states]
-            rows = await get_instance(self.hass).async_add_executor_job(read_states)
+            rows = await self._raw_query(source, start, end)
         else:
             rows = await self.query(source, start, end, kind, metadata)
         rows = serializable(rows)
@@ -157,6 +185,67 @@ class HistoryMigrator:
         record["chunks"][key] = self._chunk_summary(rows, kind)
         await self.save()
         return rows, key
+
+    async def _snapshot_inventory(self, metadata, raw_start, initial_end):
+        """Snapshot every retained source row before the first copy is accepted."""
+        inventory = {}
+        for source in self.data["migration"]["sources"]:
+            meta = metadata[source][1] if source in metadata else None
+            raw_rows = (
+                await self._raw_query(source, raw_start, initial_end)
+                if ":" not in source else []
+            )
+            five_rows = (
+                await self.query(source, raw_start, initial_end, "5minute", meta)
+                if meta else []
+            )
+            hour_rows = (
+                await self.query(source, EPOCH, initial_end, "hour", meta)
+                if meta else []
+            )
+            inventory[source] = {
+                "raw": fingerprint(raw_rows, "raw"),
+                "5minute": fingerprint(five_rows, "5minute"),
+                "hour": fingerprint(hour_rows, "hour"),
+            }
+        return inventory
+
+    async def _verify_snapshot_inventory(self, initial_end):
+        """Prove immutable chunks and imported hourly rows match the snapshot."""
+        migration = self.data["migration"]
+        for source, expected in migration["inventory"].items():
+            record = migration["sources"][source]
+            archived = {"raw": [], "5minute": [], "hour": []}
+            for key, summary in record["chunks"].items():
+                kind, _start, end = key.rsplit("_", 2)
+                if int(end) > int(initial_end.timestamp()):
+                    continue
+                store = Store(
+                    self.hass, 1,
+                    f"{self.prefix}.{identity(source)}.{key}",
+                )
+                chunk = await store.async_load()
+                if chunk is None or digest(chunk["rows"]) != chunk["digest"]:
+                    raise ValueError("Migration archive inventory is missing or corrupt")
+                if summary["digest"] != digest(chunk["rows"]):
+                    raise ValueError("Migration archive manifest does not match its chunk")
+                archived[kind].extend(chunk["rows"])
+
+            for kind in ("raw", "5minute", "hour"):
+                if fingerprint(archived[kind], kind) != expected[kind]:
+                    raise ValueError(
+                        f"Source {source} changed or disappeared during {kind} preservation"
+                    )
+
+            meta = record.get("metadata")
+            copied = (
+                await self.query(
+                    record["statistic_id"], EPOCH, initial_end, "hour", meta
+                )
+                if meta else []
+            )
+            if fingerprint(copied, "hour") != expected["hour"]:
+                raise ValueError("Imported history does not match the source inventory")
 
     async def run(self):
         migration = self.data["migration"]
@@ -177,15 +266,13 @@ class HistoryMigrator:
         raw_start = dt_util.as_utc(instance.recorder_runs_manager.first.start)
         raw_start = raw_start.replace(hour=0, minute=0, second=0, microsecond=0)
         migration.setdefault("raw_start", raw_start.timestamp())
-        if "inventory" not in migration:
-            inventory = {}
-            for source in migration["sources"]:
-                if source in metadata:
-                    probe = await self.query(source, EPOCH, initial_end, "hour", metadata[source][1])
-                    inventory[source] = {"count": len(probe)}
-                else:
-                    inventory[source] = {"count": 0}
-            migration["inventory"] = inventory
+        if migration.get("inventory_version") != 2:
+            if any(record.get("copied") for record in migration["sources"].values()):
+                raise ValueError("Migration inventory format changed after copying began")
+            migration["inventory"] = await self._snapshot_inventory(
+                metadata, raw_start, initial_end
+            )
+            migration["inventory_version"] = 2
         await self.save()
         for source, record in migration["sources"].items():
             if record.get("copied"):
@@ -196,32 +283,25 @@ class HistoryMigrator:
             meta = record["metadata"]
             raw_base = datetime.fromtimestamp(migration["raw_start"], UTC)
 
-            # Bound raw preservation to source's actual retained states
+            # Use the barrier inventory's bounds. This avoids another mutable
+            # source query and skips empty days/years before the first record.
             raw_start_day = None
-            if ":" not in source:
-                states = await instance.async_add_executor_job(
-                    partial(
-                        get_significant_states,
-                        self.hass,
-                        raw_base,
-                        initial_end,
-                        [source],
-                        include_start_time_state=False,
-                    )
+            raw_first = migration["inventory"][source]["raw"]["first_observation"]
+            if raw_first is not None:
+                first_dt = datetime.fromtimestamp(raw_first, UTC)
+                raw_start_day = max(
+                    raw_base,
+                    first_dt.replace(hour=0, minute=0, second=0, microsecond=0),
                 )
-                source_states = states.get(source, [])
-                if source_states:
-                    first_dt = dt_util.as_utc(source_states[0].last_updated)
-                    raw_start_day = max(raw_base, first_dt.replace(hour=0, minute=0, second=0, microsecond=0))
 
-            # Bound 5-minute preservation to source's actual retained statistics
             fivemin_start_day = None
-            if meta:
-                fivemin_probe = await self.query(source, raw_base, initial_end, "5minute", meta)
-                if fivemin_probe:
-                    min_ts = min(timestamp(r["start"]) for r in fivemin_probe)
-                    first_dt = datetime.fromtimestamp(min_ts, UTC)
-                    fivemin_start_day = max(raw_base, first_dt.replace(hour=0, minute=0, second=0, microsecond=0))
+            fivemin_first = migration["inventory"][source]["5minute"]["first_observation"]
+            if fivemin_first is not None:
+                first_dt = datetime.fromtimestamp(fivemin_first, UTC)
+                fivemin_start_day = max(
+                    raw_base,
+                    first_dt.replace(hour=0, minute=0, second=0, microsecond=0),
+                )
 
             if raw_start_day is not None or fivemin_start_day is not None:
                 start_candidates = [d for d in (raw_start_day, fivemin_start_day) if d is not None]
@@ -235,14 +315,24 @@ class HistoryMigrator:
                     day = end
             if meta:
                 # All retained years, not merely the model lookback; at most one
-                # year's hourly rows in memory. Empty years are cheap indexed reads.
-                start = EPOCH
+                # year's hourly rows in memory.
+                hour_first = migration["inventory"][source]["hour"]["first_observation"]
+                if hour_first is None:
+                    record["copied"] = True
+                    await self.save()
+                    continue
+                first_dt = datetime.fromtimestamp(hour_first, UTC)
+                start = datetime(first_dt.year, 1, 1, tzinfo=UTC)
                 while start < initial_end:
                     end = min(datetime(start.year + 1, 1, 1, tzinfo=UTC), initial_end)
                     rows, key = await self._archive(source, "hour", start, end, meta)
                     await self._import_verify(source, rows, key, start, end)
                     start = end
             record["copied"] = True
+            await self.save()
+        if not migration.get("snapshot_verified"):
+            await self._verify_snapshot_inventory(initial_end)
+            migration["snapshot_verified"] = True
             await self.save()
         # Live capture started before this top-of-hour boundary. Wait for the
         # recorder to finalize the bridge bucket instead of creating an upgrade gap.
@@ -308,9 +398,6 @@ class HistoryMigrator:
         original = {sid: stats.get(sid, []) for sid in sources}
         owned = {record["statistic_id"]: stats.get(record["statistic_id"], []) for record in sources.values()}
         for sid, record in sources.items():
-            expected = migration.get("inventory", {}).get(sid, {}).get("count", 0)
-            if expected > 0 and len(owned[record["statistic_id"]]) == 0:
-                raise ValueError(f"Source {sid} lost history during preservation")
             if canonical(original[sid]) != canonical(owned[record["statistic_id"]]):
                 raise ValueError("Source changed or disappeared during preservation")
         baseline = await self.hass.async_add_executor_job(

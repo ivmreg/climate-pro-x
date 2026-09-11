@@ -25,6 +25,8 @@ from custom_components.thermal_efficiency.const import (
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
     CONF_HEATING_POWER,
+    CONF_LOFT,
+    CONF_LOFT_SINCE,
     CONF_MAX_WINDOW_DAYS,
     CONF_OUTDOOR,
     CONF_OUTDOOR_CO2_SENSOR,
@@ -296,6 +298,29 @@ async def test_complete_entry_setup_captures_and_unloads(recorder_mock, hass, mo
     assert manager._stopping
 
 
+async def test_entry_setup_normalizes_loft_since(recorder_mock, hass, monkeypatch):
+    """Stored JSON dates must be converted before the initial calculation."""
+    from datetime import date
+    from unittest.mock import AsyncMock
+
+    from custom_components.thermal_efficiency.history_migration import HistoryMigrator
+
+    monkeypatch.setattr(HistoryMigrator, "run", AsyncMock())
+    config = _config() | {
+        CONF_LOFT: "sensor.loft_temperature",
+        CONF_LOFT_SINCE: "2026-01-02",
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=1)
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.runtime_data.coordinator.data["loft"] is None
+    assert isinstance(entry.runtime_data.coordinator.conf[CONF_LOFT_SINCE], str)
+    assert date.fromisoformat(entry.runtime_data.coordinator.conf[CONF_LOFT_SINCE])
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
 async def test_history_options_preserve_room_identity_and_reject_stale_form(hass):
     from types import SimpleNamespace
     from custom_components.thermal_efficiency.history import RoomHistoryManager
@@ -520,6 +545,3 @@ async def test_diagnostics_verified_hourly_chunks_counts_only_hour_kind(hass):
     diag = await async_get_config_entry_diagnostics(hass, entry)
     # Even though raw_1 and 5m_1 are verified, only hour_1 is verified of kind 'hour'
     assert diag["verified_hourly_chunks"] == 1
-
-
-
