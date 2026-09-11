@@ -294,22 +294,77 @@ def _room_from_input(user_input: dict) -> dict:
     return room
 
 
-def _validate_room_name(name: str, taken: dict) -> tuple[str | None, dict[str, str]]:
+def _is_owned_entity(hass: HomeAssistant, entity_id: str | None) -> bool:
+    if not entity_id or not isinstance(entity_id, str):
+        return False
+    reg_entry = er.async_get(hass).async_get(entity_id)
+    if reg_entry and reg_entry.platform == DOMAIN:
+        return True
+    if entity_id.startswith(f"sensor.{DOMAIN}_"):
+        return True
+    if DOMAIN in hass.data:
+        for entry_val in hass.data[DOMAIN].values():
+            mgr = getattr(entry_val, "history", None)
+            if mgr is None and isinstance(entry_val, dict):
+                mgr = entry_val.get("history")
+            if mgr and hasattr(mgr, "_is_owned_entity") and mgr._is_owned_entity(entity_id):
+                return True
+    return False
+
+
+def _other_room_slugs(
+    rooms: dict,
+    current_id: str | None = None,
+    pending_rooms: list | None = None,
+) -> set[str]:
+    slugs = set()
+    for rid, r in rooms.items():
+        if current_id is not None and rid == current_id:
+            continue
+        slugs.add(rid)
+        if isinstance(r, dict) and r.get("name"):
+            slugs.add(slugify(r["name"]))
+    if pending_rooms:
+        for item in pending_rooms:
+            rid = item[0] if isinstance(item, (tuple, list)) else item
+            r = item[1] if isinstance(item, (tuple, list)) and len(item) > 1 else {}
+            if current_id is not None and rid == current_id:
+                continue
+            slugs.add(rid)
+            if isinstance(r, dict) and r.get("name"):
+                slugs.add(slugify(r["name"]))
+    return slugs
+
+
+def _validate_room_name(name: str, taken: set[str] | dict) -> tuple[str | None, dict[str, str]]:
     slug = slugify(name)
     if not slug:
         return None, {"name": "invalid_name"}
-    if slug in taken:
+    if isinstance(taken, dict):
+        taken_slugs = set(taken.keys())
+        for r in taken.values():
+            if isinstance(r, dict) and r.get("name"):
+                taken_slugs.add(slugify(r["name"]))
+    else:
+        taken_slugs = set(taken)
+    if slug in taken_slugs:
         return None, {"name": "duplicate_room"}
     return slug, {}
 
 
 def _validate_room_input(
-    hass: HomeAssistant, user_input: dict, taken: dict
+    hass: HomeAssistant, user_input: dict, taken: set[str] | dict
 ) -> tuple[str | None, dict[str, str]]:
     slug, errors = _validate_room_name(user_input["name"], taken)
+    temp_sensor = user_input.get(CONF_TEMPERATURE)
+    if temp_sensor and _is_owned_entity(hass, temp_sensor):
+        errors[CONF_TEMPERATURE] = "invalid_source"
     heating_power = user_input.get(CONF_HEATING_POWER)
-    if heating_power and heating_power_issue(hass, heating_power):
-        errors[CONF_HEATING_POWER] = "heating_power_must_be_percent"
+    if heating_power:
+        if _is_owned_entity(hass, heating_power):
+            errors[CONF_HEATING_POWER] = "invalid_source"
+        elif heating_power_issue(hass, heating_power):
+            errors[CONF_HEATING_POWER] = "heating_power_must_be_percent"
     return slug, errors
 
 
@@ -541,7 +596,12 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             if user_input.get("remove_room"):
                 return await self._async_advance_room()
-            slug, errors = _validate_room_input(self.hass, user_input, self._rooms)
+            other_slugs = _other_room_slugs(
+                self._rooms,
+                current_id=self._current_room[0],
+                pending_rooms=self._pending_rooms,
+            )
+            slug, errors = _validate_room_input(self.hass, user_input, other_slugs)
             if slug and not errors:
                 # Display names may change; established room identity never does.
                 room_id = self._current_room[0] or slug
@@ -579,7 +639,8 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
     ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            slug, errors = _validate_room_input(self.hass, user_input, self._rooms)
+            other_slugs = _other_room_slugs(self._rooms)
+            slug, errors = _validate_room_input(self.hass, user_input, other_slugs)
             if slug and not errors:
                 self._rooms[slug] = _room_from_input(user_input)
                 if user_input.get("add_another"):

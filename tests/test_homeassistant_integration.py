@@ -400,3 +400,99 @@ async def test_history_status_sensor_live_updates(hass):
     assert sensor not in manager._status_sensors
     await manager.async_shutdown()
 
+
+def test_room_source_sensor_has_force_update():
+    from unittest.mock import MagicMock
+    from custom_components.thermal_efficiency.room_sensor import RoomSourceSensor
+
+    binding = MagicMock(id="s123456", entity_id="sensor.s", role="temperature", room_id="r1")
+    manager = MagicMock(
+        data={"streams": {"s123456": {"unique_id": "u1"}}, "rooms": {"r1": {"name": "Room 1"}}},
+        entry=MagicMock(entry_id="e1"),
+    )
+    sensor = RoomSourceSensor(manager, binding)
+    assert sensor.force_update is True
+
+
+async def test_config_and_options_flows_reject_owned_entities(recorder_mock, hass):
+    from types import SimpleNamespace
+    from homeassistant import config_entries
+    from homeassistant.helpers import entity_registry as er
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+
+    # Register an owned entity with platform == DOMAIN
+    ent_reg = er.async_get(hass)
+    owned = ent_reg.async_get_or_create("sensor", DOMAIN, "owned_sensor_unique", suggested_object_id="owned_sensor")
+
+    # 1. Config flow room details
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"outdoor": "sensor.outdoor"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"name": "Room 1", "temperature": owned.entity_id, "add_another": False},
+    )
+    assert result["type"] == "form"
+    assert result["errors"]["temperature"] == "invalid_source"
+
+    # 2. Options flow room editing
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass = hass
+    flow.handler = entry.entry_id
+    await flow.async_step_init()
+    await flow.async_step_settings(config)
+    res = await flow.async_step_room({"name": "Living Room", "temperature": owned.entity_id})
+    assert res["type"] == "form"
+    assert res["errors"]["temperature"] == "invalid_source"
+    await manager.async_shutdown()
+
+
+async def test_options_flow_rejects_duplicate_display_name_when_renaming(hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+
+    # Two rooms: room_1 (Living Room) and room_2 (Bedroom)
+    config = {
+        "outdoor": "sensor.outdoor",
+        "rooms": {
+            "room_1": {"name": "Living Room", "temperature": "sensor.living"},
+            "room_2": {"name": "Bedroom", "temperature": "sensor.bed"},
+        },
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass = hass
+    flow.handler = entry.entry_id
+    await flow.async_step_init()
+    await flow.async_step_settings(config)
+
+    # Renaming room_1 to "Bedroom" (which collides with room_2) must fail
+    res = await flow.async_step_room({"name": "Bedroom", "temperature": "sensor.living"})
+    assert res["type"] == "form"
+    assert res["errors"]["name"] == "duplicate_room"
+
+    # Keeping the same name "Living Room" succeeds
+    res_ok = await flow.async_step_room({"name": "Living Room", "temperature": "sensor.living"})
+    assert res_ok["type"] == "form"
+    assert res_ok["step_id"] == "room"  # advances to next room (room_2)
+    await manager.async_shutdown()
+
+

@@ -156,3 +156,31 @@ def test_offline_summary_also_requires_three_nights():
     assert two_nights["nights_fitted"] == 2
     assert isnan(two_nights["tau_median_h"])
     assert three_nights["tau_median_h"] == 12.0
+
+
+def test_night_taus_partial_heating_expectation(thermal_math):
+    room, outdoor, _ = _cooling_series(days=1, tau=15.0)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ts_hours = [int((start + timedelta(hours=h)).timestamp()) for h in range(6)]
+
+    # Heating data only available for hours 3, 4, 5 (50% of night hours)
+    partial_heating = {ts: 0.0 for ts in ts_hours[3:]}
+
+    # Expected intervals only covers hours 3..5
+    expected_intervals = [{"start": ts_hours[3], "end": ts_hours[5] + 3600}]
+
+    # Without expected_intervals, 50% coverage causes rejection (<80%)
+    fits_without = thermal_math.night_taus(
+        room, outdoor, partial_heating, timezone.utc, date(2026, 1, 1),
+        expected_intervals=None
+    )
+    assert len(fits_without) == 0
+
+    # With expected_intervals, coverage is evaluated only over expected hours (100% of hours 3..5)
+    fits_with = thermal_math.night_taus(
+        room, outdoor, partial_heating, timezone.utc, date(2026, 1, 1),
+        expected_intervals=expected_intervals
+    )
+    assert len(fits_with) == 1
+    assert fits_with[0]["date"] == "2026-01-01"
+

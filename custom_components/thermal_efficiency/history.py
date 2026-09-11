@@ -47,8 +47,10 @@ def observation(state, role):
         unit = state.attributes.get("unit_of_measurement")
         if role == "temperature":
             value = TemperatureConverter.convert(value, unit, "°C")
-        elif unit != "%" or not 0 <= value <= 100:
-            return None
+        else:
+            norm_unit = unit.strip().casefold() if isinstance(unit, str) else None
+            if norm_unit not in {"%", "percent", "percentage"} or not 0 <= value <= 100:
+                return None
         return value if isfinite(value) else None
     except (ValueError, TypeError, HomeAssistantError):
         return None
@@ -195,6 +197,7 @@ class RoomHistoryManager:
 
     async def async_initialize(self):
         now = self._now()
+        self._started_at = now
         stored = await self.store.async_load()
         self.data = stored or {
             "version": HISTORY_STORE_VERSION, "revision": 0, "rooms": {},
@@ -231,6 +234,8 @@ class RoomHistoryManager:
                 if current == previous.get(rid, {}).get(role):
                     continue
                 if current:
+                    if self._is_owned_entity(current):
+                        continue
                     source = self._source(current, role)
                     if any(v.get("end") is None and self.data["streams"].get(v.get("stream"), {}).get("source_id") == source["id"]
                            for v in room["visits"]):
@@ -245,7 +250,7 @@ class RoomHistoryManager:
                             "role": role, "start": now, "end": None, "cause": "gap",
                             "legacy": False, "expected": True,
                         })
-                        source["pending"] = {"since": now, "observed": now}
+                        source["pending"] = {"since": 0, "observed": now, "initial": True}
                     else:
                         self._assign(source, rid, now,
                                      "legacy" if not stored else "replacement", legacy=not stored)
@@ -330,7 +335,7 @@ class RoomHistoryManager:
                          if v.get("stream") == binding.id and v.get("end") is None)
             if state is not None and (
                 state.attributes.get("restored")
-                or state.last_reported.timestamp() < (visit.get("start") or 0)
+                or state.last_reported.timestamp() < max(visit.get("start") or 0, getattr(self, "_started_at", 0))
                 or when < stream.get("last_report", 0)
             ):
                 continue
@@ -487,7 +492,14 @@ class RoomHistoryManager:
                     if stream:
                         spec[role] = self.data["sources"][stream["source_id"]]["entity_id"]
                     else:
-                        spec.pop(role, None)
+                        # Explicit gap: preserve the configured role if the previous source is pending resolution
+                        prev_visits = [v for v in self.data["rooms"][rid]["visits"] if v["role"] == role and v.get("stream")]
+                        last_source_id = self.data["streams"][prev_visits[-1]["stream"]]["source_id"] if prev_visits else None
+                        last_source = self.data["sources"].get(last_source_id) if last_source_id else None
+                        if last_source and last_source.get("pending"):
+                            pass
+                        else:
+                            spec.pop(role, None)
                 else:
                     spec.pop(role, None)
         return rooms
@@ -508,6 +520,13 @@ class RoomHistoryManager:
                    for v in self.data["rooms"][room_id]["visits"]):
                 raise ValueError("invalid_time")
             self._assign(source, room_id, effective, "correction")
+            for room in self.data["rooms"].values():
+                for v in room["visits"]:
+                    if v.get("stream") is None and v["role"] == source["role"] and v.get("end") is None:
+                        v["end"] = max(v.get("start") or effective, effective)
+                    stream = self.data["streams"].get(v.get("stream"), {})
+                    if stream.get("source_id") == source["id"] and v.get("end") is not None and v["end"] > effective:
+                        v["end"] = effective
             for room in self.data["rooms"].values():
                 room["visits"] = [v for v in room["visits"] if v.get("start") is None or v.get("start") != v.get("end")]
             source["pending"] = None

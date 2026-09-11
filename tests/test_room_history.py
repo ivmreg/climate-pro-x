@@ -377,3 +377,120 @@ async def test_migration_failure_exponential_backoff_and_retry(manager, monkeypa
     next_retry2 = manager.data["migration"]["next_retry"]
     assert next_retry2 >= manager._now() + 119
 
+
+def test_observation_heating_power_unit_aliases():
+    assert observation(State("sensor.test", "50", {"unit_of_measurement": "%"}), "heating_power") == 50.0
+    assert observation(State("sensor.test", "75.5", {"unit_of_measurement": "percent"}), "heating_power") == 75.5
+    assert observation(State("sensor.test", "25", {"unit_of_measurement": "percentage"}), "heating_power") == 25.0
+    assert observation(State("sensor.test", "10", {"unit_of_measurement": " PERCENT "}), "heating_power") == 10.0
+    assert observation(State("sensor.test", "50", {"unit_of_measurement": "W"}), "heating_power") is None
+
+
+async def test_freshness_guard_rejects_prerestart_cached_state(recorder_mock, hass, manager):
+    binding = manager.bindings()[0]
+    manager._subscribe_states()
+    now_ts = manager._now()
+    manager._started_at = now_ts + 100
+
+    # Simulate an event whose last_reported is before startup boundary
+    state = State("sensor.a", "22", {"unit_of_measurement": "°C"}, last_reported=datetime.fromtimestamp(now_ts + 50, UTC))
+    event = Event("state_changed", {"entity_id": "sensor.a", "new_state": state}, time_fired_timestamp=now_ts + 110)
+    manager._state_changed(event)
+    assert manager.values.get(binding.id) != 22
+
+    # Fresh report after startup boundary is accepted
+    fresh_state = State("sensor.a", "22", {"unit_of_measurement": "°C"}, last_reported=datetime.fromtimestamp(now_ts + 150, UTC))
+    fresh_event = Event("state_changed", {"entity_id": "sensor.a", "new_state": fresh_state}, time_fired_timestamp=now_ts + 150)
+    manager._state_changed(fresh_event)
+    assert manager.values.get(binding.id) == 22
+    await manager.async_shutdown()
+
+
+async def test_async_correct_closes_pending_gap_at_effective(hass, manager):
+    # Simulate an uncertain offline move creating a pending gap in room a
+    when = manager._now() - 100
+    source_id = manager.bindings()[0].source_id
+    source = manager.data["sources"][source_id]
+    source["pending"] = {"since": when, "observed": when}
+    for v in manager.data["rooms"]["a"]["visits"]:
+        if v.get("end") is None:
+            v["end"] = when
+    manager.data["rooms"]["a"]["visits"].append({
+        "id": "gap_visit_1", "stream": None, "role": "temperature",
+        "start": when, "end": None, "cause": "gap", "legacy": False, "expected": True,
+    })
+
+    # Destination is room b, effective 50 seconds after gap start
+    effective = when + 50
+    await manager.async_correct(source_id, "b", effective, manager.data["revision"])
+
+    # Gap visit in room a must be closed at effective
+    gap_visit = next(v for v in manager.data["rooms"]["a"]["visits"] if v.get("id") == "gap_visit_1")
+    assert gap_visit["end"] == effective
+    # Source is no longer pending
+    assert source.get("pending") is None
+    # New visit in room b starts at effective
+    new_visit = next(v for v in manager.data["rooms"]["b"]["visits"] if v.get("start") == effective)
+    assert new_visit["role"] == "temperature"
+    await manager.async_shutdown()
+
+
+async def test_first_startup_area_mismatch_allows_historical_effective_time(hass):
+    area_reg = ar.async_get(hass)
+    living_area = area_reg.async_create("Living")
+    kitchen_area = area_reg.async_create("Kitchen")
+
+    entity_reg = er.async_get(hass)
+    sensor = entity_reg.async_get_or_create("sensor", "test", "temp_first", suggested_object_id="temp_first")
+    entity_reg.async_update_entity(sensor.entity_id, area_id=kitchen_area.id)
+
+    config = {
+        "outdoor": "sensor.out",
+        "rooms": {
+            "living": {"name": "Living", "temperature": sensor.entity_id},
+            "kitchen": {"name": "Kitchen"},
+        },
+    }
+    entry = MockConfigEntry(domain="thermal_efficiency", data=config, version=2)
+    entry.add_to_hass(hass)
+    mgr = RoomHistoryManager(hass, entry, config)
+    await mgr.async_initialize()
+
+    source = next(s for s in mgr.data["sources"].values() if s["entity_id"] == sensor.entity_id)
+    assert source["pending"]["since"] == 0
+
+    # User corrects move to have taken place 1000 seconds before startup
+    historical_effective = 100.0
+    await mgr.async_correct(source["id"], "kitchen", historical_effective, mgr.data["revision"])
+    assert source.get("pending") is None
+    kitchen_visit = next(v for v in mgr.data["rooms"]["kitchen"]["visits"] if v.get("start") == historical_effective)
+    assert kitchen_visit["role"] == "temperature"
+    await mgr.async_shutdown()
+
+
+async def test_current_rooms_preserves_role_during_pending_unresolved_move(hass, manager):
+    source_id = manager.bindings()[0].source_id
+    source = manager.data["sources"][source_id]
+    when = manager._now() - 100
+    source["pending"] = {"since": when, "observed": when}
+
+    # Close active stream visit and open gap visit in room a
+    for v in manager.data["rooms"]["a"]["visits"]:
+        if v.get("end") is None:
+            v["end"] = when
+    manager.data["rooms"]["a"]["visits"].append({
+        "id": "pending_gap", "stream": None, "role": "temperature",
+        "start": when, "end": None, "cause": "gap", "legacy": False, "expected": True,
+    })
+
+    # While pending, current_rooms() must preserve sensor.a for room a
+    rooms = manager.current_rooms()
+    assert rooms["a"].get("temperature") == "sensor.a"
+
+    # Once resolved, pending is cleared and role reflects the resolution
+    await manager.async_correct(source_id, "b", when + 10, manager.data["revision"])
+    rooms_resolved = manager.current_rooms()
+    assert "temperature" not in rooms_resolved["a"]
+    assert rooms_resolved["b"].get("temperature") == "sensor.a"
+    await manager.async_shutdown()
+

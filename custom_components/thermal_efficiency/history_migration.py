@@ -103,6 +103,8 @@ class HistoryMigrator:
             return True
         for stream in active_streams:
             coverage = stream.get("coverage", [])
+            if not coverage:
+                continue
             covered = any(
                 c["start"] <= cutoff_ts and c.get("end") is None
                 for c in coverage
@@ -184,14 +186,49 @@ class HistoryMigrator:
                 await self.save()
             meta = record["metadata"]
             # Preserve the observations at risk of normal retention first.
-            day = datetime.fromtimestamp(migration["raw_start"], UTC)
-            while day < initial_end:
-                end = min(day + timedelta(days=1), initial_end)
-                if ":" not in source:
-                    await self._archive(source, "raw", day, end, meta)
-                if meta:
-                    await self._archive(source, "5minute", day, end, meta)
-                day = end
+            keep_days = getattr(instance, "keep_days", 10) or 10
+            retention_floor = (initial_end - timedelta(days=keep_days + 2)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            raw_base = max(datetime.fromtimestamp(migration["raw_start"], UTC), retention_floor)
+
+            # Bound raw preservation to source's actual retained states
+            raw_start_day = None
+            if ":" not in source:
+                states = await instance.async_add_executor_job(
+                    partial(
+                        get_significant_states,
+                        self.hass,
+                        raw_base,
+                        initial_end,
+                        [source],
+                        include_start_time_state=False,
+                    )
+                )
+                source_states = states.get(source, [])
+                if source_states:
+                    first_dt = dt_util.as_utc(source_states[0].last_updated)
+                    raw_start_day = max(raw_base, first_dt.replace(hour=0, minute=0, second=0, microsecond=0))
+
+            # Bound 5-minute preservation to source's actual retained statistics
+            fivemin_start_day = None
+            if meta:
+                hourly = await self.query(source, raw_base, initial_end, "hour", meta)
+                if hourly:
+                    min_ts = min(timestamp(r["start"]) for r in hourly)
+                    first_dt = datetime.fromtimestamp(min_ts, UTC)
+                    fivemin_start_day = max(raw_base, first_dt.replace(hour=0, minute=0, second=0, microsecond=0))
+
+            if raw_start_day is not None or fivemin_start_day is not None:
+                start_candidates = [d for d in (raw_start_day, fivemin_start_day) if d is not None]
+                day = min(start_candidates)
+                while day < initial_end:
+                    end = min(day + timedelta(days=1), initial_end)
+                    if raw_start_day is not None and day >= raw_start_day and ":" not in source:
+                        await self._archive(source, "raw", day, end, meta)
+                    if fivemin_start_day is not None and day >= fivemin_start_day and meta:
+                        await self._archive(source, "5minute", day, end, meta)
+                    day = end
             if meta:
                 # All retained years, not merely the model lookback; at most one
                 # year's hourly rows in memory. Empty years are cheap indexed reads.

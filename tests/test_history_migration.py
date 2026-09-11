@@ -1,6 +1,7 @@
 """Real recorder imports: all fields survive removal of original statistics."""
 from datetime import UTC, datetime, timedelta
 from functools import partial
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from freezegun import freeze_time
@@ -190,3 +191,40 @@ async def test_interrupted_migration_cutoff_rebasing(recorder_mock, hass):
     source_record = data["migration"]["sources"]["sensor.a"]
     copied = await migrator.query(source_record["statistic_id"], t0 - timedelta(days=2), t2, "hour", source_record["metadata"])
     assert len(copied) == 3
+
+
+def test_unobserved_stream_has_uninterrupted_live_capture(hass):
+    data = {
+        "migration": {"cutoff": 1000.0},
+        "rooms": {"office": {"visits": [{"stream": "s_silent", "role": "temperature", "end": None}]}},
+        "streams": {"s_silent": {"id": "s_silent", "coverage": []}},
+    }
+    migrator = HistoryMigrator(hass, MagicMock(), data, AsyncMock())
+    # Unobserved stream with coverage=[] must not fail live capture check
+    assert migrator._has_uninterrupted_live_capture(1000.0) is True
+
+
+async def test_bounded_short_term_preservation_skips_empty_years(recorder_mock, hass):
+    base = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+    config = {"outdoor": "sensor.empty_history", "rooms": {}}
+    entry = MockConfigEntry(domain="thermal_efficiency", data=config)
+    entry.add_to_hass(hass)
+
+    # Set raw_start to 3 years ago in migration manifest
+    three_years_ago = (base - timedelta(days=365 * 3)).timestamp()
+    data = {
+        "migration": migration_manifest(config, entry.entry_id, base.timestamp()),
+        "streams": {},
+        "rooms": {},
+    }
+    data["migration"]["raw_start"] = three_years_ago
+    migrator = HistoryMigrator(hass, entry, data, AsyncMock())
+
+    with freeze_time(base + timedelta(minutes=10)):
+        await migrator.run()
+
+    # Source has no history in recorder, so raw and 5minute chunks must not be created for 1000+ days
+    record = data["migration"]["sources"]["sensor.empty_history"]
+    raw_and_5m_chunks = [c for c in record["chunks"].values() if c["kind"] in ("raw", "5minute")]
+    assert len(raw_and_5m_chunks) == 0
+

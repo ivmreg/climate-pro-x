@@ -45,7 +45,8 @@
     "error": {
       "invalid_name": "Enter a room name",
       "duplicate_room": "A room with this name was already added",
-      "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100"
+      "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100",
+      "invalid_source": "Choose an external sensor. Integration-owned room history entities cannot be used as room sources."
     },
     "abort": {
       "single_instance_allowed": "Only one Thermal Efficiency instance is allowed"

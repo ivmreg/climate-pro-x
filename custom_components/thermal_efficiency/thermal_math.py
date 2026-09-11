@@ -774,16 +774,22 @@ def night_taus(
             continue
         if any(b - a > TAU_MAX_GAP_S for a, b in zip(hours, hours[1:])):
             continue
-        expected = expected_intervals is None or any(
-            (v.get("start") is None or ts + 3600 > v["start"])
-            and (v.get("end") is None or ts < v["end"])
-            for v in expected_intervals for ts in hours
-        )
-        if heating is not None and expected:
-            h_vals = [heating[ts] for ts in hours if ts in heating]
+        if expected_intervals is None:
+            expected_hours = hours
+        else:
+            expected_hours = [
+                ts for ts in hours
+                if any(
+                    (v.get("start") is None or ts + 3600 > v["start"])
+                    and (v.get("end") is None or ts < v["end"])
+                    for v in expected_intervals
+                )
+            ]
+        if heating is not None and expected_hours:
+            h_vals = [heating[ts] for ts in expected_hours if ts in heating]
             # Missing heating observations are not evidence that the radiator
             # stayed off. Require at least 80% coverage when configured.
-            if len(h_vals) / len(hours) < 0.8 or max(h_vals) > TAU_MAX_HEATING_PCT:
+            if len(h_vals) / len(expected_hours) < 0.8 or max(h_vals) > TAU_MAX_HEATING_PCT:
                 continue
         if any(ts not in outdoor for ts in hours):
             continue

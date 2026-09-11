@@ -3,6 +3,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from custom_components.thermal_efficiency.assignments import compose
+
 
 @pytest.mark.parametrize("missing", [False, True])
 def test_dated_heating_quality_blocks_fallback(thermal_math, monkeypatch, missing):
@@ -106,4 +108,73 @@ def test_room_isolated_transition_exclusions(thermal_math, monkeypatch):
     ts_jan2 = int(t_trans)
     assert ts_jan2 not in captured_room_safe_temps[0]  # room a
     assert ts_jan2 in captured_room_safe_temps[1]      # room b
+
+
+def test_compose_preserves_non_legacy_stream_prior_to_cutoff():
+    base = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    cutoff = base + timedelta(hours=10)
+    t_replace = base + timedelta(hours=5)
+
+    data = {
+        "revision": 1,
+        "migration": {
+            "status": "complete",
+            "cutoff": cutoff.timestamp(),
+            "sources": {},
+        },
+        "rooms": {
+            "living_room": {
+                "visits": [
+                    {
+                        "role": "temperature",
+                        "stream": "s_legacy",
+                        "legacy": True,
+                        "start": None,
+                        "end": t_replace.timestamp(),
+                        "cause": "legacy",
+                    },
+                    {
+                        "role": "temperature",
+                        "stream": "s_new",
+                        "legacy": False,
+                        "start": t_replace.timestamp(),
+                        "end": None,
+                        "cause": "replacement",
+                    },
+                ]
+            }
+        },
+        "streams": {
+            "s_legacy": {
+                "id": "s_legacy",
+                "entity_id": "sensor.legacy_stream",
+                "original_entity_id": "sensor.orig",
+                "role": "temperature",
+                "coverage": [{"start": 0, "end": t_replace.timestamp()}],
+            },
+            "s_new": {
+                "id": "s_new",
+                "entity_id": "sensor.new_stream",
+                "original_entity_id": "sensor.repl",
+                "role": "temperature",
+                "coverage": [{"start": t_replace.timestamp(), "end": None}],
+            },
+        },
+    }
+    config = {"rooms": {"living_room": {"name": "Living Room"}}}
+
+    # Populate stats: legacy has hours 0..4, new has hours 5..12
+    stats = {
+        "sensor.orig": [{"start": (base + timedelta(hours=h)).timestamp(), "mean": 19.0} for h in range(5)],
+        "sensor.new_stream": [{"start": (base + timedelta(hours=h)).timestamp(), "mean": 21.0} for h in range(5, 13)],
+    }
+
+    result_stats, result_conf = compose(stats, config, data, UTC)
+    room_key = result_conf["rooms"]["living_room"]["temperature"]
+    composed_hours = [int(r["start"]) for r in result_stats[room_key]]
+
+    # Ensure all hours from 0 through 12 are present in room history,
+    # specifically hours 5, 6, 7, 8, 9 from the non-legacy stream before cutoff
+    expected_hours = [int((base + timedelta(hours=h)).timestamp()) for h in range(13)]
+    assert composed_hours == expected_hours
 
