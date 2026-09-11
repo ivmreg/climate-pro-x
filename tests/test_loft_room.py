@@ -560,10 +560,93 @@ async def test_late_added_loft_and_updating_assignment_since(hass):
     updated_visits = manager3.data["rooms"]["loft"]["visits"]
     updated_active = next(v for v in updated_visits if v["end"] is None and v["role"] == CONF_TEMPERATURE)
     assert updated_active["start"] == assignment_timestamp(updated_since)
+    assert updated_active["cause"] == "loft_migration"
+    await manager3._save()
     await manager3.async_shutdown()
 
+    # Clear assignment_since
+    cleared_config = deepcopy(updated_config)
+    cleared_config[CONF_ROOMS]["loft"].pop(CONF_ASSIGNMENT_SINCE)
+    hass.config_entries.async_update_entry(entry, data=cleared_config)
 
-async def test_coordinator_without_history_uses_analysis_configuration(hass):
+    manager4 = RoomHistoryManager(hass, entry, cleared_config)
+    manager4._now = lambda: late_time + 200
+    await manager4.async_initialize()
+    cleared_visits = manager4.data["rooms"]["loft"]["visits"]
+    cleared_active = next(v for v in cleared_visits if v["end"] is None and v["role"] == CONF_TEMPERATURE)
+    assert cleared_active["start"] is None
+    assert cleared_active["legacy"] is True
+    assert cleared_active["cause"] == "legacy"
+    assert cleared_active["provenance"] == "legacy_mapping_unverified"
+    await manager4.async_shutdown()
+
+
+async def test_late_added_loft_without_migration_source_sets_bridge_and_statistic_ids(hass):
+    living_area = ar.async_get(hass).async_create("Living room 2")
+    loft_area = ar.async_get(hass).async_create("Loft 2")
+    living = _create_sensor(hass, "living_temp_2", living_area.id)
+    loft = _create_sensor(hass, "loft_temp_2", loft_area.id)
+
+    entry = MockConfigEntry(
+        domain="thermal_efficiency",
+        data={
+            "outdoor": "sensor.outdoor",
+            CONF_ROOMS: {
+                "living": {
+                    "name": "Living room",
+                    CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                    CONF_TEMPERATURE: living.entity_id,
+                }
+            },
+        },
+        version=2,
+    )
+    entry.add_to_hass(hass)
+
+    start_time = datetime(2026, 9, 1, 10, tzinfo=UTC).timestamp()
+    manager = RoomHistoryManager(hass, entry, entry.data)
+    manager._now = lambda: start_time
+    await manager.async_initialize()
+    await manager._save()
+    await manager.async_shutdown()
+
+    # Late-add loft without it being in migration sources
+    loft_since = "2026-08-20"
+    late_config = {
+        "outdoor": "sensor.outdoor",
+        CONF_ROOMS: {
+            "living": {
+                "name": "Living room",
+                CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                CONF_TEMPERATURE: living.entity_id,
+            },
+            "loft": {
+                "name": "Loft",
+                CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                CONF_TEMPERATURE: loft.entity_id,
+                CONF_ASSIGNMENT_SINCE: loft_since,
+            },
+        },
+    }
+    hass.config_entries.async_update_entry(entry, data=late_config)
+    late_time = datetime(2026, 9, 2, 12, tzinfo=UTC).timestamp()
+    manager2 = RoomHistoryManager(hass, entry, late_config)
+    manager2._now = lambda: late_time
+    await manager2.async_initialize()
+
+    loft_visits = manager2.data["rooms"]["loft"]["visits"]
+    active_visit = next(v for v in loft_visits if v["end"] is None and v["role"] == CONF_TEMPERATURE)
+    assert active_visit["start"] == assignment_timestamp(loft_since)
+    assert active_visit["cause"] == "loft_migration"
+    active_stream = manager2.data["streams"][active_visit["stream"]]
+    assert active_stream["legacy_bridge_end"] == late_time
+    assert loft.entity_id in manager2.statistic_ids()
+    await manager2.async_shutdown()
+
+
+async def test_coordinator_without_history_uses_analysis_configuration(hass, monkeypatch):
+    import custom_components.thermal_efficiency.coordinator as coord_mod
+
     loft_area = ar.async_get(hass).async_create("Loft")
     living_area = ar.async_get(hass).async_create("Living")
     loft = _create_sensor(hass, "coord_loft_temp", loft_area.id)
@@ -588,6 +671,25 @@ async def test_coordinator_without_history_uses_analysis_configuration(hass):
     assert living.entity_id in stats_ids
     assert loft.entity_id in stats_ids
     assert "sensor.outdoor" in stats_ids
+
+    captured_conf = {}
+
+    def _fake_stats(*args, **kwargs):
+        return {s: [] for s in stats_ids}
+
+    def _fake_compute_all(stats, conf, tz, now, windows):
+        captured_conf.update(conf)
+        return {"rooms": {}, "loft": None}
+
+    monkeypatch.setattr(coord_mod, "get_instance", lambda hass_: hass_)
+    monkeypatch.setattr(coord_mod, "statistics_during_period", _fake_stats)
+    monkeypatch.setattr(coord_mod.thermal_math, "compute_all", _fake_compute_all)
+
+    await coordinator._async_update_data()
+    assert set(captured_conf["rooms"]) == {"living"}
+    assert captured_conf["loft"] == loft.entity_id
+    assert captured_conf["loft_humidity"] is None
+
 
 
 async def test_config_flow_resolve_and_replace_validations(hass):
@@ -686,4 +788,76 @@ async def test_config_flow_assignment_since_validation(hass):
     })
     assert res_cond_with_since["type"] is FlowResultType.FORM
     assert res_cond_with_since["errors"] == {CONF_ASSIGNMENT_SINCE: "role_not_supported"}
+
+
+async def test_replaced_loft_with_assignment_since_and_migrated_source(hass):
+    loft_area = ar.async_get(hass).async_create("Loft")
+    living_area = ar.async_get(hass).async_create("Living")
+    living = _create_sensor(hass, "repl_living_temp", living_area.id)
+    loft1 = _create_sensor(hass, "repl_loft_temp_1", loft_area.id)
+    loft2 = _create_sensor(hass, "repl_loft_temp_2", loft_area.id)
+    loft3 = _create_sensor(hass, "repl_loft_temp_3", loft_area.id)
+
+    initial_config = {
+        "outdoor": "sensor.outdoor",
+        CONF_ROOMS: {
+            "living": {
+                "name": "Living",
+                CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                CONF_TEMPERATURE: living.entity_id,
+            },
+            "loft": {
+                "name": "Loft",
+                CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                CONF_TEMPERATURE: loft1.entity_id,
+                CONF_ASSIGNMENT_SINCE: "2026-07-01",
+            },
+        },
+    }
+    entry = MockConfigEntry(domain="thermal_efficiency", data=initial_config, version=2)
+    entry.add_to_hass(hass)
+
+    start_time = datetime(2026, 9, 1, 10, tzinfo=UTC).timestamp()
+    manager = RoomHistoryManager(hass, entry, initial_config)
+    manager._now = lambda: start_time
+    await manager.async_initialize()
+    manager.data["migration"]["sources"][loft3.entity_id] = {
+        "statistic_id": "thermal_efficiency:legacy_loft3",
+        "chunks": {},
+    }
+    await manager._save()
+    await manager.async_shutdown()
+
+    # Replace via config with new sensor and updated assignment_since
+    t2 = datetime(2026, 9, 2, 10, tzinfo=UTC).timestamp()
+    config_v2 = deepcopy(initial_config)
+    config_v2[CONF_ROOMS]["loft"][CONF_TEMPERATURE] = loft2.entity_id
+    config_v2[CONF_ROOMS]["loft"][CONF_ASSIGNMENT_SINCE] = "2026-08-10"
+    hass.config_entries.async_update_entry(entry, data=config_v2)
+
+    manager2 = RoomHistoryManager(hass, entry, config_v2)
+    manager2._now = lambda: t2
+    await manager2.async_initialize()
+
+    loft_visits = manager2.data["rooms"]["loft"]["visits"]
+    active_visit = next(v for v in loft_visits if v["end"] is None and v["role"] == CONF_TEMPERATURE)
+    assert active_visit["start"] == assignment_timestamp("2026-08-10")
+    assert active_visit["cause"] == "loft_migration"
+    active_stream = manager2.data["streams"][active_visit["stream"]]
+    assert active_stream["legacy_bridge_end"] == t2
+
+    # Replace via async_replace with loft3 (which is in migration sources)
+    t3 = datetime(2026, 9, 3, 10, tzinfo=UTC).timestamp()
+    manager2._now = lambda: t3
+    hass.states.async_set(loft3.entity_id, "21.5", {"unit_of_measurement": "°C"})
+    await manager2.async_replace("loft", "temperature", loft3.entity_id, manager2.data["revision"])
+
+    active_visit3 = next(v for v in manager2.data["rooms"]["loft"]["visits"] if v["end"] is None and v["role"] == CONF_TEMPERATURE)
+    assert active_visit3["cause"] == "loft_migration"
+    assert active_visit3["provenance"] == "loft_migration"
+    assert active_visit3["start"] == t3
+    stream3 = manager2.data["streams"][active_visit3["stream"]]
+    assert stream3["legacy_bridge_end"] == t3
+    await manager2.async_shutdown()
+
 

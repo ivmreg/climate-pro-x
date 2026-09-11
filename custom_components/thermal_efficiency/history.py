@@ -294,13 +294,15 @@ class RoomHistoryManager:
                             if visit["role"] == role and visit.get("end") is None:
                                 visit["start"] = effective
                                 visit["legacy"] = effective is None
-                                if effective is not None and visit.get("cause") == "legacy":
-                                    visit["cause"] = "loft_migration"
                                 if effective is not None:
+                                    visit["cause"] = "loft_migration"
                                     visit["provenance"] = "loft_migration"
-                                if (
-                                    current in self.data.get("migration", {}).get("sources", {})
-                                    and visit.get("stream")
+                                else:
+                                    visit["cause"] = "legacy"
+                                    visit["provenance"] = "legacy_mapping_unverified"
+                                if visit.get("stream") and (
+                                    effective is not None
+                                    or current in self.data.get("migration", {}).get("sources", {})
                                 ):
                                     self.data["streams"][visit["stream"]]["legacy_bridge_end"] = now
                     continue
@@ -322,7 +324,8 @@ class RoomHistoryManager:
                         use_since = has_since and (not stored or is_new_loft or since_changed)
                         effective = assignment_timestamp(spec.get(CONF_ASSIGNMENT_SINCE)) if use_since else None
 
-                        if is_migrated_source or not stored or (is_new_loft and effective is not None):
+                        should_bridge = is_migrated_source or effective is not None
+                        if should_bridge or not stored:
                             cause = "loft_migration"
                         else:
                             cause = "replacement"
@@ -331,7 +334,7 @@ class RoomHistoryManager:
                         when = effective if effective is not None else now
                         self._assign(source, rid, when, cause, legacy=legacy)
 
-                        if is_migrated_source:
+                        if should_bridge:
                             active = next(
                                 v for v in room["visits"]
                                 if v.get("end") is None and v.get("stream")
@@ -683,18 +686,22 @@ class RoomHistoryManager:
                 source = self._source(entity_id, role)
             source["pending"] = None
             source["area_id"] = room_area
-            self._assign(source, room_id, now, "replacement")
-            if (
+            is_loft = (
                 self.config["rooms"][room_id].get(CONF_ROOM_TYPE) == ROOM_TYPE_LOFT
+            )
+            is_migrated_source = (
+                is_loft
                 and entity_id in self.data.get("migration", {}).get("sources", {})
-            ):
+            )
+            cause = "loft_migration" if is_migrated_source else "replacement"
+            self._assign(source, room_id, now, cause)
+            if is_migrated_source:
                 active = next(
                     v for v in self.data["rooms"][room_id]["visits"]
                     if v.get("end") is None and v.get("stream")
                     and self.data["streams"][v["stream"]]["source_id"] == source["id"]
                 )
                 self.data["streams"][active["stream"]]["legacy_bridge_end"] = now
-                active["cause"] = "loft_migration"
             self.data["revision"] += 1
             await self._save()
             self._publish_new()
