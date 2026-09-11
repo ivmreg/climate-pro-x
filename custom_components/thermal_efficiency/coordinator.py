@@ -17,6 +17,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import thermal_math
+from .assignments import analysis_configuration
 from .const import (
     CONF_BOILER_EFFICIENCY,
     CONF_CEILING_HEIGHT,
@@ -68,28 +69,31 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         self.history = history
 
     def _statistic_ids(self) -> set[str]:
-        ids = {self.conf[CONF_OUTDOOR]}
-        if self.conf.get(CONF_GAS_METER):
-            ids.add(self.conf[CONF_GAS_METER])
-        if self.conf.get(CONF_LOFT):
-            ids.add(self.conf[CONF_LOFT])
-        if self.conf.get(CONF_LOFT_HUMIDITY):
-            ids.add(self.conf[CONF_LOFT_HUMIDITY])
-        co2 = self.conf.get(CONF_CO2)
+        base_conf = (
+            analysis_configuration(self.conf) if not self.history else self.conf
+        )
+        ids = {base_conf[CONF_OUTDOOR]}
+        if base_conf.get(CONF_GAS_METER):
+            ids.add(base_conf[CONF_GAS_METER])
+        if base_conf.get(CONF_LOFT):
+            ids.add(base_conf[CONF_LOFT])
+        if base_conf.get(CONF_LOFT_HUMIDITY):
+            ids.add(base_conf[CONF_LOFT_HUMIDITY])
+        co2 = base_conf.get(CONF_CO2)
         if isinstance(co2, str):
             ids.add(co2)
         elif co2:
             ids.update(co2)
-        if self.conf.get(CONF_OUTDOOR_CO2_SENSOR):
-            ids.add(self.conf[CONF_OUTDOOR_CO2_SENSOR])
-        if self.conf.get(CONF_WATER):
-            ids.add(self.conf[CONF_WATER])
-        if self.conf.get(CONF_ELECTRICITY_METER):
-            ids.add(self.conf[CONF_ELECTRICITY_METER])
+        if base_conf.get(CONF_OUTDOOR_CO2_SENSOR):
+            ids.add(base_conf[CONF_OUTDOOR_CO2_SENSOR])
+        if base_conf.get(CONF_WATER):
+            ids.add(base_conf[CONF_WATER])
+        if base_conf.get(CONF_ELECTRICITY_METER):
+            ids.add(base_conf[CONF_ELECTRICITY_METER])
         if self.history:
             ids.update(self.history.statistic_ids())
         else:
-            for room in self.conf[CONF_ROOMS].values():
+            for room in base_conf[CONF_ROOMS].values():
                 ids.add(room[CONF_TEMPERATURE])
                 if room.get(CONF_HEATING_POWER):
                     ids.add(room[CONF_HEATING_POWER])
@@ -165,9 +169,18 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         )
         # compute_all is pure CPU and takes ~1s on a full season of hourly
         # statistics, so it must not run on the event loop. Tariffs are read
-        # from the state machine here, before handing off to the executor.
+        computation_stats = stats
+        if self.history:
+            computation_stats, prepared = self.history.prepare(
+                stats, self.conf, dt_util.get_default_time_zone()
+            )
+            room_conf = prepared[CONF_ROOMS]
+        else:
+            prepared = analysis_configuration(self.conf)
+            room_conf = prepared[CONF_ROOMS]
+
         invalid_heating_power: dict[str, str] = {}
-        for room in ([] if self.history else self.conf[CONF_ROOMS].values()):
+        for room in ([] if self.history else room_conf.values()):
             entity_id = room.get(CONF_HEATING_POWER)
             if not entity_id:
                 continue
@@ -183,15 +196,6 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
                     entity_id,
                     issue,
                 )
-
-        computation_stats = stats
-        room_conf = self.conf[CONF_ROOMS]
-        prepared = {}
-        if self.history:
-            computation_stats, prepared = self.history.prepare(
-                stats, self.conf, dt_util.get_default_time_zone()
-            )
-            room_conf = prepared[CONF_ROOMS]
         conf = {
             "rooms": room_conf,
             "excluded_model_days": prepared.get("excluded_model_days", []),

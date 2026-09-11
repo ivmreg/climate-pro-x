@@ -49,7 +49,7 @@ from .const import (
     ROOM_TYPE_CONDITIONED,
     ROOM_TYPE_LOFT,
 )
-from .validation import heating_power_issue
+from .validation import heating_power_issue, _loft_since
 from .assignments import room_roles, timestamp
 from .config_migration import migrate_legacy_loft_config
 
@@ -286,6 +286,10 @@ def _room_details_schema(
         vol.Optional(
             CONF_HUMIDITY, description=_suggest(room.get(CONF_HUMIDITY))
         ): _entity_selector(device_class="humidity"),
+        vol.Optional(
+            CONF_ASSIGNMENT_SINCE,
+            description=_suggest(room.get(CONF_ASSIGNMENT_SINCE)),
+        ): selector.DateSelector(),
     }
     if allow_remove:
         schema[vol.Optional("remove_room", default=False)] = selector.BooleanSelector()
@@ -307,6 +311,8 @@ def _room_from_input(user_input: dict) -> dict:
         room[CONF_HEATING_POWER] = user_input[CONF_HEATING_POWER]
     if room_type == ROOM_TYPE_LOFT and user_input.get(CONF_HUMIDITY):
         room[CONF_HUMIDITY] = user_input[CONF_HUMIDITY]
+    if room_type == ROOM_TYPE_LOFT and user_input.get(CONF_ASSIGNMENT_SINCE):
+        room[CONF_ASSIGNMENT_SINCE] = _loft_since(user_input[CONF_ASSIGNMENT_SINCE])
     return room
 
 
@@ -392,6 +398,15 @@ def _validate_room_input(
             errors[CONF_HUMIDITY] = "role_not_supported"
         elif _is_owned_entity(hass, humidity):
             errors[CONF_HUMIDITY] = "invalid_source"
+    assignment_since = user_input.get(CONF_ASSIGNMENT_SINCE)
+    if assignment_since:
+        if room_type != ROOM_TYPE_LOFT:
+            errors[CONF_ASSIGNMENT_SINCE] = "role_not_supported"
+        else:
+            try:
+                _loft_since(assignment_since)
+            except vol.Invalid:
+                errors[CONF_ASSIGNMENT_SINCE] = "invalid_date"
     return slug, errors
 
 
@@ -574,7 +589,12 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
                 self._change = ("async_correct", [user_input["source"], user_input["room"],
                                                  timestamp(user_input["effective_time"])], self._revision)
                 return await self.async_step_confirm()
-            except (ValueError, KeyError):
+            except ValueError as err:
+                if str(err) == "role_not_supported":
+                    errors["base"] = "role_not_supported"
+                else:
+                    errors["base"] = "invalid_correction"
+            except KeyError:
                 errors["base"] = "invalid_correction"
         self._revision = history.data["revision"]
         return self.async_show_form(step_id="resolve", errors=errors, data_schema=vol.Schema({
@@ -604,6 +624,10 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
                 not in room_roles(history.config["rooms"][user_input["room"]])
             ):
                 errors["base"] = "role_not_supported"
+            elif user_input["role"] == CONF_HEATING_POWER and heating_power_issue(
+                self.hass, user_input["source"]
+            ):
+                errors["base"] = "heating_power_must_be_percent"
             else:
                 self._change = ("async_replace", [user_input["room"], user_input["role"], user_input["source"]], self._revision)
                 return await self.async_step_confirm()
@@ -694,6 +718,7 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
                 }
                 if (
                     updated[CONF_ROOM_TYPE] == ROOM_TYPE_LOFT
+                    and CONF_ASSIGNMENT_SINCE not in user_input
                     and self._current_room[1]
                     and self._current_room[1].get(CONF_ASSIGNMENT_SINCE)
                 ):

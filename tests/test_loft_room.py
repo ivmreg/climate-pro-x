@@ -18,6 +18,7 @@ from custom_components.thermal_efficiency.assignments import (
 )
 from custom_components.thermal_efficiency.config_flow import (
     ThermalEfficiencyConfigFlow,
+    ThermalEfficiencyOptionsFlow,
 )
 from custom_components.thermal_efficiency.config_migration import (
     migrate_legacy_loft_config,
@@ -28,6 +29,7 @@ from custom_components.thermal_efficiency.const import (
     CONF_LOFT,
     CONF_LOFT_HUMIDITY,
     CONF_LOFT_SINCE,
+    CONF_MAX_WINDOW_DAYS,
     CONF_ROOMS,
     CONF_ROOM_TYPE,
     CONF_TEMPERATURE,
@@ -35,6 +37,7 @@ from custom_components.thermal_efficiency.const import (
     ROOM_TYPE_CONDITIONED,
     ROOM_TYPE_LOFT,
 )
+from custom_components.thermal_efficiency.coordinator import ThermalCoordinator
 from custom_components.thermal_efficiency.history import (
     RoomHistoryManager,
     assignment_timestamp,
@@ -83,6 +86,13 @@ async def test_legacy_loft_config_becomes_an_area_backed_typed_room(hass):
     assert migrated[CONF_ROOMS]["living_room"][CONF_ROOM_TYPE] == ROOM_TYPE_CONDITIONED
     assert migrated[CONF_ROOMS][loft_area.id] == {
         "name": "Loft",
+        CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+        CONF_TEMPERATURE: old_loft.entity_id,
+        "heating_power": "sensor.old_loft_heating",
+    }
+    loft_room_id = f"{loft_area.id}_2"
+    assert migrated[CONF_ROOMS][loft_room_id] == {
+        "name": "Loft",
         CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
         CONF_TEMPERATURE: loft.entity_id,
         CONF_HUMIDITY: humidity.entity_id,
@@ -92,8 +102,8 @@ async def test_legacy_loft_config_becomes_an_area_backed_typed_room(hass):
     assert prepared[CONF_LOFT] == loft.entity_id
     assert prepared[CONF_LOFT_HUMIDITY] == humidity.entity_id
     assert prepared[CONF_LOFT_SINCE] == date(2026, 7, 3)
-    assert set(prepared[CONF_ROOMS]) == {"living_room"}
-    assert {loft.entity_id, humidity.entity_id} <= configured_inputs(migrated)
+    assert set(prepared[CONF_ROOMS]) == {"living_room", loft_area.id}
+    assert {loft.entity_id, humidity.entity_id, old_loft.entity_id} <= configured_inputs(migrated)
 
 
 async def test_v06_loft_archive_is_bridged_into_dated_room_history(hass):
@@ -392,3 +402,288 @@ def test_yaml_schema_rejects_incompatible_or_duplicate_loft_rooms():
     }
     with pytest.raises(vol.Invalid, match="Only one loft"):
         CONFIG_SCHEMA(duplicate)
+
+
+def test_yaml_schema_rejects_top_level_loft_and_loft_room_simultaneously():
+    conf = {
+        "thermal_efficiency": {
+            "outdoor": "sensor.outdoor",
+            CONF_LOFT: "sensor.legacy_loft",
+            CONF_ROOMS: {
+                "living": {CONF_TEMPERATURE: "sensor.living"},
+                "loft": {
+                    CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                    CONF_TEMPERATURE: "sensor.loft_room",
+                },
+            },
+        }
+    }
+    with pytest.raises(vol.Invalid, match="simultaneously"):
+        CONFIG_SCHEMA(conf)
+
+
+def test_unconfigured_loft_humidity_remains_none():
+    config = {
+        "outdoor": "sensor.outdoor",
+        CONF_ROOMS: {
+            "living": {
+                CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                CONF_TEMPERATURE: "sensor.living",
+            },
+            "loft": {
+                CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                CONF_TEMPERATURE: "sensor.loft",
+            },
+        },
+    }
+    prepared = analysis_configuration(config)
+    assert prepared[CONF_LOFT] == "sensor.loft"
+    assert prepared[CONF_LOFT_HUMIDITY] is None
+
+    stats = {
+        "sensor.outdoor": [],
+        "sensor.living": [],
+        "sensor.loft": [],
+    }
+    data = {
+        "migration": {
+            "status": "complete",
+            "cutoff": 0,
+            "sources": {},
+        },
+        "streams": {
+            "s1": {
+                "id": "s1",
+                "source_id": "src1",
+                "original_entity_id": "sensor.loft",
+                "coverage": [],
+            }
+        },
+        "rooms": {
+            "loft": {
+                "visits": [
+                    {
+                        "id": "v1",
+                        "stream": "s1",
+                        "role": CONF_TEMPERATURE,
+                        "start": 0,
+                        "end": None,
+                        "expected": True,
+                        "cause": "legacy",
+                    }
+                ]
+            }
+        },
+    }
+    composed_stats, composed_conf = compose(stats, config, data, UTC)
+    assert composed_conf["loft"] == f"thermal_efficiency:room_{identity('loft', CONF_TEMPERATURE)}"
+    assert composed_conf["loft_humidity"] is None
+
+
+async def test_late_added_loft_and_updating_assignment_since(hass):
+    living_area = ar.async_get(hass).async_create("Living room")
+    loft_area = ar.async_get(hass).async_create("Loft")
+    living = _create_sensor(hass, "living_temp", living_area.id)
+    loft = _create_sensor(hass, "loft_temp", loft_area.id)
+
+    entry = MockConfigEntry(
+        domain="thermal_efficiency",
+        data={
+            "outdoor": "sensor.outdoor",
+            CONF_ROOMS: {
+                "living": {
+                    "name": "Living room",
+                    CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                    CONF_TEMPERATURE: living.entity_id,
+                }
+            },
+        },
+        version=2,
+    )
+    entry.add_to_hass(hass)
+
+    start_time = datetime(2026, 9, 1, 10, tzinfo=UTC).timestamp()
+    manager = RoomHistoryManager(hass, entry, entry.data)
+    manager._now = lambda: start_time
+    await manager.async_initialize()
+    manager.data["migration"]["sources"][loft.entity_id] = {
+        "statistic_id": "thermal_efficiency:legacy_loft",
+        "chunks": {},
+    }
+    await manager._save()
+    await manager.async_shutdown()
+
+    # Late-add loft with assignment_since
+    loft_since = "2026-08-15"
+    late_added_config = {
+        "outdoor": "sensor.outdoor",
+        CONF_ROOMS: {
+            "living": {
+                "name": "Living room",
+                CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                CONF_TEMPERATURE: living.entity_id,
+            },
+            "loft": {
+                "name": "Loft",
+                CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                CONF_TEMPERATURE: loft.entity_id,
+                CONF_ASSIGNMENT_SINCE: loft_since,
+            },
+        },
+    }
+    hass.config_entries.async_update_entry(entry, data=late_added_config)
+    late_time = datetime(2026, 9, 2, 10, tzinfo=UTC).timestamp()
+    manager2 = RoomHistoryManager(hass, entry, late_added_config)
+    manager2._now = lambda: late_time
+    await manager2.async_initialize()
+
+    loft_visits = manager2.data["rooms"]["loft"]["visits"]
+    active_visit = next(v for v in loft_visits if v["end"] is None and v["role"] == CONF_TEMPERATURE)
+    assert active_visit["start"] == assignment_timestamp(loft_since)
+    assert active_visit["cause"] == "loft_migration"
+    active_stream = manager2.data["streams"][active_visit["stream"]]
+    assert active_stream["legacy_bridge_end"] == late_time
+
+    await manager2._save()
+    await manager2.async_shutdown()
+
+    # Update assignment_since with unchanged entity ID
+    updated_since = "2026-07-01"
+    updated_config = deepcopy(late_added_config)
+    updated_config[CONF_ROOMS]["loft"][CONF_ASSIGNMENT_SINCE] = updated_since
+    hass.config_entries.async_update_entry(entry, data=updated_config)
+
+    manager3 = RoomHistoryManager(hass, entry, updated_config)
+    manager3._now = lambda: late_time + 100
+    await manager3.async_initialize()
+
+    updated_visits = manager3.data["rooms"]["loft"]["visits"]
+    updated_active = next(v for v in updated_visits if v["end"] is None and v["role"] == CONF_TEMPERATURE)
+    assert updated_active["start"] == assignment_timestamp(updated_since)
+    await manager3.async_shutdown()
+
+
+async def test_coordinator_without_history_uses_analysis_configuration(hass):
+    loft_area = ar.async_get(hass).async_create("Loft")
+    living_area = ar.async_get(hass).async_create("Living")
+    loft = _create_sensor(hass, "coord_loft_temp", loft_area.id)
+    living = _create_sensor(hass, "coord_living_temp", living_area.id)
+
+    raw_conf = {
+        "outdoor": "sensor.outdoor",
+        CONF_MAX_WINDOW_DAYS: 30,
+        CONF_ROOMS: {
+            "living": {
+                CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                CONF_TEMPERATURE: living.entity_id,
+            },
+            "loft": {
+                CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                CONF_TEMPERATURE: loft.entity_id,
+            },
+        },
+    }
+    coordinator = ThermalCoordinator(hass, raw_conf, history=None)
+    stats_ids = coordinator._statistic_ids()
+    assert living.entity_id in stats_ids
+    assert loft.entity_id in stats_ids
+    assert "sensor.outdoor" in stats_ids
+
+
+async def test_config_flow_resolve_and_replace_validations(hass):
+    living_area = ar.async_get(hass).async_create("Living")
+    loft_area = ar.async_get(hass).async_create("Loft")
+    living = _create_sensor(hass, "cf_living_temp", living_area.id)
+    loft = _create_sensor(hass, "cf_loft_temp", loft_area.id)
+
+    config = {
+        "outdoor": "sensor.outdoor",
+        CONF_ROOMS: {
+            "living": {
+                "name": "Living",
+                CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                CONF_TEMPERATURE: living.entity_id,
+            },
+            "loft": {
+                "name": "Loft",
+                CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                CONF_TEMPERATURE: loft.entity_id,
+            },
+        },
+    }
+    entry = MockConfigEntry(domain="thermal_efficiency", data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+
+    class Runtime:
+        history = manager
+
+    entry.runtime_data = Runtime()
+
+    humidity_source = manager._source("sensor.humidity", "humidity")
+    humidity_source["pending"] = {"since": manager._now() - 100, "observed": manager._now() - 50}
+
+    options_flow = ThermalEfficiencyOptionsFlow()
+    options_flow.hass = hass
+    options_flow.handler = entry.entry_id
+
+    await options_flow.async_step_init()
+    res = await options_flow.async_step_resolve({
+        "source": humidity_source["id"],
+        "room": "living",
+        "effective_time": datetime.now(UTC).isoformat(),
+    })
+    assert res["type"] is FlowResultType.FORM
+    assert res["errors"] == {"base": "role_not_supported"}
+
+    with pytest.raises(ValueError, match="role_not_supported"):
+        await manager.async_correct(
+            humidity_source["id"], "living", manager._now() - 75, manager.data["revision"]
+        )
+
+    hass.states.async_set("sensor.bad_heating", "not_a_number", {"unit_of_measurement": "%"})
+    replace_res = await options_flow.async_step_replace({
+        "room": "living",
+        "role": "heating_power",
+        "source": "sensor.bad_heating",
+    })
+    assert replace_res["type"] is FlowResultType.FORM
+    assert replace_res["errors"] == {"base": "heating_power_must_be_percent"}
+    await manager.async_shutdown()
+
+
+def test_loft_since_validation():
+    from custom_components.thermal_efficiency.validation import _loft_since
+
+    assert _loft_since("2026-07-03") == "2026-07-03"
+    with pytest.raises(vol.Invalid, match="ISO date"):
+        _loft_since("invalid-date")
+
+
+async def test_config_flow_assignment_since_validation(hass):
+    flow = ThermalEfficiencyConfigFlow()
+    flow.hass = hass
+    await flow.async_step_user({"outdoor": "sensor.outdoor"})
+    await flow.async_step_room({CONF_ROOM_TYPE: ROOM_TYPE_LOFT})
+    res_bad_date = await flow.async_step_room_details({
+        "name": "Loft",
+        CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+        CONF_TEMPERATURE: "sensor.loft_temperature",
+        CONF_ASSIGNMENT_SINCE: "not-a-date",
+        "add_another": True,
+    })
+    assert res_bad_date["type"] is FlowResultType.FORM
+    assert res_bad_date["errors"] == {CONF_ASSIGNMENT_SINCE: "invalid_date"}
+
+    await flow.async_step_room({CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED})
+    res_cond_with_since = await flow.async_step_room_details({
+        "name": "Living",
+        CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+        CONF_TEMPERATURE: "sensor.living_temperature",
+        CONF_ASSIGNMENT_SINCE: "2026-07-03",
+        "add_another": False,
+    })
+    assert res_cond_with_since["type"] is FlowResultType.FORM
+    assert res_cond_with_since["errors"] == {CONF_ASSIGNMENT_SINCE: "role_not_supported"}
+

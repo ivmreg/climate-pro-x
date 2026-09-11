@@ -55,17 +55,6 @@ def migrate_legacy_loft_config(hass, config: dict) -> dict:
         ),
         None,
     )
-    if room_id is None and area_id in rooms:
-        room_id = area_id
-    if room_id is None and area:
-        room_id = next(
-            (
-                candidate
-                for candidate, room in rooms.items()
-                if room.get("name", "").casefold() == area.name.casefold()
-            ),
-            None,
-        )
     if room_id is None:
         base_id = area_id or slugify(name) or "loft"
         room_id = base_id
@@ -81,7 +70,7 @@ def migrate_legacy_loft_config(hass, config: dict) -> dict:
     else:
         rooms[room_id].update(
             {
-                "name": name,
+                "name": rooms[room_id].get("name") or name,
                 CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
                 CONF_TEMPERATURE: loft_entity,
             }

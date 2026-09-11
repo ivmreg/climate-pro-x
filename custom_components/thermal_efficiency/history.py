@@ -81,9 +81,20 @@ def assignment_timestamp(value) -> float | None:
     ).timestamp()
 
 
+from types import MappingProxyType
+
+
+def _to_dict(val):
+    if isinstance(val, (dict, MappingProxyType)):
+        return {k: _to_dict(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_to_dict(v) for v in val]
+    return val
+
+
 class RoomHistoryManager:
     def __init__(self, hass, entry, config):
-        self.hass, self.entry, self.config = hass, entry, deepcopy(config)
+        self.hass, self.entry, self.config = hass, entry, deepcopy(_to_dict(config))
         self.store = Store(hass, HISTORY_STORE_VERSION, f"{HISTORY_STORE_KEY}.{entry.entry_id}")
         self.data = {}
         self.entities = {}
@@ -262,10 +273,36 @@ class RoomHistoryManager:
                             break
                 room["area_id"] = room_area_id or self._area(spec["temperature"])
             allowed_roles = room_roles(spec)
+            is_loft = (
+                spec.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED)
+                == ROOM_TYPE_LOFT
+            )
             for role in ROLES:
                 current = spec.get(role) if role in allowed_roles else None
                 previous_spec = previous.get(rid, {})
                 if current == previous_spec.get(role):
+                    if (
+                        is_loft
+                        and current
+                        and spec.get(CONF_ASSIGNMENT_SINCE)
+                        != previous_spec.get(CONF_ASSIGNMENT_SINCE)
+                    ):
+                        effective = assignment_timestamp(
+                            spec.get(CONF_ASSIGNMENT_SINCE)
+                        )
+                        for visit in room["visits"]:
+                            if visit["role"] == role and visit.get("end") is None:
+                                visit["start"] = effective
+                                visit["legacy"] = effective is None
+                                if effective is not None and visit.get("cause") == "legacy":
+                                    visit["cause"] = "loft_migration"
+                                if effective is not None:
+                                    visit["provenance"] = "loft_migration"
+                                if (
+                                    current in self.data.get("migration", {}).get("sources", {})
+                                    and visit.get("stream")
+                                ):
+                                    self.data["streams"][visit["stream"]]["legacy_bridge_end"] = now
                     continue
                 if current:
                     if self._is_owned_entity(current):
@@ -274,34 +311,27 @@ class RoomHistoryManager:
                     if any(v.get("end") is None and self.data["streams"].get(v.get("stream"), {}).get("source_id") == source["id"]
                            for v in room["visits"]):
                         continue
-                    is_loft = (
-                        spec.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED)
-                        == ROOM_TYPE_LOFT
-                    )
-                    legacy_key = (
-                        CONF_LOFT if role == "temperature" else CONF_LOFT_HUMIDITY
-                    )
-                    original_config = self.data.get("original_config", {})
-                    legacy_loft_upgrade = bool(
-                        stored
-                        and previous_spec.get(
-                            CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED
-                        ) != ROOM_TYPE_LOFT
-                        and original_config.get(legacy_key) == current
-                    )
-                    if is_loft and (not stored or legacy_loft_upgrade):
-                        effective = assignment_timestamp(spec.get(CONF_ASSIGNMENT_SINCE))
-                        self._assign(
-                            source,
-                            rid,
-                            effective if effective is not None else now,
-                            "loft_migration",
-                            legacy=effective is None,
+                    if is_loft:
+                        is_migrated_source = current in self.data.get("migration", {}).get("sources", {})
+                        since_changed = (
+                            spec.get(CONF_ASSIGNMENT_SINCE) != previous_spec.get(CONF_ASSIGNMENT_SINCE)
                         )
-                        if (
-                            legacy_loft_upgrade
-                            and current in self.data.get("migration", {}).get("sources", {})
-                        ):
+                        is_new_loft = previous_spec.get(CONF_ROOM_TYPE) != ROOM_TYPE_LOFT
+                        has_since = bool(spec.get(CONF_ASSIGNMENT_SINCE))
+
+                        use_since = has_since and (not stored or is_new_loft or since_changed)
+                        effective = assignment_timestamp(spec.get(CONF_ASSIGNMENT_SINCE)) if use_since else None
+
+                        if is_migrated_source or not stored or (is_new_loft and effective is not None):
+                            cause = "loft_migration"
+                        else:
+                            cause = "replacement"
+
+                        legacy = (effective is None and not stored)
+                        when = effective if effective is not None else now
+                        self._assign(source, rid, when, cause, legacy=legacy)
+
+                        if is_migrated_source:
                             active = next(
                                 v for v in room["visits"]
                                 if v.get("end") is None and v.get("stream")
@@ -592,10 +622,12 @@ class RoomHistoryManager:
             if not source:
                 raise ValueError("invalid_source")
             pending = source.get("pending")
+            if room_id not in self.config["rooms"]:
+                raise ValueError("invalid_time")
+            if source["role"] not in room_roles(self.config["rooms"][room_id]):
+                raise ValueError("role_not_supported")
             if (
-                room_id not in self.config["rooms"]
-                or source["role"] not in room_roles(self.config["rooms"][room_id])
-                or source.get("missing") or not pending or not isfinite(effective)
+                source.get("missing") or not pending or not isfinite(effective)
                 or not pending["since"] <= effective <= self._now()
             ):
                 raise ValueError("invalid_time")
@@ -652,6 +684,17 @@ class RoomHistoryManager:
             source["pending"] = None
             source["area_id"] = room_area
             self._assign(source, room_id, now, "replacement")
+            if (
+                self.config["rooms"][room_id].get(CONF_ROOM_TYPE) == ROOM_TYPE_LOFT
+                and entity_id in self.data.get("migration", {}).get("sources", {})
+            ):
+                active = next(
+                    v for v in self.data["rooms"][room_id]["visits"]
+                    if v.get("end") is None and v.get("stream")
+                    and self.data["streams"][v["stream"]]["source_id"] == source["id"]
+                )
+                self.data["streams"][active["stream"]]["legacy_bridge_end"] = now
+                active["cause"] = "loft_migration"
             self.data["revision"] += 1
             await self._save()
             self._publish_new()

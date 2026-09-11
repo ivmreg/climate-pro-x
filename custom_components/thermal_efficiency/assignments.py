@@ -194,6 +194,8 @@ def compose(stats: dict, config: dict, data: dict, tz) -> tuple[dict, dict]:
                                 continue
                             raise ValueError("Two sources contribute to one room/hour")
                         by_time[start] = row
+            if role == CONF_HUMIDITY and not (spec.get(CONF_HUMIDITY) or relevant or by_time):
+                continue
             result[key] = [by_time[t] for t in sorted(by_time)]
             if role in (CONF_TEMPERATURE, CONF_HUMIDITY) or expected:
                 room_conf[role] = key

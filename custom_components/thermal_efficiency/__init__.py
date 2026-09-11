@@ -48,18 +48,22 @@ from .config_migration import migrate_legacy_loft_config
 from .assignments import analysis_configuration
 from .history import RoomHistoryManager
 from .thermal_math import compute_all
+from .validation import _loft_since
 
 PLATFORMS = ["sensor"]
 
 
-def _loft_since(value: object) -> str:
-    """Validate an ISO date string, keeping it a plain string (not a `date`
-    object) so it survives being stored as config-entry data, which is
-    persisted to storage as JSON."""
-    parsed = dt_util.parse_date(str(value))
-    if parsed is None:
-        raise vol.Invalid("loft_since must be an ISO date (YYYY-MM-DD)")
-    return parsed.isoformat()
+def _validate_loft_exclusivity(conf: dict) -> dict:
+    rooms = conf.get(CONF_ROOMS, {})
+    has_loft_room = any(
+        room.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
+        for room in rooms.values()
+    )
+    if has_loft_room and CONF_LOFT in conf:
+        raise vol.Invalid(
+            "Cannot configure top-level loft and a loft room under rooms simultaneously"
+        )
+    return conf
 
 
 def _validate_room_roles(room: dict) -> dict:
@@ -107,43 +111,46 @@ def _bounded_float(minimum: float, maximum: float):
 
 CONFIG_SCHEMA = vol.Schema(
     {
-        DOMAIN: vol.Schema(
-            {
-                vol.Required(CONF_OUTDOOR): cv.entity_id,
-                vol.Required(CONF_ROOMS): vol.All(
-                    {cv.slug: ROOM_SCHEMA}, vol.Length(min=1), _validate_rooms
-                ),
-                vol.Optional(CONF_GAS_METER): cv.entity_id,
-                vol.Optional(CONF_LOFT): cv.entity_id,
-                # Loft sensor history before this date is ignored - protects
-                # against a sensor that was relocated into the loft (its
-                # earlier readings are from wherever it used to live).
-                vol.Optional(CONF_LOFT_SINCE): _loft_since,
-                vol.Optional(CONF_LOFT_HUMIDITY): cv.entity_id,
-                vol.Optional(CONF_FLOOR_AREA): _bounded_float(1.0, 2000.0),
-                vol.Optional(CONF_CEILING_HEIGHT): _bounded_float(1.8, 10.0),
-                vol.Optional(CONF_CO2): vol.Any(cv.entity_id, [cv.entity_id]),
-                vol.Optional(CONF_OUTDOOR_CO2): _bounded_float(350.0, 550.0),
-                vol.Optional(CONF_OUTDOOR_CO2_SENSOR): cv.entity_id,
-                # A statistic id, not an entity - the water history is an
-                # external statistic (e.g. thames_water:thameswater_consumption)
-                # rather than a sensor.* entity.
-                vol.Optional(CONF_WATER): cv.string,
-                # Heating-off days with less metered water than this are
-                # treated as away days for the hot-water baseline.
-                vol.Optional(
-                    CONF_MIN_DHW_WATER_L, default=DEFAULT_MIN_DHW_WATER_L
-                ): _bounded_float(0.0, 2000.0),
-                vol.Optional(CONF_GAS_UNIT_RATE): cv.entity_id,
-                vol.Optional(CONF_ELECTRICITY_METER): cv.entity_id,
-                vol.Optional(CONF_ELECTRICITY_UNIT_RATE): cv.entity_id,
-                vol.Optional(
-                    CONF_BOILER_EFFICIENCY, default=DEFAULT_BOILER_EFFICIENCY
-                ): _bounded_float(0.5, 1.0),
-                vol.Optional(
-                    CONF_MAX_WINDOW_DAYS, default=DEFAULT_MAX_WINDOW_DAYS
-                ): vol.All(cv.positive_int, vol.Range(min=30, max=730)),
-            }
+        DOMAIN: vol.All(
+            vol.Schema(
+                {
+                    vol.Required(CONF_OUTDOOR): cv.entity_id,
+                    vol.Required(CONF_ROOMS): vol.All(
+                        {cv.slug: ROOM_SCHEMA}, vol.Length(min=1), _validate_rooms
+                    ),
+                    vol.Optional(CONF_GAS_METER): cv.entity_id,
+                    vol.Optional(CONF_LOFT): cv.entity_id,
+                    # Loft sensor history before this date is ignored - protects
+                    # against a sensor that was relocated into the loft (its
+                    # earlier readings are from wherever it used to live).
+                    vol.Optional(CONF_LOFT_SINCE): _loft_since,
+                    vol.Optional(CONF_LOFT_HUMIDITY): cv.entity_id,
+                    vol.Optional(CONF_FLOOR_AREA): _bounded_float(1.0, 2000.0),
+                    vol.Optional(CONF_CEILING_HEIGHT): _bounded_float(1.8, 10.0),
+                    vol.Optional(CONF_CO2): vol.Any(cv.entity_id, [cv.entity_id]),
+                    vol.Optional(CONF_OUTDOOR_CO2): _bounded_float(350.0, 550.0),
+                    vol.Optional(CONF_OUTDOOR_CO2_SENSOR): cv.entity_id,
+                    # A statistic id, not an entity - the water history is an
+                    # external statistic (e.g. thames_water:thameswater_consumption)
+                    # rather than a sensor.* entity.
+                    vol.Optional(CONF_WATER): cv.string,
+                    # Heating-off days with less metered water than this are
+                    # treated as away days for the hot-water baseline.
+                    vol.Optional(
+                        CONF_MIN_DHW_WATER_L, default=DEFAULT_MIN_DHW_WATER_L
+                    ): _bounded_float(0.0, 2000.0),
+                    vol.Optional(CONF_GAS_UNIT_RATE): cv.entity_id,
+                    vol.Optional(CONF_ELECTRICITY_METER): cv.entity_id,
+                    vol.Optional(CONF_ELECTRICITY_UNIT_RATE): cv.entity_id,
+                    vol.Optional(
+                        CONF_BOILER_EFFICIENCY, default=DEFAULT_BOILER_EFFICIENCY
+                    ): _bounded_float(0.5, 1.0),
+                    vol.Optional(
+                        CONF_MAX_WINDOW_DAYS, default=DEFAULT_MAX_WINDOW_DAYS
+                    ): vol.All(cv.positive_int, vol.Range(min=30, max=730)),
+                }
+            ),
+            _validate_loft_exclusivity,
         )
     },
     extra=vol.ALLOW_EXTRA,
