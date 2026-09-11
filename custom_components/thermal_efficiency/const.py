@@ -7,8 +7,11 @@ CONF_LOFT_SINCE = "loft_since"
 CONF_LOFT_HUMIDITY = "loft_humidity"
 CONF_FLOOR_AREA = "floor_area_m2"
 CONF_ROOMS = "rooms"
+CONF_ROOM_TYPE = "room_type"
 CONF_TEMPERATURE = "temperature"
 CONF_HEATING_POWER = "heating_power"
+CONF_HUMIDITY = "humidity"
+CONF_ASSIGNMENT_SINCE = "assignment_since"
 CONF_MAX_WINDOW_DAYS = "max_window_days"
 CONF_CO2 = "co2"
 CONF_OUTDOOR_CO2 = "outdoor_co2_ppm"
@@ -32,6 +35,7 @@ UPDATE_INTERVAL_HOURS = 6
 # public room configuration: the latter remains backwards compatible while the
 # history journal owns attribution over time.
 HISTORY_STORE_VERSION = 1
+HISTORY_DATA_VERSION = 2
 HISTORY_STORE_KEY = f"{DOMAIN}.room_history"
 CONF_HISTORY_ENABLED = "history_enabled"
 
@@ -39,3 +43,6 @@ CONF_HISTORY_ENABLED = "history_enabled"
 # only one model window relative to "now" makes its oldest heating data slide
 # away during summer, so the coordinator retrieves one additional window.
 HLC_STATISTICS_LOOKBACK_MULTIPLIER = 2
+
+ROOM_TYPE_CONDITIONED = "conditioned"
+ROOM_TYPE_LOFT = "loft"

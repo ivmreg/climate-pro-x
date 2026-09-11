@@ -3,13 +3,10 @@
     "step": {
       "user": {
         "title": "Thermal Efficiency – home settings",
-        "description": "Whole-home sensors. You'll add rooms next, one at a time.",
+        "description": "Whole-home sensors. You'll add conditioned rooms and the loft next, one at a time.",
         "data": {
           "outdoor": "Outdoor temperature sensor",
           "gas_meter": "Gas meter, cumulative kWh (optional)",
-          "loft": "Loft temperature sensor (optional)",
-          "loft_since": "Ignore loft sensor readings before this date (optional)",
-          "loft_humidity": "Loft humidity sensor (optional)",
           "floor_area_m2": "Floor area in m² (optional – normalises the heat loss coefficient)",
           "ceiling_height_m": "Ceiling height in m (optional – enables the ventilation/fabric loss split)",
           "co2": "Indoor CO2 sensors (optional – enables the ventilation/fabric estimate)",
@@ -28,6 +25,7 @@
         "title": "Add a room",
         "description": "Pick a Versatile Thermostat climate entity to auto-fill this room's name and temperature sensor from it (its Area and EMA sensor), or leave blank to enter everything by hand.",
         "data": {
+          "room_type": "Room type",
           "vtrv_climate": "Versatile Thermostat climate entity (optional)"
         }
       },
@@ -36,8 +34,10 @@
         "description": "Rooms so far: {rooms_so_far}",
         "data": {
           "name": "Room name",
+          "room_type": "Room type",
           "temperature": "Temperature sensor",
           "heating_power": "Heating demand sensor, 0–100% (optional)",
+          "humidity": "Humidity sensor (loft only, optional)",
           "add_another": "Add another room"
         }
       }
@@ -45,6 +45,10 @@
     "error": {
       "invalid_name": "Enter a room name",
       "duplicate_room": "A room with this name was already added",
+      "duplicate_loft": "Only one loft can be configured",
+      "invalid_room_type": "Choose a supported room type",
+      "role_not_supported": "Heating demand belongs to conditioned rooms; humidity belongs to the loft",
+      "conditioned_room_required": "Add at least one conditioned room before finishing",
       "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100",
       "invalid_source": "Choose an external sensor. Integration-owned room history entities cannot be used as room sources."
     },
@@ -86,9 +90,6 @@
         "data": {
           "outdoor": "Outdoor temperature sensor",
           "gas_meter": "Gas meter, cumulative kWh (optional)",
-          "loft": "Loft temperature sensor (optional)",
-          "loft_since": "Ignore loft sensor readings before this date (optional)",
-          "loft_humidity": "Loft humidity sensor (optional)",
           "floor_area_m2": "Floor area in m² (optional – normalises the heat loss coefficient)",
           "ceiling_height_m": "Ceiling height in m (optional – enables the ventilation/fabric loss split)",
           "co2": "Indoor CO2 sensors (optional – enables the ventilation/fabric estimate)",
@@ -108,8 +109,10 @@
         "description": "Reviewing your existing rooms, one at a time - fix an entity, tick \"Remove this room\" to drop it, or just continue.",
         "data": {
           "name": "Room name",
+          "room_type": "Room type",
           "temperature": "Temperature sensor",
           "heating_power": "Heating demand sensor, 0–100% (optional)",
+          "humidity": "Humidity sensor (loft only, optional)",
           "remove_room": "Remove this room"
         }
       },
@@ -117,6 +120,7 @@
         "title": "Add a new room",
         "description": "All existing rooms reviewed. Pick a Versatile Thermostat climate entity to auto-fill a new room, leave blank to enter everything by hand, or tick \"No more rooms\" to finish now.",
         "data": {
+          "room_type": "Room type",
           "vtrv_climate": "Versatile Thermostat climate entity (optional)",
           "finish": "No more rooms - finish now"
         }
@@ -125,8 +129,10 @@
         "title": "Confirm new room details",
         "data": {
           "name": "Room name",
+          "room_type": "Room type",
           "temperature": "Temperature sensor",
           "heating_power": "Heating demand sensor, 0–100% (optional)",
+          "humidity": "Humidity sensor (loft only, optional)",
           "add_another": "Add another room"
         }
       }
@@ -134,6 +140,10 @@
     "error": {
       "invalid_name": "Enter a room name",
       "duplicate_room": "A room with this name was already added",
+      "duplicate_loft": "Only one loft can be configured",
+      "invalid_room_type": "Choose a supported room type",
+      "role_not_supported": "That measurement is not supported by the selected room type",
+      "conditioned_room_required": "Keep or add at least one conditioned room before finishing",
       "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100",
       "at_least_one_room": "Keep or add at least one room before finishing",
       "invalid_source": "Choose an external sensor. Integration-owned room history entities cannot be used as replacement sources.",
@@ -143,7 +153,8 @@
       "no_pending_moves": "No uncertain moves need resolving.",
       "no_closed_visits": "No completed visits are available to correct.",
       "change_not_applied": "No change was applied. The source must have a valid reading, dates must be valid and non-overlapping, and assignments must not have changed since the preview. Reopen the form to review.",
-      "assignments_changed": "Assignments changed while these settings were open. Reopen settings to review the current rooms."
+      "assignments_changed": "Assignments changed while these settings were open. Reopen settings to review the current rooms.",
+      "conditioned_room_required": "At least one conditioned room is required"
     }
   }
 }

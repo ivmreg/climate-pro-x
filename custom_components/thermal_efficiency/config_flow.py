@@ -22,6 +22,7 @@ from homeassistant.util import slugify
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_ASSIGNMENT_SINCE,
     CONF_BOILER_EFFICIENCY,
     CONF_CEILING_HEIGHT,
     CONF_CO2,
@@ -31,24 +32,26 @@ from .const import (
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
     CONF_HEATING_POWER,
-    CONF_LOFT,
-    CONF_LOFT_HUMIDITY,
-    CONF_LOFT_SINCE,
+    CONF_HUMIDITY,
     CONF_MAX_WINDOW_DAYS,
     CONF_MIN_DHW_WATER_L,
     CONF_OUTDOOR,
     CONF_OUTDOOR_CO2,
     CONF_OUTDOOR_CO2_SENSOR,
     CONF_ROOMS,
+    CONF_ROOM_TYPE,
     CONF_TEMPERATURE,
     CONF_WATER,
     DEFAULT_BOILER_EFFICIENCY,
     DEFAULT_MAX_WINDOW_DAYS,
     DEFAULT_MIN_DHW_WATER_L,
     DOMAIN,
+    ROOM_TYPE_CONDITIONED,
+    ROOM_TYPE_LOFT,
 )
-from .validation import heating_power_issue
-from .assignments import timestamp
+from .validation import heating_power_issue, _loft_since
+from .assignments import room_roles, timestamp
+from .config_migration import migrate_legacy_loft_config
 
 
 def _entity_selector(**kwargs: Any) -> selector.EntitySelector:
@@ -80,16 +83,6 @@ def _global_schema(defaults: dict | None = None) -> vol.Schema:
             vol.Optional(
                 CONF_GAS_METER, description=_suggest(defaults.get(CONF_GAS_METER))
             ): _entity_selector(device_class="energy"),
-            vol.Optional(
-                CONF_LOFT, description=_suggest(defaults.get(CONF_LOFT))
-            ): _entity_selector(device_class="temperature"),
-            vol.Optional(
-                CONF_LOFT_SINCE, description=_suggest(defaults.get(CONF_LOFT_SINCE))
-            ): selector.DateSelector(),
-            vol.Optional(
-                CONF_LOFT_HUMIDITY,
-                description=_suggest(defaults.get(CONF_LOFT_HUMIDITY)),
-            ): _entity_selector(device_class="humidity"),
             vol.Optional(
                 CONF_FLOOR_AREA, description=_suggest(defaults.get(CONF_FLOOR_AREA))
             ): selector.NumberSelector(
@@ -206,6 +199,12 @@ def _normalize_global(user_input: dict) -> dict:
 
 def _vtrv_picker_schema(allow_finish: bool = False) -> vol.Schema:
     schema: dict = {
+        vol.Required(CONF_ROOM_TYPE, default=ROOM_TYPE_CONDITIONED): (
+            selector.SelectSelector(selector.SelectSelectorConfig(options=[
+                {"value": ROOM_TYPE_CONDITIONED, "label": "Conditioned room"},
+                {"value": ROOM_TYPE_LOFT, "label": "Loft"},
+            ]))
+        ),
         vol.Optional("vtrv_climate"): selector.EntitySelector(
             selector.EntitySelectorConfig(
                 domain="climate", integration="versatile_thermostat"
@@ -272,11 +271,25 @@ def _room_details_schema(
     schema: dict = {
         vol.Required("name", description=_suggest(name)): selector.TextSelector(),
         vol.Required(
+            CONF_ROOM_TYPE,
+            default=room.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED),
+        ): selector.SelectSelector(selector.SelectSelectorConfig(options=[
+            {"value": ROOM_TYPE_CONDITIONED, "label": "Conditioned room"},
+            {"value": ROOM_TYPE_LOFT, "label": "Loft"},
+        ])),
+        vol.Required(
             CONF_TEMPERATURE, description=_suggest(room.get(CONF_TEMPERATURE))
         ): _entity_selector(device_class="temperature"),
         vol.Optional(
             CONF_HEATING_POWER, description=_suggest(room.get(CONF_HEATING_POWER))
         ): _entity_selector(),
+        vol.Optional(
+            CONF_HUMIDITY, description=_suggest(room.get(CONF_HUMIDITY))
+        ): _entity_selector(device_class="humidity"),
+        vol.Optional(
+            CONF_ASSIGNMENT_SINCE,
+            description=_suggest(room.get(CONF_ASSIGNMENT_SINCE)),
+        ): selector.DateSelector(),
     }
     if allow_remove:
         schema[vol.Optional("remove_room", default=False)] = selector.BooleanSelector()
@@ -288,9 +301,18 @@ def _room_details_schema(
 
 
 def _room_from_input(user_input: dict) -> dict:
-    room = {CONF_TEMPERATURE: user_input[CONF_TEMPERATURE]}
-    if user_input.get(CONF_HEATING_POWER):
+    room_type = user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED)
+    room = {
+        "name": user_input["name"],
+        CONF_ROOM_TYPE: room_type,
+        CONF_TEMPERATURE: user_input[CONF_TEMPERATURE],
+    }
+    if room_type == ROOM_TYPE_CONDITIONED and user_input.get(CONF_HEATING_POWER):
         room[CONF_HEATING_POWER] = user_input[CONF_HEATING_POWER]
+    if room_type == ROOM_TYPE_LOFT and user_input.get(CONF_HUMIDITY):
+        room[CONF_HUMIDITY] = user_input[CONF_HUMIDITY]
+    if room_type == ROOM_TYPE_LOFT and user_input.get(CONF_ASSIGNMENT_SINCE):
+        room[CONF_ASSIGNMENT_SINCE] = _loft_since(user_input[CONF_ASSIGNMENT_SINCE])
     return room
 
 
@@ -360,26 +382,62 @@ def _validate_room_input(
     if temp_sensor and _is_owned_entity(hass, temp_sensor):
         errors[CONF_TEMPERATURE] = "invalid_source"
     heating_power = user_input.get(CONF_HEATING_POWER)
+    room_type = user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED)
+    if room_type not in (ROOM_TYPE_CONDITIONED, ROOM_TYPE_LOFT):
+        errors[CONF_ROOM_TYPE] = "invalid_room_type"
     if heating_power:
-        if _is_owned_entity(hass, heating_power):
+        if room_type == ROOM_TYPE_LOFT:
+            errors[CONF_HEATING_POWER] = "role_not_supported"
+        elif _is_owned_entity(hass, heating_power):
             errors[CONF_HEATING_POWER] = "invalid_source"
         elif heating_power_issue(hass, heating_power):
             errors[CONF_HEATING_POWER] = "heating_power_must_be_percent"
+    humidity = user_input.get(CONF_HUMIDITY)
+    if humidity:
+        if room_type != ROOM_TYPE_LOFT:
+            errors[CONF_HUMIDITY] = "role_not_supported"
+        elif _is_owned_entity(hass, humidity):
+            errors[CONF_HUMIDITY] = "invalid_source"
+    assignment_since = user_input.get(CONF_ASSIGNMENT_SINCE)
+    if assignment_since:
+        if room_type != ROOM_TYPE_LOFT:
+            errors[CONF_ASSIGNMENT_SINCE] = "role_not_supported"
+        else:
+            try:
+                _loft_since(assignment_since)
+            except vol.Invalid:
+                errors[CONF_ASSIGNMENT_SINCE] = "invalid_date"
     return slug, errors
+
+
+def _has_loft(rooms: dict, current_id: str | None = None) -> bool:
+    return any(
+        room_id != current_id
+        and room.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
+        for room_id, room in rooms.items()
+    )
+
+
+def _has_conditioned_room(rooms: dict) -> bool:
+    return any(
+        room.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_CONDITIONED
+        for room in rooms.values()
+    )
 
 
 class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Home settings, then rooms one at a time, each optionally piggybacking
     on a Versatile Thermostat climate entity."""
 
-    # The public configuration schema is backwards compatible. History has its
-    # own versioned Store; keep rollback to the previous integration possible.
-    VERSION = 1
+    # Version 2 represents the loft as a typed room. The migration preserves the
+    # old top-level values as dated room history before setup continues.
+    VERSION = 2
 
     def __init__(self) -> None:
         self._global: dict = {}
         self._rooms: dict[str, dict] = {}
         self._pending_vtrv: str | None = None
+        self._pending_room_type = ROOM_TYPE_CONDITIONED
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -394,6 +452,9 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         if user_input is not None:
             self._pending_vtrv = user_input.get("vtrv_climate")
+            self._pending_room_type = user_input.get(
+                CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED
+            )
             return await self.async_step_room_details()
         return self.async_show_form(step_id="room", data_schema=_vtrv_picker_schema())
 
@@ -403,8 +464,21 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             slug, errors = _validate_room_input(self.hass, user_input, self._rooms)
+            if (
+                user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
+                and _has_loft(self._rooms)
+            ):
+                errors[CONF_ROOM_TYPE] = "duplicate_loft"
             if slug and not errors:
-                self._rooms[slug] = _room_from_input(user_input)
+                candidate = {**self._rooms, slug: _room_from_input(user_input)}
+                if (
+                    not user_input.get("add_another")
+                    and not _has_conditioned_room(candidate)
+                ):
+                    errors["base"] = "conditioned_room_required"
+                else:
+                    self._rooms = candidate
+            if slug and not errors:
                 if user_input.get("add_another"):
                     return await self.async_step_room()
                 return self.async_create_entry(
@@ -412,13 +486,15 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data={**self._global, CONF_ROOMS: self._rooms},
                 )
         name, temperature, heating_power = _derive_from_vtrv(
-            self.hass, self._pending_vtrv
+            self.hass,
+            self._pending_vtrv if self._pending_room_type == ROOM_TYPE_CONDITIONED else None,
         )
         return self.async_show_form(
             step_id="room_details",
             data_schema=_room_details_schema(
                 name,
-                {CONF_TEMPERATURE: temperature, CONF_HEATING_POWER: heating_power},
+                {CONF_ROOM_TYPE: self._pending_room_type,
+                 CONF_TEMPERATURE: temperature, CONF_HEATING_POWER: heating_power},
                 ask_add_another=True,
             ),
             errors=errors,
@@ -429,7 +505,8 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         """Migrate an existing `thermal_efficiency:` YAML block."""
         return self.async_create_entry(
-            title="Thermal Efficiency (from YAML)", data=import_config
+            title="Thermal Efficiency (from YAML)",
+            data=migrate_legacy_loft_config(self.hass, import_config),
         )
 
     @staticmethod
@@ -451,6 +528,7 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         self._pending_rooms: list[tuple[str, dict]] = []
         self._current_room: tuple[str | None, dict | None] = (None, None)
         self._pending_vtrv: str | None = None
+        self._pending_room_type = ROOM_TYPE_CONDITIONED
         self._revision: int | None = None
         self._change = None
 
@@ -503,10 +581,20 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         errors = {}
         if user_input is not None:
             try:
+                source = history.data["sources"][user_input["source"]]
+                if source["role"] not in room_roles(
+                    history.config["rooms"][user_input["room"]]
+                ):
+                    raise ValueError("role_not_supported")
                 self._change = ("async_correct", [user_input["source"], user_input["room"],
                                                  timestamp(user_input["effective_time"])], self._revision)
                 return await self.async_step_confirm()
-            except (ValueError, KeyError):
+            except ValueError as err:
+                if str(err) == "role_not_supported":
+                    errors["base"] = "role_not_supported"
+                else:
+                    errors["base"] = "invalid_correction"
+            except KeyError:
                 errors["base"] = "invalid_correction"
         self._revision = history.data["revision"]
         return self.async_show_form(step_id="resolve", errors=errors, data_schema=vol.Schema({
@@ -530,6 +618,16 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             if user_input["source"] in owned:
                 errors["base"] = "invalid_source"
+            elif (
+                user_input["room"] not in history.config["rooms"]
+                or user_input["role"]
+                not in room_roles(history.config["rooms"][user_input["room"]])
+            ):
+                errors["base"] = "role_not_supported"
+            elif user_input["role"] == CONF_HEATING_POWER and heating_power_issue(
+                self.hass, user_input["source"]
+            ):
+                errors["base"] = "heating_power_must_be_percent"
             else:
                 self._change = ("async_replace", [user_input["room"], user_input["role"], user_input["source"]], self._revision)
                 return await self.async_step_confirm()
@@ -538,7 +636,9 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
             vol.Required("room"): selector.SelectSelector(selector.SelectSelectorConfig(options=[
                 {"value": rid, "label": history.data["rooms"][rid]["name"]} for rid in history.config["rooms"]])),
             vol.Required("role"): selector.SelectSelector(selector.SelectSelectorConfig(options=[
-                {"value": "temperature", "label": "Temperature"}, {"value": "heating_power", "label": "Heating demand (%)"}])),
+                {"value": "temperature", "label": "Temperature"},
+                {"value": "heating_power", "label": "Heating demand (%)"},
+                {"value": "humidity", "label": "Humidity"}])),
             vol.Required("source"): _entity_selector(exclude_entities=sorted(owned)),
         }))
 
@@ -602,10 +702,30 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
                 pending_rooms=self._pending_rooms,
             )
             slug, errors = _validate_room_input(self.hass, user_input, other_slugs)
+            other_rooms = dict(self._rooms)
+            other_rooms.update(dict(self._pending_rooms))
+            if (
+                user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
+                and _has_loft(other_rooms, self._current_room[0])
+            ):
+                errors[CONF_ROOM_TYPE] = "duplicate_loft"
             if slug and not errors:
                 # Display names may change; established room identity never does.
                 room_id = self._current_room[0] or slug
-                self._rooms[room_id] = {**_room_from_input(user_input), "name": user_input["name"]}
+                updated = {
+                    **_room_from_input(user_input),
+                    "name": user_input["name"],
+                }
+                if (
+                    updated[CONF_ROOM_TYPE] == ROOM_TYPE_LOFT
+                    and CONF_ASSIGNMENT_SINCE not in user_input
+                    and self._current_room[1]
+                    and self._current_room[1].get(CONF_ASSIGNMENT_SINCE)
+                ):
+                    updated[CONF_ASSIGNMENT_SINCE] = self._current_room[1][
+                        CONF_ASSIGNMENT_SINCE
+                    ]
+                self._rooms[room_id] = updated
                 return await self._async_advance_room()
         name, room = self._current_room
         return self.async_show_form(
@@ -627,8 +747,17 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
                         data_schema=_vtrv_picker_schema(allow_finish=True),
                         errors={"base": "at_least_one_room"},
                     )
+                if not _has_conditioned_room(self._rooms):
+                    return self.async_show_form(
+                        step_id="new_room",
+                        data_schema=_vtrv_picker_schema(allow_finish=True),
+                        errors={"base": "conditioned_room_required"},
+                    )
                 return self._async_finish()
             self._pending_vtrv = user_input.get("vtrv_climate")
+            self._pending_room_type = user_input.get(
+                CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED
+            )
             return await self.async_step_new_room_details()
         return self.async_show_form(
             step_id="new_room", data_schema=_vtrv_picker_schema(allow_finish=True)
@@ -641,19 +770,33 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             other_slugs = _other_room_slugs(self._rooms)
             slug, errors = _validate_room_input(self.hass, user_input, other_slugs)
+            if (
+                user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
+                and _has_loft(self._rooms)
+            ):
+                errors[CONF_ROOM_TYPE] = "duplicate_loft"
             if slug and not errors:
-                self._rooms[slug] = _room_from_input(user_input)
-                if user_input.get("add_another"):
-                    return await self.async_step_new_room()
-                return self._async_finish()
+                candidate = {**self._rooms, slug: _room_from_input(user_input)}
+                if (
+                    not user_input.get("add_another")
+                    and not _has_conditioned_room(candidate)
+                ):
+                    errors["base"] = "conditioned_room_required"
+                else:
+                    self._rooms = candidate
+                    if user_input.get("add_another"):
+                        return await self.async_step_new_room()
+                    return self._async_finish()
         name, temperature, heating_power = _derive_from_vtrv(
-            self.hass, self._pending_vtrv
+            self.hass,
+            self._pending_vtrv if self._pending_room_type == ROOM_TYPE_CONDITIONED else None,
         )
         return self.async_show_form(
             step_id="new_room_details",
             data_schema=_room_details_schema(
                 name,
-                {CONF_TEMPERATURE: temperature, CONF_HEATING_POWER: heating_power},
+                {CONF_ROOM_TYPE: self._pending_room_type,
+                 CONF_TEMPERATURE: temperature, CONF_HEATING_POWER: heating_power},
                 ask_add_another=True,
             ),
             errors=errors,
@@ -663,6 +806,8 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         history = self._history()
         if history and self._revision != history.data["revision"]:
             return self.async_abort(reason="assignments_changed")
+        if not _has_conditioned_room(self._rooms):
+            return self.async_abort(reason="conditioned_room_required")
         self.hass.config_entries.async_update_entry(
             self.config_entry, data={**self._global, CONF_ROOMS: self._rooms}
         )

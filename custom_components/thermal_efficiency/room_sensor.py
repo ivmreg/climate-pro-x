@@ -21,6 +21,8 @@ class RoomSourceSensor(SensorEntity):
         self._attr_native_unit_of_measurement = "°C" if binding.role == "temperature" else "%"
         if binding.role == "temperature":
             self._attr_device_class = SensorDeviceClass.TEMPERATURE
+        elif binding.role == "humidity":
+            self._attr_device_class = SensorDeviceClass.HUMIDITY
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, f"{manager.entry.entry_id}:room:{binding.room_id}")},
             name=manager.data["rooms"][binding.room_id]["name"],

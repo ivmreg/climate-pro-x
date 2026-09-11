@@ -21,7 +21,14 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-from .assignments import GLOBAL_INPUTS, ROLES, configured_inputs, identity, timestamp
+from .assignments import (
+    GLOBAL_INPUTS,
+    ROLES,
+    analysis_configuration,
+    configured_inputs,
+    identity,
+    timestamp,
+)
 from .const import DOMAIN
 from .thermal_math import compute_all
 
@@ -383,11 +390,10 @@ class HistoryMigrator:
     async def _verify_model_parity(self, cutoff):
         """Evaluate both copies on the same date, mappings, units and window."""
         migration = self.data["migration"]
-        config = deepcopy(migration["configuration"])
-        config["gas_unit_rate"] = config["electricity_unit_rate"] = None
-        if config.get("loft_since"):
-            config["loft_since"] = dt_util.parse_date(config["loft_since"])
-        days = int(config.get("max_window_days", 365))
+        raw_config = deepcopy(migration["configuration"])
+        raw_config["gas_unit_rate"] = raw_config["electricity_unit_rate"] = None
+        owned_raw_config = deepcopy(raw_config)
+        days = int(raw_config.get("max_window_days", 365))
         start = cutoff - timedelta(days=days * 2)
         units = {"temperature": "°C", "energy": "kWh", "volume": "L"}
         sources = migration["sources"]
@@ -400,21 +406,27 @@ class HistoryMigrator:
         for sid, record in sources.items():
             if canonical(original[sid]) != canonical(owned[record["statistic_id"]]):
                 raise ValueError("Source changed or disappeared during preservation")
-        baseline = await self.hass.async_add_executor_job(
-            compute_all, original, config, dt_util.get_default_time_zone(), cutoff, (days,)
-        )
-        owned_config = deepcopy(config)
-        for key in GLOBAL_INPUTS:
-            val = owned_config.get(key)
+        for key in (*GLOBAL_INPUTS, "loft", "loft_humidity"):
+            val = owned_raw_config.get(key)
             if isinstance(val, str) and val in sources:
-                owned_config[key] = sources[val]["statistic_id"]
+                owned_raw_config[key] = sources[val]["statistic_id"]
             elif isinstance(val, list):
-                owned_config[key] = [sources.get(x, {}).get("statistic_id", x) for x in val]
-        for room in owned_config.get("rooms", {}).values():
+                owned_raw_config[key] = [
+                    sources.get(x, {}).get("statistic_id", x) for x in val
+                ]
+        for room in owned_raw_config.get("rooms", {}).values():
             for role in ROLES:
                 val = room.get(role)
                 if val and val in sources:
                     room[role] = sources[val]["statistic_id"]
+        config = analysis_configuration(raw_config)
+        owned_config = analysis_configuration(owned_raw_config)
+        for prepared in (config, owned_config):
+            if prepared.get("loft_since") and isinstance(prepared["loft_since"], str):
+                prepared["loft_since"] = dt_util.parse_date(prepared["loft_since"])
+        baseline = await self.hass.async_add_executor_job(
+            compute_all, original, config, dt_util.get_default_time_zone(), cutoff, (days,)
+        )
         preserved = await self.hass.async_add_executor_job(
             compute_all, owned, owned_config, dt_util.get_default_time_zone(), cutoff, (days,)
         )

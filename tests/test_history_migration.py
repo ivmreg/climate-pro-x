@@ -238,24 +238,41 @@ async def test_verify_model_parity_rewrites_config_to_owned_ids(recorder_mock, h
     config = {
         "outdoor": "sensor.out",
         "gas_meter": "sensor.gas",
-        "rooms": {"office": {"temperature": "sensor.room", "heating_power": "sensor.heat"}},
+        "rooms": {
+            "office": {
+                "temperature": "sensor.room",
+                "heating_power": "sensor.heat",
+            },
+            "loft": {
+                "room_type": "loft",
+                "temperature": "sensor.loft",
+                "humidity": "sensor.loft_humidity",
+                "assignment_since": base.date().isoformat(),
+            },
+        },
     }
     meta_out = {"source": "recorder", "statistic_id": "sensor.out", "name": "Out", "unit_of_measurement": "°C", "has_sum": False, "mean_type": StatisticMeanType.ARITHMETIC, "unit_class": "temperature"}
     meta_gas = {"source": "recorder", "statistic_id": "sensor.gas", "name": "Gas", "unit_of_measurement": "kWh", "has_sum": True, "mean_type": StatisticMeanType.ARITHMETIC, "unit_class": "energy"}
     meta_room = {"source": "recorder", "statistic_id": "sensor.room", "name": "Room", "unit_of_measurement": "°C", "has_sum": False, "mean_type": StatisticMeanType.ARITHMETIC, "unit_class": "temperature"}
     meta_heat = {"source": "recorder", "statistic_id": "sensor.heat", "name": "Heat", "unit_of_measurement": "%", "has_sum": False, "mean_type": StatisticMeanType.ARITHMETIC, "unit_class": None}
+    meta_loft = {**meta_room, "statistic_id": "sensor.loft", "name": "Loft"}
+    meta_humidity = {"source": "recorder", "statistic_id": "sensor.loft_humidity", "name": "Loft humidity", "unit_of_measurement": "%", "has_sum": False, "mean_type": StatisticMeanType.ARITHMETIC, "unit_class": None}
 
     stats = [{"start": cutoff - timedelta(hours=1), "mean": 10.0, "sum": 5.0}]
     async_import_statistics(hass, meta_out, stats)
     async_import_statistics(hass, meta_gas, stats)
     async_import_statistics(hass, meta_room, stats)
     async_import_statistics(hass, meta_heat, stats)
+    async_import_statistics(hass, meta_loft, stats)
+    async_import_statistics(hass, meta_humidity, stats)
 
     # Import identical stats for the owned external statistics
     async_add_external_statistics(hass, {**meta_out, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:out"}, stats)
     async_add_external_statistics(hass, {**meta_gas, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:gas"}, stats)
     async_add_external_statistics(hass, {**meta_room, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:room"}, stats)
     async_add_external_statistics(hass, {**meta_heat, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:heat"}, stats)
+    async_add_external_statistics(hass, {**meta_loft, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:loft"}, stats)
+    async_add_external_statistics(hass, {**meta_humidity, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:loft_humidity"}, stats)
     await committed(hass)
 
     entry = MockConfigEntry(domain="thermal_efficiency", data=config)
@@ -265,6 +282,8 @@ async def test_verify_model_parity_rewrites_config_to_owned_ids(recorder_mock, h
     manifest["sources"]["sensor.gas"]["statistic_id"] = "thermal_efficiency:gas"
     manifest["sources"]["sensor.room"]["statistic_id"] = "thermal_efficiency:room"
     manifest["sources"]["sensor.heat"]["statistic_id"] = "thermal_efficiency:heat"
+    manifest["sources"]["sensor.loft"]["statistic_id"] = "thermal_efficiency:loft"
+    manifest["sources"]["sensor.loft_humidity"]["statistic_id"] = "thermal_efficiency:loft_humidity"
 
     data = {"migration": manifest, "streams": {}, "rooms": {}}
     migrator = HistoryMigrator(hass, entry, data, AsyncMock())
@@ -282,11 +301,17 @@ async def test_verify_model_parity_rewrites_config_to_owned_ids(recorder_mock, h
     # Baseline used original config
     assert captured_configs[0]["outdoor"] == "sensor.out"
     assert captured_configs[0]["rooms"]["office"]["temperature"] == "sensor.room"
+    assert set(captured_configs[0]["rooms"]) == {"office"}
+    assert captured_configs[0]["loft"] == "sensor.loft"
+    assert captured_configs[0]["loft_humidity"] == "sensor.loft_humidity"
+    assert captured_configs[0]["loft_since"] == base.date()
     # Preserved run used rewritten config with owned statistic IDs
     assert captured_configs[1]["outdoor"] == "thermal_efficiency:out"
     assert captured_configs[1]["rooms"]["office"]["temperature"] == "thermal_efficiency:room"
     assert captured_configs[1]["rooms"]["office"]["heating_power"] == "thermal_efficiency:heat"
     assert captured_configs[1]["gas_meter"] == "thermal_efficiency:gas"
+    assert captured_configs[1]["loft"] == "thermal_efficiency:loft"
+    assert captured_configs[1]["loft_humidity"] == "thermal_efficiency:loft_humidity"
 
 
 async def test_snapshot_inventory_fails_if_source_is_lost_before_copy(recorder_mock, hass):

@@ -7,7 +7,13 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_HEATING_POWER, CONF_ROOMS, DOMAIN
+from .const import (
+    CONF_HEATING_POWER,
+    CONF_ROOMS,
+    CONF_ROOM_TYPE,
+    DOMAIN,
+    ROOM_TYPE_CONDITIONED,
+)
 from .coordinator import ThermalCoordinator
 from .thermal_math import TAU_MIN_NIGHTS
 
@@ -43,7 +49,9 @@ async def async_setup_entry(
         WaterUsageSensor(coordinator),
     ]
     entities += [
-        RoomTauSensor(coordinator, room) for room in coordinator.conf["rooms"]
+        RoomTauSensor(coordinator, room)
+        for room, spec in coordinator.conf["rooms"].items()
+        if spec.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_CONDITIONED
     ]
     from .room_sensor import HistoryStatusSensor
     entities.append(HistoryStatusSensor(coordinator, runtime.history))

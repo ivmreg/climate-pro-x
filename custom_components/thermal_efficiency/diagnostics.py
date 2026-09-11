@@ -5,14 +5,18 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
+from .const import CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED
+
 
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict:
     runtime = entry.runtime_data
     history = runtime.history.data
+    configured_rooms = getattr(runtime.history, "config", entry.data).get("rooms", {})
     migration = history.get("migration", {})
     return {
+        "configuration_schema_version": entry.version,
         "history_schema_version": history.get("version"),
         "history_revision": history.get("revision"),
         "migration": {
@@ -23,6 +27,18 @@ async def async_get_config_entry_diagnostics(
             "parity_verified": migration.get("parity_verified", False),
         },
         "rooms": len(history.get("rooms", {})),
+        "room_types": {
+            room_type: sum(
+                room.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == room_type
+                for room in configured_rooms.values()
+            )
+            for room_type in sorted(
+                {
+                    room.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED)
+                    for room in configured_rooms.values()
+                }
+            )
+        },
         "sources": len(history.get("sources", {})),
         "streams": [
             {
