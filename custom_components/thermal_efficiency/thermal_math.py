@@ -758,7 +758,8 @@ def water_usage_summary(water_sum: Series, tz: tzinfo, since, until) -> dict | N
 
 
 def night_taus(
-    room: Series, outdoor: Series, heating: Series | None, tz: tzinfo, since
+    room: Series, outdoor: Series, heating: Series | None, tz: tzinfo, since,
+    expected_intervals: list[dict] | None = None,
 ) -> list[dict]:
     """One exponential-decay fit per usable night."""
     nights: dict = defaultdict(list)
@@ -773,11 +774,22 @@ def night_taus(
             continue
         if any(b - a > TAU_MAX_GAP_S for a, b in zip(hours, hours[1:])):
             continue
-        if heating is not None:
-            h_vals = [heating[ts] for ts in hours if ts in heating]
+        if expected_intervals is None:
+            expected_hours = hours
+        else:
+            expected_hours = [
+                ts for ts in hours
+                if any(
+                    (v.get("start") is None or ts >= v["start"])
+                    and (v.get("end") is None or ts + 3600 <= v["end"])
+                    for v in expected_intervals
+                )
+            ]
+        if heating is not None and expected_hours:
+            h_vals = [heating[ts] for ts in expected_hours if ts in heating]
             # Missing heating observations are not evidence that the radiator
             # stayed off. Require at least 80% coverage when configured.
-            if len(h_vals) / len(hours) < 0.8 or max(h_vals) > TAU_MAX_HEATING_PCT:
+            if len(h_vals) / len(expected_hours) < 0.8 or max(h_vals) > TAU_MAX_HEATING_PCT:
                 continue
         if any(ts not in outdoor for ts in hours):
             continue
@@ -988,6 +1000,35 @@ def compute_all(
     outdoor_by_day = daily_mean(outdoor, tz)
     water_by_day = daily_water_litres(water, tz)
     heat_pct_by_day = daily_heating_pct(list(room_heat.values()), tz)
+    excluded_days = set(conf.get("excluded_model_days", []))
+    if any("heating_expected_intervals" in spec for spec in room_confs.values()):
+        # A configured-but-missing radiator is not evidence of heating off.
+        # Expectations are dated, so adding a radiator never invalidates years
+        # before it existed. Incomplete expected days cannot enter any fallback.
+        observed = defaultdict(list)
+        expected_hours = defaultdict(int)
+        for ts in outdoor:
+            expected_rooms = [name for name, spec in room_confs.items() if any(
+                (v.get("start") is None or ts >= v["start"])
+                and (v.get("end") is None or ts + 3600 <= v["end"])
+                for v in spec.get("heating_expected_intervals", [])
+            )]
+            if expected_rooms:
+                day = _local(ts, tz).date()
+                expected_hours[day] += 1
+                if all(ts in room_heat.get(name, {}) for name in expected_rooms):
+                    observed[day].append(max(room_heat[name][ts] for name in expected_rooms))
+        heat_pct_by_day = {}
+        for day, count in expected_hours.items():
+            values = observed[day]
+            if len(values) < max(18, count * 0.8):
+                excluded_days.add(day.isoformat())
+            else:
+                heat_pct_by_day[day] = sum(values) / len(values)
+    for by_day in (q_by_day, dt_by_day, heat_pct_by_day):
+        for day in list(by_day):
+            if day.isoformat() in excluded_days:
+                del by_day[day]
     # General rolling window for usage/context metrics. The heating model gets
     # a separate window below, anchored to the latest evidenced heating day so
     # summer data cannot move it.
@@ -1405,9 +1446,13 @@ def compute_all(
 
     for name, temps in room_temp.items():
         result["rooms"][name] = None
+        room_excluded = set(room_confs[name].get("excluded_model_days") if "excluded_model_days" in room_confs[name] else excluded_days)
         for window in windows_days:
             since = (now - timedelta(days=window)).astimezone(tz).date()
-            fits = night_taus(temps, outdoor, room_heat.get(name), tz, since)
+            safe_temps = {ts: value for ts, value in temps.items()
+                          if _local(ts, tz).date().isoformat() not in room_excluded}
+            fits = night_taus(safe_temps, outdoor, room_heat.get(name), tz, since,
+                             room_confs[name].get("heating_expected_intervals"))
             if len(fits) >= TAU_MIN_NIGHTS:
                 taus = sorted(f["tau_hours"] for f in fits)
                 result["rooms"][name] = {

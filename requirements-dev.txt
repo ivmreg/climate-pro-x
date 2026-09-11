@@ -1,4 +1,6 @@
 -r requirements.txt
 pytest>=9,<10
 pytest-cov>=5,<8
-pytest-homeassistant-custom-component>=0.13.316,<0.14
+# These fixture releases pin HA 2026.2.3 and 2026.9.1 respectively.
+pytest-homeassistant-custom-component==0.13.316; python_version < "3.14"
+pytest-homeassistant-custom-component==0.13.364; python_version >= "3.14"

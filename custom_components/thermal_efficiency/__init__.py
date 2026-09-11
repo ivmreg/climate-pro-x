@@ -3,6 +3,7 @@ computed from the recorder's long-term statistics."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import voluptuous as vol
 
 import homeassistant.helpers.config_validation as cv
@@ -38,6 +39,8 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import ThermalCoordinator
+from .history import RoomHistoryManager
+from .thermal_math import compute_all
 
 PLATFORMS = ["sensor"]
 
@@ -125,17 +128,36 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+@dataclass(slots=True)
+class ThermalRuntime:
+    coordinator: ThermalCoordinator
+    history: RoomHistoryManager
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    coordinator = ThermalCoordinator(hass, dict(entry.data))
-    await coordinator.async_config_entry_first_refresh()
-    entry.runtime_data = coordinator
+    history = RoomHistoryManager(hass, entry, dict(entry.data))
+    await history.async_initialize()
+    coordinator = ThermalCoordinator(hass, dict(entry.data), history)
+    # Recorder availability or a slow archive must not delay live capture.
+    initial_config = dict(entry.data)
+    if initial_config.get(CONF_LOFT_SINCE):
+        initial_config[CONF_LOFT_SINCE] = dt_util.parse_date(
+            initial_config[CONF_LOFT_SINCE]
+        )
+    coordinator.async_set_updated_data(compute_all(
+        {}, initial_config, dt_util.get_default_time_zone(), dt_util.utcnow(), (365,)
+    ))
+    entry.runtime_data = ThermalRuntime(coordinator, history)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unloaded:
+        await entry.runtime_data.history.async_shutdown()
+    return unloaded
 
 
 async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:

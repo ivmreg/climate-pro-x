@@ -27,7 +27,8 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: ThermalCoordinator = entry.runtime_data
+    runtime = entry.runtime_data
+    coordinator: ThermalCoordinator = runtime.coordinator
     entities: list[SensorEntity] = [
         HlcSensor(coordinator),
         LoftSensor(coordinator),
@@ -44,7 +45,10 @@ async def async_setup_entry(
     entities += [
         RoomTauSensor(coordinator, room) for room in coordinator.conf["rooms"]
     ]
+    from .room_sensor import HistoryStatusSensor
+    entities.append(HistoryStatusSensor(coordinator, runtime.history))
     async_add_entities(entities)
+    await runtime.history.async_setup_platform(async_add_entities, coordinator)
 
 
 class ThermalSensor(CoordinatorEntity[ThermalCoordinator], SensorEntity):

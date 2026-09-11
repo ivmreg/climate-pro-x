@@ -8,6 +8,7 @@ reviewed/edited) before offering to add new ones."""
 from __future__ import annotations
 
 from typing import Any
+from datetime import UTC, datetime
 
 import voluptuous as vol
 
@@ -18,6 +19,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import selector
 from homeassistant.util import slugify
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_BOILER_EFFICIENCY,
@@ -46,10 +48,15 @@ from .const import (
     DOMAIN,
 )
 from .validation import heating_power_issue
+from .assignments import timestamp
 
 
 def _entity_selector(**kwargs: Any) -> selector.EntitySelector:
     return selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", **kwargs))
+
+
+def _display_time(value):
+    return datetime.fromtimestamp(value, UTC).astimezone(dt_util.get_default_time_zone()).isoformat() if value is not None else "Retained legacy history"
 
 
 def _suggest(value: Any) -> dict:
@@ -287,22 +294,77 @@ def _room_from_input(user_input: dict) -> dict:
     return room
 
 
-def _validate_room_name(name: str, taken: dict) -> tuple[str | None, dict[str, str]]:
+def _is_owned_entity(hass: HomeAssistant, entity_id: str | None) -> bool:
+    if not entity_id or not isinstance(entity_id, str):
+        return False
+    reg_entry = er.async_get(hass).async_get(entity_id)
+    if reg_entry and reg_entry.platform == DOMAIN:
+        return True
+    if entity_id.startswith(f"sensor.{DOMAIN}_"):
+        return True
+    if DOMAIN in hass.data:
+        for entry_val in hass.data[DOMAIN].values():
+            mgr = getattr(entry_val, "history", None)
+            if mgr is None and isinstance(entry_val, dict):
+                mgr = entry_val.get("history")
+            if mgr and hasattr(mgr, "_is_owned_entity") and mgr._is_owned_entity(entity_id):
+                return True
+    return False
+
+
+def _other_room_slugs(
+    rooms: dict,
+    current_id: str | None = None,
+    pending_rooms: list | None = None,
+) -> set[str]:
+    slugs = set()
+    for rid, r in rooms.items():
+        if current_id is not None and rid == current_id:
+            continue
+        slugs.add(rid)
+        if isinstance(r, dict) and r.get("name"):
+            slugs.add(slugify(r["name"]))
+    if pending_rooms:
+        for item in pending_rooms:
+            rid = item[0] if isinstance(item, (tuple, list)) else item
+            r = item[1] if isinstance(item, (tuple, list)) and len(item) > 1 else {}
+            if current_id is not None and rid == current_id:
+                continue
+            slugs.add(rid)
+            if isinstance(r, dict) and r.get("name"):
+                slugs.add(slugify(r["name"]))
+    return slugs
+
+
+def _validate_room_name(name: str, taken: set[str] | dict) -> tuple[str | None, dict[str, str]]:
     slug = slugify(name)
     if not slug:
         return None, {"name": "invalid_name"}
-    if slug in taken:
+    if isinstance(taken, dict):
+        taken_slugs = set(taken.keys())
+        for r in taken.values():
+            if isinstance(r, dict) and r.get("name"):
+                taken_slugs.add(slugify(r["name"]))
+    else:
+        taken_slugs = set(taken)
+    if slug in taken_slugs:
         return None, {"name": "duplicate_room"}
     return slug, {}
 
 
 def _validate_room_input(
-    hass: HomeAssistant, user_input: dict, taken: dict
+    hass: HomeAssistant, user_input: dict, taken: set[str] | dict
 ) -> tuple[str | None, dict[str, str]]:
     slug, errors = _validate_room_name(user_input["name"], taken)
+    temp_sensor = user_input.get(CONF_TEMPERATURE)
+    if temp_sensor and _is_owned_entity(hass, temp_sensor):
+        errors[CONF_TEMPERATURE] = "invalid_source"
     heating_power = user_input.get(CONF_HEATING_POWER)
-    if heating_power and heating_power_issue(hass, heating_power):
-        errors[CONF_HEATING_POWER] = "heating_power_must_be_percent"
+    if heating_power:
+        if _is_owned_entity(hass, heating_power):
+            errors[CONF_HEATING_POWER] = "invalid_source"
+        elif heating_power_issue(hass, heating_power):
+            errors[CONF_HEATING_POWER] = "heating_power_must_be_percent"
     return slug, errors
 
 
@@ -310,6 +372,8 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Home settings, then rooms one at a time, each optionally piggybacking
     on a Versatile Thermostat climate entity."""
 
+    # The public configuration schema is backwards compatible. History has its
+    # own versioned Store; keep rollback to the previous integration possible.
     VERSION = 1
 
     def __init__(self) -> None:
@@ -387,19 +451,136 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         self._pending_rooms: list[tuple[str, dict]] = []
         self._current_room: tuple[str | None, dict | None] = (None, None)
         self._pending_vtrv: str | None = None
+        self._revision: int | None = None
+        self._change = None
+
+    def _history(self):
+        runtime = getattr(self.config_entry, "runtime_data", None)
+        return getattr(runtime, "history", None)
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
+        if user_input is None and self._history():
+            return self.async_show_menu(step_id="init", menu_options=["settings", "replace", "history", "resolve", "correct_visit"])
+        return await self.async_step_settings(user_input)
+
+    async def async_step_settings(self, user_input=None):
         if user_input is not None:
             self._global = _normalize_global(user_input)
+            history = self._history()
+            self._revision = history.data["revision"] if history else None
             self._pending_rooms = list(
-                self.config_entry.data.get(CONF_ROOMS, {}).items()
+                (history.current_rooms() if history else self.config_entry.data.get(CONF_ROOMS, {})).items()
             )
             return await self._async_advance_room()
         return self.async_show_form(
-            step_id="init", data_schema=_global_schema(self.config_entry.data)
+            step_id="settings", data_schema=_global_schema(self.config_entry.data)
         )
+
+    async def async_step_history(self, user_input=None):
+        if user_input is not None:
+            return await self.async_step_init()
+        history = self._history()
+        migration = history.data["migration"]
+        lines = [f"History migration: {migration['status']}"]
+        for room in history.data["rooms"].values():
+            lines.append(f"\n{room['name']}")
+            for visit in room["visits"]:
+                stream = history.data["streams"].get(visit.get("stream"))
+                source = history.data["sources"][stream["source_id"]]["entity_id"] if stream else "No source — gap"
+                start = _display_time(visit.get("start"))
+                end = _display_time(visit["end"]) if visit.get("end") else "present"
+                lines.append(f"{visit['role']}: {source}; {start} → {end}")
+        return self.async_show_form(step_id="history", data_schema=vol.Schema({}),
+                                    description_placeholders={"history": "\n\n".join(lines)})
+
+    async def async_step_resolve(self, user_input=None):
+        history = self._history()
+        pending = {sid: s for sid, s in history.data["sources"].items() if s.get("pending") and not s.get("missing")}
+        if not pending:
+            return self.async_abort(reason="no_pending_moves")
+        errors = {}
+        if user_input is not None:
+            try:
+                self._change = ("async_correct", [user_input["source"], user_input["room"],
+                                                 timestamp(user_input["effective_time"])], self._revision)
+                return await self.async_step_confirm()
+            except (ValueError, KeyError):
+                errors["base"] = "invalid_correction"
+        self._revision = history.data["revision"]
+        return self.async_show_form(step_id="resolve", errors=errors, data_schema=vol.Schema({
+            vol.Required("source"): selector.SelectSelector(selector.SelectSelectorConfig(
+                options=[{"value": sid, "label": s["entity_id"]} for sid, s in pending.items()])),
+            vol.Required("room"): selector.SelectSelector(selector.SelectSelectorConfig(
+                options=[{"value": rid, "label": history.data["rooms"][rid]["name"]} for rid in history.config["rooms"]])),
+            vol.Required("effective_time"): selector.TextSelector(),
+        }))
+
+    async def async_step_replace(self, user_input=None):
+        history = self._history()
+        ent_reg = er.async_get(self.hass)
+        owned = {e.entity_id for e in ent_reg.entities.values() if e.platform == DOMAIN}
+        if history:
+            for s in history.data.get("streams", {}).values():
+                if s.get("entity_id"):
+                    owned.add(s["entity_id"])
+                owned.update(s.get("aliases", []))
+        errors = {}
+        if user_input is not None:
+            if user_input["source"] in owned:
+                errors["base"] = "invalid_source"
+            else:
+                self._change = ("async_replace", [user_input["room"], user_input["role"], user_input["source"]], self._revision)
+                return await self.async_step_confirm()
+        self._revision = history.data["revision"]
+        return self.async_show_form(step_id="replace", errors=errors, data_schema=vol.Schema({
+            vol.Required("room"): selector.SelectSelector(selector.SelectSelectorConfig(options=[
+                {"value": rid, "label": history.data["rooms"][rid]["name"]} for rid in history.config["rooms"]])),
+            vol.Required("role"): selector.SelectSelector(selector.SelectSelectorConfig(options=[
+                {"value": "temperature", "label": "Temperature"}, {"value": "heating_power", "label": "Heating demand (%)"}])),
+            vol.Required("source"): _entity_selector(exclude_entities=sorted(owned)),
+        }))
+
+    async def async_step_correct_visit(self, user_input=None):
+        history = self._history()
+        options = [{"value": v["id"], "label": f"{room['name']} / {v['role']} / {_display_time(v.get('start'))} → {_display_time(v['end'])}"}
+                   for room in history.data["rooms"].values() for v in room["visits"] if v.get("end") is not None]
+        if not options:
+            return self.async_abort(reason="no_closed_visits")
+        errors = {}
+        if user_input is not None:
+            try:
+                self._change = ("async_edit_visit", [user_input["visit"], timestamp(user_input["start"]),
+                    timestamp(user_input["end"]), user_input.get("exclude", False)], self._revision)
+                return await self.async_step_confirm()
+            except ValueError:
+                errors["base"] = "invalid_correction"
+        self._revision = history.data["revision"]
+        return self.async_show_form(step_id="correct_visit", errors=errors, data_schema=vol.Schema({
+            vol.Required("visit"): selector.SelectSelector(selector.SelectSelectorConfig(options=options)),
+            vol.Required("start"): selector.TextSelector(), vol.Required("end"): selector.TextSelector(),
+            vol.Optional("exclude", default=False): selector.BooleanSelector(),
+        }))
+
+    async def async_step_confirm(self, user_input=None):
+        method, args, revision = self._change
+        if user_input is not None:
+            try:
+                await getattr(self._history(), method)(*args, revision)
+                return self.async_create_entry(title="", data={})
+            except (ValueError, KeyError, StopIteration):
+                return self.async_abort(reason="change_not_applied")
+        # The preview uses the submitted values, never silently refreshed defaults.
+        history = self._history()
+        if method == "async_correct":
+            preview = f"Assign {history.data['sources'][args[0]]['entity_id']} to {history.data['rooms'][args[1]]['name']} from {_display_time(args[2])}. Unobserved hours remain gaps."
+        elif method == "async_replace":
+            preview = f"Use {args[2]} for {args[1].replace('_', ' ')} in {history.data['rooms'][args[0]]['name']} from confirmation time. The previous assignment ends; its history stays preserved."
+        else:
+            preview = f"Correct this completed visit to {_display_time(args[1])} → {_display_time(args[2])}. Exclude from analysis: {args[3]}. Recorded observations stay unchanged."
+        return self.async_show_form(step_id="confirm", data_schema=vol.Schema({}),
+            description_placeholders={"change": preview})
 
     async def _async_advance_room(self) -> config_entries.ConfigFlowResult:
         if self._pending_rooms:
@@ -415,9 +596,16 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             if user_input.get("remove_room"):
                 return await self._async_advance_room()
-            slug, errors = _validate_room_input(self.hass, user_input, self._rooms)
+            other_slugs = _other_room_slugs(
+                self._rooms,
+                current_id=self._current_room[0],
+                pending_rooms=self._pending_rooms,
+            )
+            slug, errors = _validate_room_input(self.hass, user_input, other_slugs)
             if slug and not errors:
-                self._rooms[slug] = _room_from_input(user_input)
+                # Display names may change; established room identity never does.
+                room_id = self._current_room[0] or slug
+                self._rooms[room_id] = {**_room_from_input(user_input), "name": user_input["name"]}
                 return await self._async_advance_room()
         name, room = self._current_room
         return self.async_show_form(
@@ -451,7 +639,8 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
     ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            slug, errors = _validate_room_input(self.hass, user_input, self._rooms)
+            other_slugs = _other_room_slugs(self._rooms)
+            slug, errors = _validate_room_input(self.hass, user_input, other_slugs)
             if slug and not errors:
                 self._rooms[slug] = _room_from_input(user_input)
                 if user_input.get("add_another"):
@@ -471,6 +660,9 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         )
 
     def _async_finish(self) -> config_entries.ConfigFlowResult:
+        history = self._history()
+        if history and self._revision != history.data["revision"]:
+            return self.async_abort(reason="assignments_changed")
         self.hass.config_entries.async_update_entry(
             self.config_entry, data={**self._global, CONF_ROOMS: self._rooms}
         )

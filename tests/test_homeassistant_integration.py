@@ -25,6 +25,8 @@ from custom_components.thermal_efficiency.const import (
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
     CONF_HEATING_POWER,
+    CONF_LOFT,
+    CONF_LOFT_SINCE,
     CONF_MAX_WINDOW_DAYS,
     CONF_OUTDOOR,
     CONF_OUTDOOR_CO2_SENSOR,
@@ -38,7 +40,7 @@ from custom_components.thermal_efficiency.validation import heating_power_issue
 
 
 @pytest.fixture(autouse=True)
-def _enable_custom_integrations(enable_custom_integrations):
+def _enable_custom_integrations(recorder_db_url, enable_custom_integrations):
     """Allow Home Assistant to discover this repository's custom integration."""
 
 
@@ -245,3 +247,301 @@ async def test_options_entry_can_hold_legacy_scalar_co2(hass):
 
     coordinator = ThermalCoordinator(hass, dict(entry.data))
     assert "sensor.bedroom_co2" in coordinator._statistic_ids()
+
+
+async def test_complete_entry_setup_captures_and_unloads(recorder_mock, hass, monkeypatch):
+    from unittest.mock import AsyncMock
+    from homeassistant.helpers import entity_registry as er
+    from custom_components.thermal_efficiency.history_migration import HistoryMigrator
+    from custom_components.thermal_efficiency.diagnostics import async_get_config_entry_diagnostics
+
+    monkeypatch.setattr(HistoryMigrator, "run", AsyncMock())
+    entry = MockConfigEntry(domain=DOMAIN, data=_config(), version=1)
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.version == 1  # public config remains compatible with rollback
+    manager = entry.runtime_data.history
+    await manager._migration_task
+    binding = manager.bindings()[0]
+    hass.states.async_set(binding.source_entity_id, "20", {"unit_of_measurement": "°C"})
+    await hass.async_block_till_done()
+    assert hass.states.get(binding.entity_id).state == "20.0"
+    assert len(er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)) == 14
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    assert diagnostics["archive_rows"] == {"raw": 0, "5minute": 0, "hour": 0}
+    assert binding.source_entity_id not in str(diagnostics)
+    # Compile a real hour of unchanged reports on the owned SensorEntity.
+    from freezegun import freeze_time
+    from homeassistant.util import dt as dt_util
+    from homeassistant.components.recorder.tasks import StatisticsTask, ClearStatisticsTask
+    from custom_components.thermal_efficiency.history_migration import HistoryMigrator, committed
+    base = dt_util.utcnow().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    for index in range(12):
+        beginning = base + timedelta(minutes=5 * index)
+        with freeze_time(beginning):
+            hass.states.async_set(binding.source_entity_id, "22", {"unit_of_measurement": "°C"})
+            await hass.async_block_till_done()
+            await committed(hass)
+        with freeze_time(beginning + timedelta(minutes=5)):
+            recorder_mock.queue_task(StatisticsTask(beginning, False))
+            await committed(hass)
+    migrator = HistoryMigrator(hass, entry, manager.data, manager._save)
+    rows = await migrator.query(binding.entity_id, base, base + timedelta(hours=1), "hour")
+    assert len(rows) == 1
+    assert rows[0]["mean"] == 22
+    hass.states.async_remove(binding.source_entity_id)
+    recorder_mock.queue_task(ClearStatisticsTask(None, [binding.source_entity_id]))
+    await committed(hass)
+    assert await migrator.query(binding.entity_id, base, base + timedelta(hours=1), "hour") == rows
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert manager._stopping
+
+
+async def test_entry_setup_normalizes_loft_since(recorder_mock, hass, monkeypatch):
+    """Stored JSON dates must be converted before the initial calculation."""
+    from datetime import date
+    from unittest.mock import AsyncMock
+
+    from custom_components.thermal_efficiency.history_migration import HistoryMigrator
+
+    monkeypatch.setattr(HistoryMigrator, "run", AsyncMock())
+    config = _config() | {
+        CONF_LOFT: "sensor.loft_temperature",
+        CONF_LOFT_SINCE: "2026-01-02",
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=1)
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.runtime_data.coordinator.data["loft"] is None
+    assert isinstance(entry.runtime_data.coordinator.conf[CONF_LOFT_SINCE], str)
+    assert date.fromisoformat(entry.runtime_data.coordinator.conf[CONF_LOFT_SINCE])
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_history_options_preserve_room_identity_and_reject_stale_form(hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass = hass
+    flow.handler = entry.entry_id
+    menu = await flow.async_step_init()
+    assert "history" in menu["menu_options"]
+    history = await flow.async_step_history()
+    assert "sensor.living_temperature" in history["description_placeholders"]["history"]
+    assert (await flow.async_step_resolve())["reason"] == "no_pending_moves"
+    await flow.async_step_settings(config)
+    await flow.async_step_room({"name": "Renamed living room", "temperature": "sensor.replacement"})
+    assert "living_room" in flow._rooms
+    assert flow._rooms["living_room"]["name"] == "Renamed living room"
+    manager.data["revision"] += 1
+    assert flow._async_finish()["reason"] == "assignments_changed"
+
+
+async def test_replacement_options_preview_before_write(recorder_mock, hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass, flow.handler = hass, entry.entry_id
+    await flow.async_step_replace()
+    revision = manager.data["revision"]
+    hass.states.async_set("sensor.new", "19", {"unit_of_measurement": "°C"})
+    preview = await flow.async_step_replace({"room": "living_room", "role": "temperature", "source": "sensor.new"})
+    assert preview["step_id"] == "confirm"
+    assert "sensor.new" in preview["description_placeholders"]["change"]
+    assert manager.data["revision"] == revision
+    assert (await flow.async_step_confirm({}))["type"] is FlowResultType.CREATE_ENTRY
+    assert manager.current_rooms()["living_room"]["temperature"] == "sensor.new"
+    await manager.async_shutdown()
+
+
+async def test_replacement_rejects_owned_entities(hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+
+    binding = manager.bindings()[0]
+    # Set valid state on the owned entity to prove the rejection is due to ownership, not observation
+    hass.states.async_set(binding.entity_id, "20", {"unit_of_measurement": "°C"})
+
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass, flow.handler = hass, entry.entry_id
+    form = await flow.async_step_replace({"room": "living_room", "role": "temperature", "source": binding.entity_id})
+    assert form["type"] is FlowResultType.FORM
+    assert form["errors"]["base"] == "invalid_source"
+
+    with pytest.raises(ValueError, match="invalid_source"):
+        await manager.async_replace("living_room", "temperature", binding.entity_id, manager.data["revision"])
+
+    await manager.async_shutdown()
+
+
+async def test_history_status_sensor_live_updates(hass):
+    from unittest.mock import MagicMock
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+    from custom_components.thermal_efficiency.room_sensor import HistoryStatusSensor
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    coordinator = MagicMock()
+    sensor = HistoryStatusSensor(coordinator, manager)
+    sensor.hass = hass
+    sensor.entity_id = "sensor.history_status"
+
+    await sensor.async_added_to_hass()
+    assert sensor in manager._status_sensors
+
+    manager.data["migration"]["status"] = "copying"
+    manager._publish_migration_status()
+    assert sensor.native_value == "copying"
+
+    manager.data["migration"]["status"] = "complete"
+    manager._publish_migration_status()
+    assert sensor.native_value == "complete"
+
+    await sensor.async_will_remove_from_hass()
+    assert sensor not in manager._status_sensors
+    await manager.async_shutdown()
+
+
+def test_room_source_sensor_has_force_update():
+    from unittest.mock import MagicMock
+    from custom_components.thermal_efficiency.room_sensor import RoomSourceSensor
+
+    binding = MagicMock(id="s123456", entity_id="sensor.s", role="temperature", room_id="r1")
+    manager = MagicMock(
+        data={"streams": {"s123456": {"unique_id": "u1"}}, "rooms": {"r1": {"name": "Room 1"}}},
+        entry=MagicMock(entry_id="e1"),
+    )
+    sensor = RoomSourceSensor(manager, binding)
+    assert sensor.force_update is True
+
+
+async def test_config_and_options_flows_reject_owned_entities(recorder_mock, hass):
+    from types import SimpleNamespace
+    from homeassistant import config_entries
+    from homeassistant.helpers import entity_registry as er
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+
+    # Register an owned entity with platform == DOMAIN
+    ent_reg = er.async_get(hass)
+    owned = ent_reg.async_get_or_create("sensor", DOMAIN, "owned_sensor_unique", suggested_object_id="owned_sensor")
+
+    # 1. Config flow room details
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"outdoor": "sensor.outdoor"}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {"name": "Room 1", "temperature": owned.entity_id, "add_another": False},
+    )
+    assert result["type"] == "form"
+    assert result["errors"]["temperature"] == "invalid_source"
+
+    # 2. Options flow room editing
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass = hass
+    flow.handler = entry.entry_id
+    await flow.async_step_init()
+    await flow.async_step_settings(config)
+    res = await flow.async_step_room({"name": "Living Room", "temperature": owned.entity_id})
+    assert res["type"] == "form"
+    assert res["errors"]["temperature"] == "invalid_source"
+    await manager.async_shutdown()
+
+
+async def test_options_flow_rejects_duplicate_display_name_when_renaming(hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+
+    # Two rooms: room_1 (Living Room) and room_2 (Bedroom)
+    config = {
+        "outdoor": "sensor.outdoor",
+        "rooms": {
+            "room_1": {"name": "Living Room", "temperature": "sensor.living"},
+            "room_2": {"name": "Bedroom", "temperature": "sensor.bed"},
+        },
+    }
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass = hass
+    flow.handler = entry.entry_id
+    await flow.async_step_init()
+    await flow.async_step_settings(config)
+
+    # Renaming room_1 to "Bedroom" (which collides with room_2) must fail
+    res = await flow.async_step_room({"name": "Bedroom", "temperature": "sensor.living"})
+    assert res["type"] == "form"
+    assert res["errors"]["name"] == "duplicate_room"
+
+    # Keeping the same name "Living Room" succeeds
+    res_ok = await flow.async_step_room({"name": "Living Room", "temperature": "sensor.living"})
+    assert res_ok["type"] == "form"
+    assert res_ok["step_id"] == "room"  # advances to next room (room_2)
+    await manager.async_shutdown()
+
+
+async def test_diagnostics_verified_hourly_chunks_counts_only_hour_kind(hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.diagnostics import async_get_config_entry_diagnostics
+
+    entry = MockConfigEntry(domain=DOMAIN, data=_config())
+    history_data = {
+        "migration": {
+            "sources": {
+                "sensor.a": {
+                    "statistic_id": "sensor.a",
+                    "chunks": {
+                        "raw_1": {"kind": "raw", "verified": True, "count": 10},
+                        "5m_1": {"kind": "5minute", "verified": True, "count": 12},
+                        "hour_1": {"kind": "hour", "verified": True, "count": 24},
+                        "hour_2": {"kind": "hour", "verified": False, "count": 24},
+                    }
+                }
+            }
+        }
+    }
+    entry.runtime_data = SimpleNamespace(history=SimpleNamespace(data=history_data))
+    diag = await async_get_config_entry_diagnostics(hass, entry)
+    # Even though raw_1 and 5m_1 are verified, only hour_1 is verified of kind 'hour'
+    assert diag["verified_hourly_chunks"] == 1
