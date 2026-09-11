@@ -20,6 +20,8 @@ Considered approaches:
 
 User-confirmed operating convention: whenever a sensor physically moves, Igor reassigns it to the corresponding Home Assistant Area. Therefore an observed effective Area reassignment is the authoritative move signal. Implement automatic dated assignments from those events, with a manual history/correction workflow as recovery. No confirmation dialog is required for an ordinary unambiguous move observed while the integration is running. Scope the first release to room temperature and heating-power sources; reserve the same primitives for later outdoor, loft, humidity and CO2 source histories. Keep the existing `loft_since` behavior intact. This first release must not claim to solve relocation for those other source roles.
 
+Version 0.7 completes the reserved loft follow-up: loft temperature and humidity now use the same room/source/visit primitives. The thermal calculation still treats a Loft room as the building's loft input, while configuration, Area moves, replacement and history retention follow the common room path. The version-2 config migration converts the old top-level loft fields and reuses the version-0.6 archives; `loft_since` becomes the first dated Loft visit.
+
 Example: Room A used sensor X until 10 September at 14:30, then sensor Y. The room uses X's eligible statistics before the change and Y's afterwards. If X moves to Room B, B receives only X's post-move readings. Replacing hardware while retaining the same entity ID still creates a new assignment boundary.
 
 ## Product behavior

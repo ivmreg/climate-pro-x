@@ -128,7 +128,7 @@ long-term statistics — no tokens, no polling, no pip requirements.
 Analysis entities update every 6 h under the "Thermal Efficiency" device.
 
 Room inputs are protected by integration-owned history streams. On the first
-0.6.x startup, retained hourly statistics for **all configured inputs** are copied
+0.6.x or later startup, retained hourly statistics for **all configured inputs** are copied
 into climate-pro-x's own statistics and read back to verify every timestamp and
 value, including cumulative sums, meter states, reset times, and original units.
 Retained raw states (with attributes) and five-minute statistics are also saved
@@ -136,7 +136,11 @@ in immutable, checksummed archive chunks under HA's integration storage. Those
 archives preserve their original resolution; the supported recorder import API
 exposes the copied hourly statistics for analysis. Original records are untouched.
 Live room measurements are mirrored into a separate recorder sensor for each
-source/room/role combination and grouped under a stable room device.
+source/room/role combination and grouped under a stable room device. From 0.7,
+the loft is a typed room in this same system: its temperature and optional
+humidity sources use the same dated visits, owned streams, Area moves, gaps,
+replacements and corrections as conditioned-room sensors. Only the analysis
+stage distinguishes the loft because it models different building physics.
 
 When a tracked source is physically moved and its effective Home Assistant Area
 is changed, the old stream stops and the source begins a dated stream in the
@@ -170,10 +174,11 @@ data cannot be treated as evidence of heating being off. A room that previously
 had heating-demand data retains that expectation when its sensor moves away.
 
 Back up HA configuration and recorder before upgrading, including the
-integration's storage archives. Existing analysis entity IDs and the public
-config-entry version stay unchanged, allowing a code rollback. Rolling back
-does not delete the added archive or recorder streams. History purged before
-the upgrade cannot be recovered. Keep the owned sensors included in recorder;
+integration's storage archives. Existing analysis entity IDs stay unchanged.
+Version 0.7 migrates the config entry to schema version 2, so rollback to 0.6
+requires restoring its matching configuration and database backup; replacing
+the integration files alone is insufficient. History purged before the upgrade
+cannot be recovered. Keep the owned sensors included in recorder;
 normal recorder retention still applies to new raw/five-minute measurements,
 and manually deleting owned statistics removes those live records.
 
@@ -196,11 +201,9 @@ and manually deleting owned statistics removes those live records.
   80% heating-power coverage when that source is configured.
 - `sensor.thermal_efficiency_loft_ratio` — ceiling-vs-roof loss split from
   cold nights; robust to flatlined (dead-battery) sensors, plus a
-  `humidity_pct` attribute if `loft_humidity` is configured. If your loft
-  sensor was ever relocated (moved into the loft from somewhere else), set
-  `loft_since` to the move date so its earlier, non-loft readings are
-  ignored — a sensor that merely sat somewhere else warm won't necessarily
-  flatline, so this isn't caught automatically otherwise.
+  `humidity_pct` attribute if the Loft room has a humidity source. The 0.7
+  migration converts the former `loft_since` date into the first Loft visit,
+  so earlier readings stay archived but are not attributed to the loft.
 - `sensor.thermal_efficiency_hot_water_gas` — non-space-heating gas (hot water,
   plus any gas cooking/pilot), kWh/day, from a robust heating-off baseline.
   Heating-off days come from the rooms' heating-power statistics where they
@@ -255,13 +258,13 @@ and manually deleting owned statistics removes those live records.
 2. Restart Home Assistant so it picks up the new integration.
 3. **Settings → Devices & Services → Add Integration → "Thermal
    Efficiency".** The setup wizard is:
-   - One form for whole-home sensors: outdoor, gas meter, loft (+
-     `loft_since`/`loft_humidity`), floor area, ceiling height, a CO2
+   - One form for whole-home sensors: outdoor, gas meter, floor area, ceiling height, a CO2
      sensor, a water statistic (+ the away-day litres threshold), a gas
      tariff sensor, an electricity meter and tariff, and boiler efficiency
      (everything past the gas meter is optional — see the metrics table
      above for what each unlocks).
-   - Then, per room: pick an existing **Versatile Thermostat climate
+   - Then, per room: choose a conditioned room or the loft. For a conditioned
+     room, pick an existing **Versatile Thermostat climate
      entity** to auto-fill that room's name (from its Area) and
      temperature sensor (its EMA sensor — same device as the climate
      entity), or leave it blank to enter everything by hand. A
@@ -269,7 +272,9 @@ and manually deleting owned statistics removes those live records.
      exactly one unambiguous candidate in that area. It must report a
      percentage with values from 0 to 100; incompatible sources are rejected
      rather than interpreted as demand. Check "Add another room" to keep
-     going, uncheck it once you've added the last one.
+      going, uncheck it once you've added the last one. For the loft, select
+      its temperature and optional humidity sensors directly. One loft and at
+      least one conditioned room are required for the corresponding analyses.
 
    Sensors appear within a minute of finishing the wizard (first
    computation runs over up to a year of statistics). To change anything
@@ -288,9 +293,6 @@ matches `config.yaml` in this repo:
 thermal_efficiency:
   gas_meter: sensor.smart_meter_gas_import
   outdoor: sensor.sonoff_outdoor_sensor_temperature
-  loft: sensor.portable_sensor_temperature
-  loft_since: "2026-07-03"  # ignore this sensor's history before its move into the loft
-  loft_humidity: sensor.portable_sensor_humidity
   floor_area_m2: 105
   ceiling_height_m: 2.45
   co2:
@@ -310,7 +312,15 @@ thermal_efficiency:
   electricity_unit_rate: sensor.smart_meter_electricity_import_unit_rate
   boiler_efficiency: 0.88
   rooms:
+    loft:
+      name: Loft
+      room_type: loft
+      temperature: sensor.portable_sensor_temperature
+      humidity: sensor.portable_sensor_humidity
+      assignment_since: "2026-07-03"  # first dated visit; earlier readings stay unassigned
     living_room:
+      name: Living room
+      room_type: conditioned
       temperature: sensor.living_room_vtrv_ema_temperature
       heating_power: sensor.living_room_heating_power
     bedroom:
@@ -329,6 +339,21 @@ thermal_efficiency:
       temperature: sensor.office_vtrv_ema_temperature
       heating_power: sensor.office_heating_power
 ```
+
+### Version 0.7 migration notes
+
+- Legacy top-level `loft`, `loft_humidity` and `loft_since` settings migrate
+  automatically into a typed Loft room. Existing conditioned rooms gain the
+  `conditioned` type without changing their stable room IDs.
+- The prior loft temperature and humidity archives are reused. The original
+  0.6 cutover and the 0.7 room conversion are bridged, while `loft_since`
+  remains the first attributed Loft visit, so no valid history is dropped or
+  reassigned to the wrong location.
+- Loft sources now follow the same Home Assistant Area reassignment,
+  replacement, correction and integration-owned stream behavior as all other
+  room sources.
+- Restore the matching pre-upgrade configuration and database backup when
+  rolling back to 0.6, because 0.6 does not understand schema version 2.
 
 ### Version 0.4 migration notes
 

@@ -38,6 +38,7 @@ async def manager(hass):
     ("unknown", "°C", "temperature", None), ("20", None, "temperature", None),
     ("10", "W", "heating_power", None), ("101", "%", "heating_power", None),
     ("-1", "%", "heating_power", None), ("0", "%", "heating_power", 0),
+    ("45", "%", "humidity", 45), ("101", "%", "humidity", None),
 ])
 def test_observation_units(value, unit, role, expected):
     assert observation(State("sensor.test", value, {"unit_of_measurement": unit}), role) == expected

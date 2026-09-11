@@ -197,13 +197,17 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             "excluded_model_days": prepared.get("excluded_model_days", []),
             "outdoor": self.conf[CONF_OUTDOOR],
             "gas_meter": self.conf.get(CONF_GAS_METER),
-            "loft": self.conf.get(CONF_LOFT),
+            "loft": prepared.get(CONF_LOFT, self.conf.get(CONF_LOFT)),
             "loft_since": (
-                dt_util.parse_date(self.conf[CONF_LOFT_SINCE])
+                prepared.get(CONF_LOFT_SINCE)
+                if CONF_LOFT_SINCE in prepared
+                else dt_util.parse_date(self.conf[CONF_LOFT_SINCE])
                 if self.conf.get(CONF_LOFT_SINCE)
                 else None
             ),
-            "loft_humidity": self.conf.get(CONF_LOFT_HUMIDITY),
+            "loft_humidity": prepared.get(
+                CONF_LOFT_HUMIDITY, self.conf.get(CONF_LOFT_HUMIDITY)
+            ),
             "floor_area_m2": self.conf.get(CONF_FLOOR_AREA),
             "co2": self.conf.get(CONF_CO2),
             "outdoor_co2_ppm": self.conf.get(CONF_OUTDOOR_CO2),

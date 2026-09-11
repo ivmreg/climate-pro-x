@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from math import isfinite
 
 from homeassistant.components.recorder import get_instance
@@ -23,8 +23,21 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
-from .assignments import GLOBAL_INPUTS, ROLES, compose, identity, validate_visits
-from .const import DOMAIN, HISTORY_STORE_KEY, HISTORY_STORE_VERSION
+from .assignments import (
+    GLOBAL_INPUTS, ROLES, compose, identity, room_roles, validate_visits,
+)
+from .const import (
+    CONF_ASSIGNMENT_SINCE,
+    CONF_LOFT,
+    CONF_LOFT_HUMIDITY,
+    CONF_ROOM_TYPE,
+    DOMAIN,
+    HISTORY_DATA_VERSION,
+    HISTORY_STORE_KEY,
+    HISTORY_STORE_VERSION,
+    ROOM_TYPE_CONDITIONED,
+    ROOM_TYPE_LOFT,
+)
 from .history_migration import HistoryMigrator, migration_manifest
 
 
@@ -54,6 +67,18 @@ def observation(state, role):
         return value if isfinite(value) else None
     except (ValueError, TypeError, HomeAssistantError):
         return None
+
+
+def assignment_timestamp(value) -> float | None:
+    """Convert a configured local calendar date to its UTC timestamp."""
+    if not value:
+        return None
+    day = dt_util.parse_date(str(value))
+    if day is None:
+        raise ValueError("Invalid assignment start date")
+    return datetime.combine(
+        day, time.min, tzinfo=dt_util.get_default_time_zone()
+    ).timestamp()
 
 
 class RoomHistoryManager:
@@ -205,11 +230,12 @@ class RoomHistoryManager:
         self._started_at = now
         stored = await self.store.async_load()
         self.data = stored or {
-            "version": HISTORY_STORE_VERSION, "revision": 0, "rooms": {},
+            "version": HISTORY_DATA_VERSION, "revision": 0, "rooms": {},
             "sources": {}, "streams": {}, "configured": {},
             "original_config": deepcopy(self.config),
             "migration": migration_manifest(self.config, self.entry.entry_id, now),
         }
+        self.data["version"] = HISTORY_DATA_VERSION
         last = self.data.get("last_verified", now)
         for sid in self.data["streams"]:
             self._gap(sid, last)
@@ -235,9 +261,11 @@ class RoomHistoryManager:
                             room_area_id = a.id
                             break
                 room["area_id"] = room_area_id or self._area(spec["temperature"])
+            allowed_roles = room_roles(spec)
             for role in ROLES:
-                current = spec.get(role)
-                if current == previous.get(rid, {}).get(role):
+                current = spec.get(role) if role in allowed_roles else None
+                previous_spec = previous.get(rid, {})
+                if current == previous_spec.get(role):
                     continue
                 if current:
                     if self._is_owned_entity(current):
@@ -245,6 +273,41 @@ class RoomHistoryManager:
                     source = self._source(current, role)
                     if any(v.get("end") is None and self.data["streams"].get(v.get("stream"), {}).get("source_id") == source["id"]
                            for v in room["visits"]):
+                        continue
+                    is_loft = (
+                        spec.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED)
+                        == ROOM_TYPE_LOFT
+                    )
+                    legacy_key = (
+                        CONF_LOFT if role == "temperature" else CONF_LOFT_HUMIDITY
+                    )
+                    original_config = self.data.get("original_config", {})
+                    legacy_loft_upgrade = bool(
+                        stored
+                        and previous_spec.get(
+                            CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED
+                        ) != ROOM_TYPE_LOFT
+                        and original_config.get(legacy_key) == current
+                    )
+                    if is_loft and (not stored or legacy_loft_upgrade):
+                        effective = assignment_timestamp(spec.get(CONF_ASSIGNMENT_SINCE))
+                        self._assign(
+                            source,
+                            rid,
+                            effective if effective is not None else now,
+                            "loft_migration",
+                            legacy=effective is None,
+                        )
+                        if (
+                            legacy_loft_upgrade
+                            and current in self.data.get("migration", {}).get("sources", {})
+                        ):
+                            active = next(
+                                v for v in room["visits"]
+                                if v.get("end") is None and v.get("stream")
+                                and self.data["streams"][v["stream"]]["source_id"] == source["id"]
+                            )
+                            self.data["streams"][active["stream"]]["legacy_bridge_end"] = now
                         continue
                     sensor_area = self._area(current)
                     if not stored and room.get("area_id") is not None and sensor_area != room.get("area_id"):
@@ -398,7 +461,10 @@ class RoomHistoryManager:
             if source.get("missing") == missing and source.get("pending") and area == source["area_id"]:
                 continue
             start = when if offline_since is None else offline_since
-            dest = by_area.get(area, [])
+            dest = [
+                rid for rid in by_area.get(area, [])
+                if source["role"] in room_roles(self.config["rooms"][rid])
+            ]
             source.update(area_id=area, missing=missing)
             pending = offline_since is not None or missing or len(dest) != 1
             source["pending"] = {"since": start, "observed": when} if pending else None
@@ -491,7 +557,7 @@ class RoomHistoryManager:
         rooms = deepcopy(self.config["rooms"])
         for rid, spec in rooms.items():
             spec["name"] = self.data["rooms"][rid]["name"]
-            for role in ROLES:
+            for role in room_roles(spec):
                 active = [v for v in self.data["rooms"][rid]["visits"] if v["role"] == role and v.get("end") is None]
                 if active:
                     stream = self.data["streams"].get(active[0].get("stream"))
@@ -522,7 +588,12 @@ class RoomHistoryManager:
             if not source:
                 raise ValueError("invalid_source")
             pending = source.get("pending")
-            if room_id not in self.config["rooms"] or source.get("missing") or not pending or not isfinite(effective) or not pending["since"] <= effective <= self._now():
+            if (
+                room_id not in self.config["rooms"]
+                or source["role"] not in room_roles(self.config["rooms"][room_id])
+                or source.get("missing") or not pending or not isfinite(effective)
+                or not pending["since"] <= effective <= self._now()
+            ):
                 raise ValueError("invalid_time")
             if any(v.get("end") is None and v["role"] == source["role"] and v.get("start") is not None and v["start"] > effective
                    for v in self.data["rooms"][room_id]["visits"]):
@@ -557,7 +628,10 @@ class RoomHistoryManager:
         async with self._lock:
             if revision != self.data["revision"]:
                 raise ValueError("stale_revision")
-            if room_id not in self.config["rooms"] or role not in ROLES:
+            if (
+                room_id not in self.config["rooms"]
+                or role not in room_roles(self.config["rooms"][room_id])
+            ):
                 raise ValueError("invalid_selection")
             if self._is_owned_entity(entity_id) or observation(self.hass.states.get(entity_id), role) is None:
                 raise ValueError("invalid_source")
