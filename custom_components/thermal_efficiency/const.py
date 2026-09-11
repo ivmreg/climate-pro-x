@@ -28,6 +28,13 @@ DEFAULT_MIN_DHW_WATER_L = 50.0
 EXPANDING_WINDOWS_DAYS = (60, 120, 365)
 UPDATE_INTERVAL_HOURS = 6
 
+# Versioned room-history storage.  These keys deliberately do not replace the
+# public room configuration: the latter remains backwards compatible while the
+# history journal owns attribution over time.
+HISTORY_STORE_VERSION = 1
+HISTORY_STORE_KEY = f"{DOMAIN}.room_history"
+CONF_HISTORY_ENABLED = "history_enabled"
+
 # The heating model is anchored to the latest qualifying heating day. Fetching
 # only one model window relative to "now" makes its oldest heating data slide
 # away during summer, so the coordinator retrieves one additional window.

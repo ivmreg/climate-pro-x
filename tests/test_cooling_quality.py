@@ -33,6 +33,14 @@ def test_tau_fit_recovers_dynamic_cooling_parameter(thermal_math):
     assert all(abs(fit["tau_hours"] - 15.0) <= 0.25 for fit in fits)
 
 
+def test_heating_added_later_preserves_earlier_cooling(thermal_math):
+    room, outdoor, _ = _cooling_series()
+    added = datetime(2026, 1, 3, tzinfo=timezone.utc).timestamp()
+    fits = thermal_math.night_taus(room, outdoor, {}, timezone.utc, date(2026, 1, 1),
+                                   [{"start": added, "end": None}])
+    assert [f["date"] for f in fits] == ["2026-01-01", "2026-01-02"]
+
+
 def test_tau_pinned_at_the_search_bound_is_not_reported(thermal_math):
     """A room that barely cools fits best at the top of the tau search range.
     That is the range talking, not the building: the night bounds tau from
@@ -97,7 +105,7 @@ def test_compute_all_withholds_tau_with_only_two_nights(thermal_math, monkeypatc
 def test_out_of_range_heating_history_is_filtered(thermal_math, monkeypatch):
     captured = {}
 
-    def _capture_heating(room, outdoor, heating, tz, since):
+    def _capture_heating(room, outdoor, heating, tz, since, expected_intervals=None):
         captured["heating"] = heating
         return []
 

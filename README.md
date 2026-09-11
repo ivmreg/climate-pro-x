@@ -125,7 +125,57 @@ canonicalise older cache files.
 same (validated) maths live inside HA, straight from the recorder's
 long-term statistics — no tokens, no polling, no pip requirements.
 
-Entities (updated every 6 h, all under one "Thermal Efficiency" device):
+Analysis entities update every 6 h under the "Thermal Efficiency" device.
+
+Room inputs are protected by integration-owned history streams. On the first
+0.6.x startup, retained hourly statistics for **all configured inputs** are copied
+into climate-pro-x's own statistics and read back to verify every timestamp and
+value, including cumulative sums, meter states, reset times, and original units.
+Retained raw states (with attributes) and five-minute statistics are also saved
+in immutable, checksummed archive chunks under HA's integration storage. Those
+archives preserve their original resolution; the supported recorder import API
+exposes the copied hourly statistics for analysis. Original records are untouched.
+Live room measurements are mirrored into a separate recorder sensor for each
+source/room/role combination and grouped under a stable room device.
+
+When a tracked source is physically moved and its effective Home Assistant Area
+is changed, the old stream stops and the source begins a dated stream in the
+configured room associated with the destination Area. Earlier readings remain
+with the old room. Moving the device's Area has no effect when the entity has an
+explicit Area override. A virtual thermostat EMA remains tied to that virtual
+entity; moving an upstream physical sensor does not reconfigure the thermostat.
+
+The background migration resumes after interruption. The diagnostic history
+migration sensor and integration options show its status; download diagnostics
+for counts by resolution. Finalization waits until six minutes after the next
+hour boundary so the recorder can finish the bridge hour. Until verification
+succeeds, retained legacy inputs remain available for historical analysis.
+
+Use **Configure → Replace a room sensor** to replace a source;
+the change starts a new dated assignment without rewriting earlier history.
+Renaming a room keeps its stable identity. **Room assignment history** shows
+visits and gaps. A return to an earlier room reuses the original pair sensor.
+Re-selecting the same source in the replacement flow explicitly starts a new
+hardware generation. **Correct a completed visit** adjusts its analytical bounds
+or excludes it, retaining the original observations and recorded assignment audit.
+Incoming moves replace that room's selected source for the same role. Unknown
+or ambiguous Areas require resolution; arbitrary new sensors are not adopted.
+An Area change detected after downtime is held for **Resolve a move while
+offline**, where you provide the destination and effective timestamp.
+
+Fresh reports are required after a move or restart. Missing, invalid, disabled,
+excluded, or silent-for-24-hours inputs become gaps. Partial transition hours
+and transition dates are excluded from thermal models; missing expected heating
+data cannot be treated as evidence of heating being off. A room that previously
+had heating-demand data retains that expectation when its sensor moves away.
+
+Back up HA configuration and recorder before upgrading, including the
+integration's storage archives. Existing analysis entity IDs and the public
+config-entry version stay unchanged, allowing a code rollback. Rolling back
+does not delete the added archive or recorder streams. History purged before
+the upgrade cannot be recovered. Keep the owned sensors included in recorder;
+normal recorder retention still applies to new raw/five-minute measurements,
+and manually deleting owned statistics removes those live records.
 
 - `sensor.thermal_efficiency_heat_loss_coefficient` — delivered W/K over the
   full window after available DHW and boiler-efficiency corrections, with

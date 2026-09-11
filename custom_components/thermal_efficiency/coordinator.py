@@ -43,12 +43,13 @@ from .const import (
     UPDATE_INTERVAL_HOURS,
 )
 from .validation import heating_power_issue
+from .history import RoomHistoryManager
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class ThermalCoordinator(DataUpdateCoordinator[dict]):
-    def __init__(self, hass: HomeAssistant, conf: dict) -> None:
+    def __init__(self, hass: HomeAssistant, conf: dict, history: RoomHistoryManager | None = None) -> None:
         super().__init__(
             hass,
             _LOGGER,
@@ -56,6 +57,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             update_interval=timedelta(hours=UPDATE_INTERVAL_HOURS),
         )
         self.conf = conf
+        self.history = history
 
     def _statistic_ids(self) -> set[str]:
         ids = {self.conf[CONF_OUTDOOR]}
@@ -76,10 +78,13 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             ids.add(self.conf[CONF_WATER])
         if self.conf.get(CONF_ELECTRICITY_METER):
             ids.add(self.conf[CONF_ELECTRICITY_METER])
-        for room in self.conf[CONF_ROOMS].values():
-            ids.add(room[CONF_TEMPERATURE])
-            if room.get(CONF_HEATING_POWER):
-                ids.add(room[CONF_HEATING_POWER])
+        if self.history:
+            ids.update(self.history.statistic_ids())
+        else:
+            for room in self.conf[CONF_ROOMS].values():
+                ids.add(room[CONF_TEMPERATURE])
+                if room.get(CONF_HEATING_POWER):
+                    ids.add(room[CONF_HEATING_POWER])
         return ids
 
     def _unit_rate(self, conf_key: str, fuel: str) -> float | None:
@@ -154,7 +159,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         # statistics, so it must not run on the event loop. Tariffs are read
         # from the state machine here, before handing off to the executor.
         invalid_heating_power: dict[str, str] = {}
-        for room in self.conf[CONF_ROOMS].values():
+        for room in ([] if self.history else self.conf[CONF_ROOMS].values()):
             entity_id = room.get(CONF_HEATING_POWER)
             if not entity_id:
                 continue
@@ -171,8 +176,17 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
                     issue,
                 )
 
+        computation_stats = stats
+        room_conf = self.conf[CONF_ROOMS]
+        prepared = {}
+        if self.history:
+            computation_stats, prepared = self.history.prepare(
+                stats, self.conf, dt_util.get_default_time_zone()
+            )
+            room_conf = prepared[CONF_ROOMS]
         conf = {
-            "rooms": self.conf[CONF_ROOMS],
+            "rooms": room_conf,
+            "excluded_model_days": prepared.get("excluded_model_days", []),
             "outdoor": self.conf[CONF_OUTDOOR],
             "gas_meter": self.conf.get(CONF_GAS_METER),
             "loft": self.conf.get(CONF_LOFT),
@@ -199,7 +213,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         }
         return await self.hass.async_add_executor_job(
             thermal_math.compute_all,
-            stats,
+            computation_stats,
             conf,
             dt_util.get_default_time_zone(),
             now,

@@ -13,8 +13,8 @@ jobs:
     timeout-minutes: 10
     strategy:
       matrix:
-        # Current Home Assistant development/test dependencies target 3.13.
-        python-version: ["3.13"]
+        # Exercise both the older supported core and the current HA runtime.
+        python-version: ["3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v4

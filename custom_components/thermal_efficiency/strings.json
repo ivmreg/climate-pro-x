@@ -54,6 +54,33 @@
   "options": {
     "step": {
       "init": {
+        "title": "Thermal Efficiency",
+        "menu_options": {"settings": "Home settings", "replace": "Replace a room sensor", "history": "Room assignment history", "resolve": "Resolve a move while offline", "correct_visit": "Correct a completed visit"}
+      },
+      "replace": {
+        "title": "Replace a room sensor",
+        "description": "Select a room, measurement and source. Re-selecting the same source explicitly starts a new hardware generation. Only new reports will be captured after confirmation.",
+        "data": {"room": "Room", "role": "Measurement", "source": "Replacement sensor"}
+      },
+      "correct_visit": {
+        "title": "Correct a completed visit",
+        "description": "Enter corrected bounds as ISO timestamps with UTC offsets. Intervals must not overlap other visits. You can exclude mistaken observations from analysis without deleting recorded history.",
+        "data": {"visit": "Completed visit", "start": "Start time", "end": "End time", "exclude": "Exclude from analysis"}
+      },
+      "confirm": {
+        "title": "Review assignment change",
+        "description": "{change}"
+      },
+      "history": {
+        "title": "Room assignment history",
+        "description": "{history}"
+      },
+      "resolve": {
+        "title": "Resolve an uncertain move",
+        "description": "Choose the room and when the sensor was physically moved. Enter an ISO timestamp with a UTC offset, for example 2026-09-11T14:00:00+01:00. Unobserved readings remain gaps.",
+        "data": {"source": "Sensor", "room": "Destination room", "effective_time": "Time of move"}
+      },
+      "settings": {
         "title": "Thermal Efficiency – home settings",
         "data": {
           "outdoor": "Outdoor temperature sensor",
@@ -107,7 +134,14 @@
       "invalid_name": "Enter a room name",
       "duplicate_room": "A room with this name was already added",
       "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100",
-      "at_least_one_room": "Keep or add at least one room before finishing"
+      "at_least_one_room": "Keep or add at least one room before finishing",
+      "invalid_correction": "Choose a time between the last verified assignment and now. If assignments changed while this form was open, review and retry."
+    },
+    "abort": {
+      "no_pending_moves": "No uncertain moves need resolving.",
+      "no_closed_visits": "No completed visits are available to correct.",
+      "change_not_applied": "No change was applied. The source must have a valid reading, dates must be valid and non-overlapping, and assignments must not have changed since the preview. Reopen the form to review.",
+      "assignments_changed": "Assignments changed while these settings were open. Reopen settings to review the current rooms."
     }
   }
 }

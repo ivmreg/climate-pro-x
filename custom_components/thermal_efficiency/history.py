@@ -1,0 +1,485 @@
+"""Durable, dated assignments and recorder-backed source/room streams."""
+from __future__ import annotations
+
+import asyncio
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import timedelta
+from math import isfinite
+
+from homeassistant.components.recorder import get_instance
+from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.event import (
+    async_track_state_change_event, async_track_state_report_event,
+    async_track_time_interval,
+)
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_conversion import TemperatureConverter
+
+from .assignments import ROLES, compose, identity, validate_visits
+from .const import DOMAIN, HISTORY_STORE_KEY, HISTORY_STORE_VERSION
+from .history_migration import HistoryMigrator, migration_manifest
+
+
+@dataclass(slots=True)
+class StreamBinding:
+    id: str
+    room_id: str
+    role: str
+    source_id: str
+    source_entity_id: str
+    entity_id: str
+
+
+def observation(state, role):
+    """Reject invalid units and non-finite readings rather than guessing."""
+    if state is None:
+        return None
+    try:
+        value = float(state.state)
+        unit = state.attributes.get("unit_of_measurement")
+        if role == "temperature":
+            value = TemperatureConverter.convert(value, unit, "°C")
+        elif unit != "%" or not 0 <= value <= 100:
+            return None
+        return value if isfinite(value) else None
+    except (ValueError, TypeError, HomeAssistantError):
+        return None
+
+
+class RoomHistoryManager:
+    def __init__(self, hass, entry, config):
+        self.hass, self.entry, self.config = hass, entry, deepcopy(config)
+        self.store = Store(hass, HISTORY_STORE_VERSION, f"{HISTORY_STORE_KEY}.{entry.entry_id}")
+        self.data = {}
+        self.entities = {}
+        self.values = {}
+        self._unsubs = []
+        self._state_unsubs = []
+        self._tasks = set()
+        self._lock = asyncio.Lock()
+        self._save_lock = asyncio.Lock()
+        self._add_entities = None
+        self._coordinator = None
+        self._migration_task = None
+        self._stopping = False
+
+    @property
+    def ready(self):
+        return self.data.get("migration", {}).get("status") == "complete"
+
+    def _now(self):
+        return dt_util.utcnow().timestamp()
+
+    async def _save(self):
+        async with self._save_lock:
+            await self.store.async_save(deepcopy(self.data))
+
+    def _area(self, entity_id):
+        entity = er.async_get(self.hass).async_get(entity_id)
+        if not entity:
+            return None
+        device = dr.async_get(self.hass).async_get(entity.device_id) if entity.device_id else None
+        return entity.area_id or (device.area_id if device else None)
+
+    def _source(self, entity_id, role):
+        entity = er.async_get(self.hass).async_get(entity_id)
+        for known in self.data["sources"].values():
+            if not known.get("missing") and not known.get("retired") and known["role"] == role and (
+                entity and known["registry_id"] == entity.id
+                or not entity and known["registry_id"] is None and known["entity_id"] == entity_id
+            ):
+                return known
+        # Registry-row identity survives entity_id rename but not delete/recreate.
+        key = identity(entity.id if entity else f"unregistered:{entity_id}", role)
+        if any(self.data["sources"].get(key, {}).get(flag) for flag in ("missing", "retired")):
+            # HA may resurrect a deleted registry row. Explicit adoption starts
+            # a new generation and cannot silently resume its retired history.
+            key = identity(key, str(self.data["revision"]), "replacement")
+        return self.data["sources"].setdefault(key, {
+            "id": key, "registry_id": entity.id if entity else None,
+            "entity_id": entity_id, "role": role, "area_id": self._area(entity_id),
+        })
+
+    def _stream(self, source, room_id):
+        sid = identity(self.entry.entry_id, source["id"], room_id, source["role"])
+        if sid not in self.data["streams"]:
+            unique = f"{DOMAIN}_room_stream_{sid}"
+            entity = er.async_get(self.hass).async_get_or_create(
+                "sensor", DOMAIN, unique, config_entry=self.entry,
+                suggested_object_id=f"thermal_efficiency_{room_id}_{source['role']}_{sid[:6]}",
+            )
+            self.data["streams"][sid] = {
+                "id": sid, "unique_id": unique, "entity_id": entity.entity_id,
+                "room_id": room_id, "role": source["role"], "source_id": source["id"],
+                "original_entity_id": source["entity_id"], "coverage": [], "quarantine": [],
+            }
+        return sid
+
+    def _close(self, visit, when):
+        visit["end"] = max(when, visit.get("start") or when)
+        self._gap(visit.get("stream"), when)
+
+    def _gap(self, sid, when):
+        stream = self.data["streams"].get(sid)
+        if not stream:
+            return
+        for interval in stream["coverage"]:
+            if interval.get("end") is None:
+                interval["end"] = max(interval["start"], when)
+        self.values.pop(sid, None)
+        if not self._stopping and (entity := self.entities.get(sid)) and entity.hass:
+            entity.async_write_ha_state()
+
+    def _assign(self, source, room_id, when, cause="area_change", legacy=False):
+        role = source["role"]
+        vacated = set()
+        for rid, room in self.data["rooms"].items():
+            for visit in room["visits"]:
+                stream = self.data["streams"].get(visit.get("stream"), {})
+                if visit.get("end") is None and (
+                    stream.get("source_id") == source["id"] or rid == room_id and visit["role"] == role
+                ):
+                    self._close(visit, when)
+                    if rid != room_id:
+                        vacated.add(rid)
+        for rid in vacated:
+            self.data["rooms"][rid]["visits"].append({
+                "id": identity(rid, role, str(when), "gap"), "stream": None,
+                "role": role, "start": when, "end": None, "cause": "gap",
+                "legacy": False, "expected": True,
+            })
+        if room_id is not None:
+            sid = self._stream(source, room_id)
+            self.data["rooms"][room_id]["visits"].append({
+                "id": identity(sid, str(when), str(self.data["revision"])),
+                "stream": sid, "role": role, "start": None if legacy else when,
+                "end": None, "cause": cause, "legacy": legacy, "expected": True,
+                "provenance": "legacy_mapping_unverified" if legacy else cause,
+            })
+
+    async def async_initialize(self):
+        now = self._now()
+        stored = await self.store.async_load()
+        self.data = stored or {
+            "version": HISTORY_STORE_VERSION, "revision": 0, "rooms": {},
+            "sources": {}, "streams": {}, "configured": {},
+            "original_config": deepcopy(self.config),
+            "migration": migration_manifest(self.config, self.entry.entry_id, now),
+        }
+        last = self.data.get("last_verified", now)
+        for sid in self.data["streams"]:
+            self._gap(sid, last)
+        # Reconcile only explicit config deltas. An unchanged saved config must
+        # never undo a move already observed through the HA registry.
+        previous = self.data.get("configured", {})
+        for rid, spec in self.config["rooms"].items():
+            room = self.data["rooms"].setdefault(rid, {
+                "name": spec.get("name", rid.replace("_", " ").title()),
+                "area_id": self._area(spec["temperature"]), "visits": [],
+            })
+            room["name"] = spec.get("name", room["name"])
+            for role in ROLES:
+                current = spec.get(role)
+                if current == previous.get(rid, {}).get(role):
+                    continue
+                if current:
+                    source = self._source(current, role)
+                    if any(v.get("end") is None and self.data["streams"].get(v.get("stream"), {}).get("source_id") == source["id"]
+                           for v in room["visits"]):
+                        continue
+                    self._assign(source, rid, now,
+                                 "legacy" if not stored else "replacement", legacy=not stored)
+                else:
+                    for visit in room["visits"]:
+                        if visit["role"] == role and visit.get("end") is None:
+                            self._close(visit, now)
+        for rid in previous.keys() - self.config["rooms"].keys():
+            for visit in self.data["rooms"][rid]["visits"]:
+                if visit.get("end") is None:
+                    self._close(visit, now)
+        self.data["configured"] = deepcopy(self.config["rooms"])
+        if stored:
+            self._reconcile_registry(now, offline_since=last)
+        self.data["last_verified"] = now
+        self.data["revision"] += 1
+        await self._save()
+
+    def bindings(self):
+        return [StreamBinding(s["id"], s["room_id"], s["role"], s["source_id"],
+                              self.data["sources"][s["source_id"]]["entity_id"], s["entity_id"])
+                for s in self.data["streams"].values()]
+
+    def _stream_active(self, sid):
+        return any(v.get("stream") == sid and v.get("end") is None
+                   for r in self.data["rooms"].values() for v in r["visits"])
+
+    def register_entity(self, binding, entity):
+        self.entities[binding.id] = entity
+
+    def _publish_new(self):
+        if self._add_entities:
+            from .room_sensor import RoomSourceSensor
+            new = [RoomSourceSensor(self, b) for b in self.bindings() if b.id not in self.entities]
+            # Reserve synchronously to avoid duplicate entities on rapid moves.
+            for entity in new:
+                self.entities[entity.binding.id] = entity
+            if new:
+                self._add_entities(new)
+
+    def _spawn(self, coro):
+        task = self.hass.async_create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def async_setup_platform(self, add_entities, coordinator):
+        self._add_entities, self._coordinator = add_entities, coordinator
+        self._publish_new()
+        self._subscribe_states()
+        self._unsubs = [
+            self.hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, self._registry_changed),
+            self.hass.bus.async_listen(dr.EVENT_DEVICE_REGISTRY_UPDATED, self._registry_changed),
+            async_track_time_interval(self.hass, self._tick, timedelta(minutes=1)),
+        ]
+        # Completed migrations still need an immediate analytical refresh after
+        # restart; do not leave the startup placeholders until the six-hour tick.
+        self._spawn(coordinator.async_request_refresh())
+        self._start_migration()
+
+    def _subscribe_states(self):
+        for unsub in self._state_unsubs:
+            unsub()
+        ids = {s["entity_id"] for s in self.data["sources"].values()}
+        self._state_unsubs = [
+            async_track_state_change_event(self.hass, ids, self._state_changed),
+            async_track_state_report_event(self.hass, ids, self._state_changed),
+        ]
+
+    @callback
+    def _state_changed(self, event):
+        if self._stopping:
+            return
+        state = event.data["new_state"] if "new_state" in event.data else self.hass.states.get(event.data["entity_id"])
+        when = event.time_fired.timestamp()
+        for binding in self.bindings():
+            if binding.source_entity_id != event.data["entity_id"] or not self._stream_active(binding.id):
+                continue
+            source = self.data["sources"][binding.source_id]
+            stream = self.data["streams"][binding.id]
+            visit = next(v for r in self.data["rooms"].values() for v in r["visits"]
+                         if v.get("stream") == binding.id and v.get("end") is None)
+            if state is not None and (
+                state.attributes.get("restored")
+                or state.last_reported.timestamp() < (visit.get("start") or 0)
+                or when < stream.get("last_report", 0)
+            ):
+                continue
+            entry = er.async_get(self.hass).async_get(source["entity_id"])
+            owned_entry = er.async_get(self.hass).async_get(binding.entity_id)
+            value = observation(state, binding.role)
+            recorder = get_instance(self.hass)
+            included = (recorder.entity_filter is None or recorder.entity_filter(binding.entity_id)) and not (owned_entry and owned_entry.disabled)
+            if value is None or source.get("pending") or not included or entry and entry.disabled:
+                stream["quality"] = "excluded" if not included else "unavailable"
+                self._gap(binding.id, when)
+                continue
+            if not stream["coverage"] or stream["coverage"][-1].get("end") is not None:
+                stream["coverage"].append({"start": when, "end": None})
+            stream["last_report"] = when
+            stream["quality"] = "capturing"
+            self.values[binding.id] = value
+            if (entity := self.entities.get(binding.id)) and entity.hass:
+                entity.async_write_ha_state()
+
+    @callback
+    def _registry_changed(self, event):
+        # Mutate synchronously at the event boundary, before any subsequent
+        # reading can be attributed to yesterday's registry snapshot.
+        if self._reconcile_registry(event.time_fired.timestamp()):
+            self._spawn(self._commit_registry())
+
+    def _reconcile_registry(self, when, offline_since=None):
+        registry = er.async_get(self.hass)
+        rows = {e.id: e for e in registry.entities.values()}
+        by_area = {}
+        for rid, room in self.data["rooms"].items():
+            if rid in self.config["rooms"] and room.get("area_id"):
+                by_area.setdefault(room["area_id"], []).append(rid)
+        changed = False
+        for stream in self.data["streams"].values():
+            current = registry.async_get_entity_id("sensor", DOMAIN, stream["unique_id"])
+            if current and current != stream["entity_id"]:
+                stream.setdefault("aliases", []).append(stream["entity_id"])
+                stream["entity_id"] = current
+                changed = True
+        for source in self.data["sources"].values():
+            if source.get("missing") or source.get("retired"):
+                continue
+            row = rows.get(source["registry_id"])
+            if row and source["entity_id"] != row.entity_id:
+                source["entity_id"] = row.entity_id
+                changed = True
+            missing = source["registry_id"] is not None and row is None
+            area = self._area(source["entity_id"])
+            if area == source["area_id"] and not missing:
+                continue
+            if source.get("missing") == missing and source.get("pending") and area == source["area_id"]:
+                continue
+            start = when if offline_since is None else offline_since
+            dest = by_area.get(area, [])
+            source.update(area_id=area, missing=missing)
+            pending = offline_since is not None or missing or len(dest) != 1
+            source["pending"] = {"since": start, "observed": when} if pending else None
+            self._assign(source, None if pending else dest[0], start, "uncertain" if pending else "area_change")
+            changed = True
+        return changed
+
+    async def _commit_registry(self):
+        async with self._lock:
+            self.data["revision"] += 1
+            await self._save()
+            self._publish_new()
+            self._subscribe_states()
+
+    @callback
+    def _tick(self, now):
+        self._spawn(self._checkpoint(now.timestamp()))
+        self._start_migration()
+
+    async def _checkpoint(self, when):
+        async with self._lock:
+            # Silent inputs become gaps, even if HA retains their last state.
+            for sid, stream in self.data["streams"].items():
+                if when - stream.get("last_report", when) > 86400:
+                    self._gap(sid, stream["last_report"] + 86400)
+                    stream["quality"] = "stale"
+            self.data["last_verified"] = when
+            await self._save()
+
+    def _start_migration(self):
+        if self.ready or self._stopping or self._migration_task and not self._migration_task.done():
+            return
+        self._migration_task = self.hass.async_create_background_task(
+            self.async_migrate_history(), f"{DOMAIN} preserve retained history"
+        )
+
+    async def async_migrate_history(self):
+        try:
+            await HistoryMigrator(self.hass, self.entry, self.data, self._save).run()
+        except Exception as err:
+            self.data["migration"].update(status="failed", error=type(err).__name__)
+            await self._save()
+        if self._coordinator:
+            await self._coordinator.async_request_refresh()
+
+    def statistic_ids(self):
+        return {s["entity_id"] for s in self.data["streams"].values()} | {
+            s["statistic_id"] for s in self.data["migration"]["sources"].values()
+        } | (set() if self.ready else set(self.data["migration"]["sources"])) | {
+            alias for stream in self.data["streams"].values() for alias in stream.get("aliases", [])
+        }
+
+    def prepare(self, stats, conf, tz):
+        return compose(stats, conf, self.data, tz)
+
+    def current_rooms(self):
+        rooms = deepcopy(self.config["rooms"])
+        for rid, spec in rooms.items():
+            spec["name"] = self.data["rooms"][rid]["name"]
+            for role in ROLES:
+                active = [v for v in self.data["rooms"][rid]["visits"] if v["role"] == role and v.get("end") is None]
+                if active:
+                    stream = self.data["streams"].get(active[0].get("stream"))
+                    if stream:
+                        spec[role] = self.data["sources"][stream["source_id"]]["entity_id"]
+                    else:
+                        spec.pop(role, None)
+                else:
+                    spec.pop(role, None)
+        return rooms
+
+    async def async_correct(self, source_id, room_id, effective, revision):
+        """Resolve an offline move from a user-supplied effective timestamp.
+
+        Unobserved hours remain gaps. This edits provenance, never sensor data.
+        """
+        async with self._lock:
+            if revision != self.data["revision"]:
+                raise ValueError("stale_revision")
+            source = self.data["sources"][source_id]
+            pending = source.get("pending")
+            if room_id not in self.config["rooms"] or source.get("missing") or not pending or not isfinite(effective) or not pending["since"] <= effective <= self._now():
+                raise ValueError("invalid_time")
+            if any(v.get("end") is None and v["role"] == source["role"] and v.get("start") is not None and v["start"] > effective
+                   for v in self.data["rooms"][room_id]["visits"]):
+                raise ValueError("invalid_time")
+            self._assign(source, room_id, effective, "correction")
+            for room in self.data["rooms"].values():
+                room["visits"] = [v for v in room["visits"] if v.get("start") is None or v.get("start") != v.get("end")]
+            source["pending"] = None
+            validate_visits(self.data)
+            self.data["revision"] += 1
+            await self._save()
+            self._publish_new()
+
+    async def async_replace(self, room_id, role, entity_id, revision):
+        """Explicitly adopt a replacement, including same-registry-ID hardware."""
+        async with self._lock:
+            if revision != self.data["revision"]:
+                raise ValueError("stale_revision")
+            if room_id not in self.config["rooms"] or role not in ROLES:
+                raise ValueError("invalid_selection")
+            if observation(self.hass.states.get(entity_id), role) is None:
+                raise ValueError("invalid_source")
+            source = self._source(entity_id, role)
+            active_here = any(v.get("end") is None and self.data["streams"].get(v.get("stream"), {}).get("source_id") == source["id"]
+                              for v in self.data["rooms"][room_id]["visits"])
+            now = self._now()
+            if active_here:
+                source["retired"] = True
+                source = self._source(entity_id, role)
+            self._assign(source, room_id, now, "replacement")
+            self.data["revision"] += 1
+            await self._save()
+            self._publish_new()
+            self._subscribe_states()
+
+    async def async_edit_visit(self, visit_id, start, end, exclude, revision):
+        """Correct a completed visit's analytical bounds, preserving its audit."""
+        async with self._lock:
+            if revision != self.data["revision"]:
+                raise ValueError("stale_revision")
+            if not isfinite(start) or not isfinite(end) or end > self._now():
+                raise ValueError("invalid_time")
+            staged = deepcopy(self.data)
+            visit = next(v for room in staged["rooms"].values() for v in room["visits"] if v["id"] == visit_id)
+            if visit.get("end") is None:
+                raise ValueError("active_visit")
+            visit.setdefault("as_recorded", {k: visit.get(k) for k in ("start", "end", "stream", "cause")})
+            visit.update(start=start, end=end, cause="corrected")
+            if exclude:
+                visit["stream"] = None
+            validate_visits(staged)
+            self.data["rooms"] = staged["rooms"]
+            self.data["revision"] += 1
+            await self._save()
+
+    async def async_shutdown(self):
+        self._stopping = True
+        for unsub in self._unsubs + self._state_unsubs:
+            unsub()
+        tasks = list(self._tasks)
+        if self._migration_task:
+            tasks.append(self._migration_task)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        now = self._now()
+        for sid in self.data["streams"]:
+            self._gap(sid, now)
+        self.data["last_verified"] = now
+        await self._save()
