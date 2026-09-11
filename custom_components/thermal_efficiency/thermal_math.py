@@ -780,8 +780,8 @@ def night_taus(
             expected_hours = [
                 ts for ts in hours
                 if any(
-                    (v.get("start") is None or ts + 3600 > v["start"])
-                    and (v.get("end") is None or ts < v["end"])
+                    (v.get("start") is None or ts >= v["start"])
+                    and (v.get("end") is None or ts + 3600 <= v["end"])
                     for v in expected_intervals
                 )
             ]
@@ -1009,8 +1009,8 @@ def compute_all(
         expected_hours = defaultdict(int)
         for ts in outdoor:
             expected_rooms = [name for name, spec in room_confs.items() if any(
-                (v.get("start") is None or ts + 3600 > v["start"])
-                and (v.get("end") is None or ts < v["end"])
+                (v.get("start") is None or ts >= v["start"])
+                and (v.get("end") is None or ts + 3600 <= v["end"])
                 for v in spec.get("heating_expected_intervals", [])
             )]
             if expected_rooms:

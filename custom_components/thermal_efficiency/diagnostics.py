@@ -39,7 +39,7 @@ async def async_get_config_entry_diagnostics(
             for kind in ("raw", "5minute", "hour")
         },
         "verified_hourly_chunks": sum(bool(chunk.get("verified")) for source in migration.get("sources", {}).values()
-                                      for chunk in source["chunks"].values()),
+                                      for chunk in source["chunks"].values() if chunk.get("kind") == "hour"),
         "pending_assignments": sum(bool(s.get("pending")) for s in history.get("sources", {}).values()),
         "preserved_inputs": [
             {"statistic_id": source["statistic_id"],

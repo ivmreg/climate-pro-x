@@ -184,3 +184,34 @@ def test_night_taus_partial_heating_expectation(thermal_math):
     assert len(fits_with) == 1
     assert fits_with[0]["date"] == "2026-01-01"
 
+
+def test_night_taus_full_hour_containment(thermal_math):
+    room, outdoor, _ = _cooling_series(days=1, tau=15.0)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ts_hours = [int((start + timedelta(hours=h)).timestamp()) for h in range(6)]
+
+    # Heating data provided for hours 0, 1, 2.
+    # Sensor visit ended at 03:30 (halfway through hour 3).
+    # Because hour 3 ends at 04:00 (which exceeds 03:30), hour 3 is NOT fully contained in the visit.
+    # Therefore, expected hours are only 0, 1, 2 (3 hours).
+    # Heating data coverage is 3/3 (100%), which passes the 80% threshold.
+    partial_heating = {ts: 0.0 for ts in ts_hours[:3]}
+    interval = [{"start": ts_hours[0], "end": ts_hours[3] + 1800}]
+
+    fits = thermal_math.night_taus(
+        room, outdoor, partial_heating, timezone.utc, date(2026, 1, 1),
+        expected_intervals=interval
+    )
+    assert len(fits) == 1
+    assert fits[0]["date"] == "2026-01-01"
+
+    # Also test start containment: if visit started at 00:30, hour 0 (00:00..01:00) is not expected (00:00 < 00:30).
+    interval_start = [{"start": ts_hours[0] + 1800, "end": ts_hours[3]}]
+    partial_heating_start = {ts: 0.0 for ts in ts_hours[1:3]}
+    fits_start = thermal_math.night_taus(
+        room, outdoor, partial_heating_start, timezone.utc, date(2026, 1, 1),
+        expected_intervals=interval_start
+    )
+    assert len(fits_start) == 1
+
+

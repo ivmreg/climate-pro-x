@@ -7,7 +7,9 @@ import pytest
 from freezegun import freeze_time
 from homeassistant.components.recorder.db_schema import StatisticsShortTerm
 from homeassistant.components.recorder.models.statistics import StatisticMeanType
-from homeassistant.components.recorder.statistics import async_import_statistics, clear_statistics
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics, async_import_statistics, clear_statistics,
+)
 from homeassistant.components.recorder.tasks import ClearStatisticsTask
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
@@ -227,4 +229,63 @@ async def test_bounded_short_term_preservation_skips_empty_years(recorder_mock, 
     record = data["migration"]["sources"]["sensor.empty_history"]
     raw_and_5m_chunks = [c for c in record["chunks"].values() if c["kind"] in ("raw", "5minute")]
     assert len(raw_and_5m_chunks) == 0
+
+
+async def test_verify_model_parity_rewrites_config_to_owned_ids(recorder_mock, hass, monkeypatch):
+    from copy import deepcopy
+    base = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+    cutoff = base
+    config = {
+        "outdoor": "sensor.out",
+        "gas_meter": "sensor.gas",
+        "rooms": {"office": {"temperature": "sensor.room", "heating_power": "sensor.heat"}},
+    }
+    meta_out = {"source": "recorder", "statistic_id": "sensor.out", "name": "Out", "unit_of_measurement": "°C", "has_sum": False, "mean_type": StatisticMeanType.ARITHMETIC, "unit_class": "temperature"}
+    meta_gas = {"source": "recorder", "statistic_id": "sensor.gas", "name": "Gas", "unit_of_measurement": "kWh", "has_sum": True, "mean_type": StatisticMeanType.ARITHMETIC, "unit_class": "energy"}
+    meta_room = {"source": "recorder", "statistic_id": "sensor.room", "name": "Room", "unit_of_measurement": "°C", "has_sum": False, "mean_type": StatisticMeanType.ARITHMETIC, "unit_class": "temperature"}
+    meta_heat = {"source": "recorder", "statistic_id": "sensor.heat", "name": "Heat", "unit_of_measurement": "%", "has_sum": False, "mean_type": StatisticMeanType.ARITHMETIC, "unit_class": None}
+
+    stats = [{"start": cutoff - timedelta(hours=1), "mean": 10.0, "sum": 5.0}]
+    async_import_statistics(hass, meta_out, stats)
+    async_import_statistics(hass, meta_gas, stats)
+    async_import_statistics(hass, meta_room, stats)
+    async_import_statistics(hass, meta_heat, stats)
+
+    # Import identical stats for the owned external statistics
+    async_add_external_statistics(hass, {**meta_out, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:out"}, stats)
+    async_add_external_statistics(hass, {**meta_gas, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:gas"}, stats)
+    async_add_external_statistics(hass, {**meta_room, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:room"}, stats)
+    async_add_external_statistics(hass, {**meta_heat, "source": "thermal_efficiency", "statistic_id": "thermal_efficiency:heat"}, stats)
+    await committed(hass)
+
+    entry = MockConfigEntry(domain="thermal_efficiency", data=config)
+    entry.add_to_hass(hass)
+    manifest = migration_manifest(config, entry.entry_id, cutoff.timestamp())
+    manifest["sources"]["sensor.out"]["statistic_id"] = "thermal_efficiency:out"
+    manifest["sources"]["sensor.gas"]["statistic_id"] = "thermal_efficiency:gas"
+    manifest["sources"]["sensor.room"]["statistic_id"] = "thermal_efficiency:room"
+    manifest["sources"]["sensor.heat"]["statistic_id"] = "thermal_efficiency:heat"
+
+    data = {"migration": manifest, "streams": {}, "rooms": {}}
+    migrator = HistoryMigrator(hass, entry, data, AsyncMock())
+
+    captured_configs = []
+    from custom_components.thermal_efficiency import history_migration as hm
+    def mock_compute(st, cfg, tz, now, windows):
+        captured_configs.append(deepcopy(cfg))
+        return {"result": 1}
+    monkeypatch.setattr(hm, "compute_all", mock_compute)
+
+    await migrator._verify_model_parity(cutoff)
+    assert data["migration"]["parity_verified"] is True
+    assert len(captured_configs) == 2
+    # Baseline used original config
+    assert captured_configs[0]["outdoor"] == "sensor.out"
+    assert captured_configs[0]["rooms"]["office"]["temperature"] == "sensor.room"
+    # Preserved run used rewritten config with owned statistic IDs
+    assert captured_configs[1]["outdoor"] == "thermal_efficiency:out"
+    assert captured_configs[1]["rooms"]["office"]["temperature"] == "thermal_efficiency:room"
+    assert captured_configs[1]["rooms"]["office"]["heating_power"] == "thermal_efficiency:heat"
+    assert captured_configs[1]["gas_meter"] == "thermal_efficiency:gas"
+
 

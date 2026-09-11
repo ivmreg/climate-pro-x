@@ -213,22 +213,23 @@ class RoomHistoryManager:
         previous = self.data.get("configured", {})
         area_reg = ar.async_get(self.hass)
         for rid, spec in self.config["rooms"].items():
-            room_area_id = None
-            if rid in area_reg.areas:
-                room_area_id = rid
-            else:
-                room_name = spec.get("name", rid.replace("_", " ").title()).lower()
-                for a in area_reg.areas.values():
-                    if a.name.lower() == room_name or a.id.lower() == rid.lower():
-                        room_area_id = a.id
-                        break
+            existing = rid in self.data["rooms"]
             room = self.data["rooms"].setdefault(rid, {
                 "name": spec.get("name", rid.replace("_", " ").title()),
-                "area_id": room_area_id or self._area(spec["temperature"]), "visits": [],
+                "area_id": None, "visits": [],
             })
             room["name"] = spec.get("name", room["name"])
-            if room_area_id and room.get("area_id") != room_area_id:
-                room["area_id"] = room_area_id
+            if not existing or not room.get("area_id"):
+                room_area_id = None
+                if rid in area_reg.areas:
+                    room_area_id = rid
+                else:
+                    room_name = spec.get("name", rid.replace("_", " ").title()).lower()
+                    for a in area_reg.areas.values():
+                        if a.name.lower() == room_name or a.id.lower() == rid.lower():
+                            room_area_id = a.id
+                            break
+                room["area_id"] = room_area_id or self._area(spec["temperature"])
             for role in ROLES:
                 current = spec.get(role)
                 if current == previous.get(rid, {}).get(role):
@@ -241,7 +242,7 @@ class RoomHistoryManager:
                            for v in room["visits"]):
                         continue
                     sensor_area = self._area(current)
-                    if not stored and room_area_id is not None and sensor_area != room_area_id:
+                    if not stored and room.get("area_id") is not None and sensor_area != room.get("area_id"):
                         self._assign(source, rid, now, "legacy", legacy=True)
                         visit = room["visits"][-1]
                         self._close(visit, now)
@@ -417,8 +418,8 @@ class RoomHistoryManager:
             # Silent inputs become gaps, even if HA retains their last state.
             for sid, stream in self.data["streams"].items():
                 if when - stream.get("last_report", when) > 86400:
-                    self._gap(sid, stream["last_report"] + 86400)
                     stream["quality"] = "stale"
+                    self._gap(sid, stream["last_report"] + 86400)
             self.data["last_verified"] = when
             await self._save()
 
@@ -534,6 +535,8 @@ class RoomHistoryManager:
             self.data["revision"] += 1
             await self._save()
             self._publish_new()
+            if self._coordinator:
+                await self._coordinator.async_request_refresh()
 
     async def async_replace(self, room_id, role, entity_id, revision):
         """Explicitly adopt a replacement, including same-registry-ID hardware."""
@@ -561,6 +564,8 @@ class RoomHistoryManager:
             await self._save()
             self._publish_new()
             self._subscribe_states()
+            if self._coordinator:
+                await self._coordinator.async_request_refresh()
 
     async def async_edit_visit(self, visit_id, start, end, exclude, revision):
         """Correct a completed visit's analytical bounds, preserving its audit."""
@@ -577,10 +582,14 @@ class RoomHistoryManager:
             visit.update(start=start, end=end, cause="corrected")
             if exclude:
                 visit["stream"] = None
+            else:
+                visit["stream"] = visit["as_recorded"]["stream"]
             validate_visits(staged)
             self.data["rooms"] = staged["rooms"]
             self.data["revision"] += 1
             await self._save()
+            if self._coordinator:
+                await self._coordinator.async_request_refresh()
 
     async def async_shutdown(self):
         self._stopping = True

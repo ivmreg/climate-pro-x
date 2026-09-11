@@ -494,3 +494,100 @@ async def test_current_rooms_preserves_role_during_pending_unresolved_move(hass,
     assert rooms_resolved["b"].get("temperature") == "sensor.a"
     await manager.async_shutdown()
 
+
+async def test_async_edit_visit_re_inclusion_restores_stream(recorder_mock, hass, manager):
+    original = manager.bindings()[0]
+    hass.states.async_set("sensor.a", "20", {"unit_of_measurement": "°C"})
+    await manager.async_replace("a", "temperature", "sensor.a", manager.data["revision"])
+    retired = next(v for v in manager.data["rooms"]["a"]["visits"] if v.get("stream") == original.id)
+    end = retired["end"]
+
+    # Exclude visit sets stream to None while preserving as_recorded
+    await manager.async_edit_visit(retired["id"], end - 86400, end, True, manager.data["revision"])
+    visit = next(v for v in manager.data["rooms"]["a"]["visits"] if v["id"] == retired["id"])
+    assert visit["stream"] is None
+    assert visit["as_recorded"]["stream"] == original.id
+
+    # Re-including with exclude=False restores original stream
+    await manager.async_edit_visit(retired["id"], end - 86400, end, False, manager.data["revision"])
+    visit = next(v for v in manager.data["rooms"]["a"]["visits"] if v["id"] == retired["id"])
+    assert visit["stream"] == original.id
+    await manager.async_shutdown()
+
+
+async def test_room_rename_preserves_stored_area_id(hass):
+    area_reg = ar.async_get(hass)
+    orig_area = area_reg.async_create("Original Room")
+    other_area = area_reg.async_create("Other Room")
+
+    config = {
+        "outdoor": "sensor.outdoor",
+        "rooms": {"room_1": {"name": "Original Room", "temperature": "sensor.t1"}},
+    }
+    entry = MockConfigEntry(domain="thermal_efficiency", data=config, version=2)
+    entry.add_to_hass(hass)
+
+    mgr = RoomHistoryManager(hass, entry, config)
+    await mgr.async_initialize()
+    assert mgr.data["rooms"]["room_1"]["area_id"] == orig_area.id
+    await mgr._save()
+    await mgr.async_shutdown()
+
+    # Rename display name in config to match other_area
+    new_config = {
+        "outdoor": "sensor.outdoor",
+        "rooms": {"room_1": {"name": "Other Room", "temperature": "sensor.t1"}},
+    }
+    hass.config_entries.async_update_entry(entry, data=new_config)
+    mgr2 = RoomHistoryManager(hass, entry, new_config)
+    await mgr2.async_initialize()
+    assert mgr2.data["rooms"]["room_1"]["name"] == "Other Room"
+    # Stored area_id must be authoritative and not overwritten
+    assert mgr2.data["rooms"]["room_1"]["area_id"] == orig_area.id
+    await mgr2.async_shutdown()
+
+
+async def test_history_mutations_request_coordinator_refresh(recorder_mock, hass, manager):
+    coordinator = AsyncMock()
+    manager._coordinator = coordinator
+
+    # Set valid state for sensor.a
+    hass.states.async_set("sensor.a", "20", {"unit_of_measurement": "°C"})
+
+    # 1. async_replace requests refresh
+    await manager.async_replace("a", "temperature", "sensor.a", manager.data["revision"])
+    assert coordinator.async_request_refresh.call_count == 1
+
+    # 2. async_edit_visit requests refresh
+    retired = next(v for v in manager.data["rooms"]["a"]["visits"] if v.get("end") is not None)
+    end = retired["end"]
+    await manager.async_edit_visit(retired["id"], end - 100, end, True, manager.data["revision"])
+    assert coordinator.async_request_refresh.call_count == 2
+
+    # 3. async_correct requests refresh
+    source_id = manager.bindings()[0].source_id
+    source = manager.data["sources"][source_id]
+    when = manager._now() - 200
+    source["pending"] = {"since": when, "observed": when}
+    await manager.async_correct(source_id, "b", when + 10, manager.data["revision"])
+    assert coordinator.async_request_refresh.call_count == 3
+    await manager.async_shutdown()
+
+
+async def test_checkpoint_publishes_stale_quality(hass, manager):
+    when = manager._now()
+    sid = manager.bindings()[0].id
+    stream = manager.data["streams"][sid]
+    stream["last_report"] = when - 90000  # older than 86400s silence threshold
+
+    mock_entity = MagicMock()
+    mock_entity.hass = hass
+    manager.entities[sid] = mock_entity
+
+    await manager._checkpoint(when)
+
+    assert stream["quality"] == "stale"
+    mock_entity.async_write_ha_state.assert_called_once()
+    await manager.async_shutdown()
+
+

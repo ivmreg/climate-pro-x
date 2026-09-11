@@ -138,10 +138,11 @@ Use synthetic sources with sharply different room temperatures and real HA recor
 - **Recorder exclusions:** disabled/excluded owned recording gives actionable status, not a claim of protected history. Do not modify recorder settings in the test target outside fixtures.
 - **Coverage/regression:** independent heating expectations, fixed room population, HLC seasonal anchoring, loft inputs, existing full synthetic pipeline and unrelated meter metrics remain valid.
 
-Use current repository CI in Python 3.13 with `requirements-dev.txt`:
+Use repository CI running across both Python 3.13 (HA 2026.2.3) and Python 3.14 (HA 2026.9.1) with `requirements-dev.txt`:
 
 ```sh
 python -m pip install -r requirements-dev.txt
+python -m pip install homeassistant==2026.2.3  # or 2026.9.1 on Python 3.14
 python -m pytest
 python -m coverage report --include='custom_components/thermal_efficiency/thermal_math.py' --fail-under=90
 ```

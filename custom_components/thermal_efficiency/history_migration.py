@@ -21,7 +21,7 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
-from .assignments import configured_inputs, identity, timestamp
+from .assignments import GLOBAL_INPUTS, ROLES, configured_inputs, identity, timestamp
 from .const import DOMAIN
 from .thermal_math import compute_all
 
@@ -302,15 +302,27 @@ class HistoryMigrator:
             statistics_during_period, self.hass, start, cutoff, ids, "hour", units, {"mean", "sum"}
         )
         original = {sid: stats.get(sid, []) for sid in sources}
-        owned = {sid: stats.get(record["statistic_id"], []) for sid, record in sources.items()}
-        for sid in sources:
-            if canonical(original[sid]) != canonical(owned[sid]):
+        owned = {record["statistic_id"]: stats.get(record["statistic_id"], []) for record in sources.values()}
+        for sid, record in sources.items():
+            if canonical(original[sid]) != canonical(owned[record["statistic_id"]]):
                 raise ValueError("Source changed or disappeared during preservation")
         baseline = await self.hass.async_add_executor_job(
             compute_all, original, config, dt_util.get_default_time_zone(), cutoff, (days,)
         )
+        owned_config = deepcopy(config)
+        for key in GLOBAL_INPUTS:
+            val = owned_config.get(key)
+            if isinstance(val, str) and val in sources:
+                owned_config[key] = sources[val]["statistic_id"]
+            elif isinstance(val, list):
+                owned_config[key] = [sources.get(x, {}).get("statistic_id", x) for x in val]
+        for room in owned_config.get("rooms", {}).values():
+            for role in ROLES:
+                val = room.get(role)
+                if val and val in sources:
+                    room[role] = sources[val]["statistic_id"]
         preserved = await self.hass.async_add_executor_job(
-            compute_all, owned, config, dt_util.get_default_time_zone(), cutoff, (days,)
+            compute_all, owned, owned_config, dt_util.get_default_time_zone(), cutoff, (days,)
         )
         if baseline != preserved:
             raise ValueError("Preserved history changed fixed-date analysis")

@@ -496,3 +496,30 @@ async def test_options_flow_rejects_duplicate_display_name_when_renaming(hass):
     await manager.async_shutdown()
 
 
+async def test_diagnostics_verified_hourly_chunks_counts_only_hour_kind(hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.diagnostics import async_get_config_entry_diagnostics
+
+    entry = MockConfigEntry(domain=DOMAIN, data=_config())
+    history_data = {
+        "migration": {
+            "sources": {
+                "sensor.a": {
+                    "statistic_id": "sensor.a",
+                    "chunks": {
+                        "raw_1": {"kind": "raw", "verified": True, "count": 10},
+                        "5m_1": {"kind": "5minute", "verified": True, "count": 12},
+                        "hour_1": {"kind": "hour", "verified": True, "count": 24},
+                        "hour_2": {"kind": "hour", "verified": False, "count": 24},
+                    }
+                }
+            }
+        }
+    }
+    entry.runtime_data = SimpleNamespace(history=SimpleNamespace(data=history_data))
+    diag = await async_get_config_entry_diagnostics(hass, entry)
+    # Even though raw_1 and 5m_1 are verified, only hour_1 is verified of kind 'hour'
+    assert diag["verified_hourly_chunks"] == 1
+
+
+
