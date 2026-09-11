@@ -74,9 +74,9 @@ views:
               - entity: sensor.thermal_efficiency_living_room_time_constant
                 type: bar
                 orientation: h
-                x: |-
+                x: >-
                   $ex {
-                    vars.roomRows = [
+                    const getRows = () => [
                       ['Office', 'sensor.thermal_efficiency_office_time_constant'],
                       ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
                       ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
@@ -89,15 +89,62 @@ views:
                       nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
                     })).filter(room => Number.isFinite(room.value))
                        .sort((a, b) => b.value - a.value);
-                    return vars.roomRows.map(room => room.value);
+                    return getRows().map(room => room.value);
                   }
-                "y": $ex vars.roomRows.map(room => room.name)
-                customdata: $ex vars.roomRows.map(room => room.nights)
+                "y": >-
+                  $ex {
+                    const getRows = () => [
+                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
+                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
+                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
+                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
+                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
+                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
+                    ].map(([name, id]) => ({
+                      name,
+                      value: Number(hass.states[id]?.state),
+                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
+                    })).filter(room => Number.isFinite(room.value))
+                       .sort((a, b) => b.value - a.value);
+                    return getRows().map(room => room.name);
+                  }
+                customdata: >-
+                  $ex {
+                    const getRows = () => [
+                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
+                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
+                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
+                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
+                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
+                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
+                    ].map(([name, id]) => ({
+                      name,
+                      value: Number(hass.states[id]?.state),
+                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
+                    })).filter(room => Number.isFinite(room.value))
+                       .sort((a, b) => b.value - a.value);
+                    return getRows().map(room => room.nights);
+                  }
                 marker:
-                  color: |-
-                    $ex vars.roomRows.map((room, index) =>
-                      ['#2e7d32', '#7cb342', '#f9a825', '#ef6c00', '#d84315', '#c62828'][index]
-                    )
+                  color: >-
+                    $ex {
+                      const getRows = () => [
+                        ['Office', 'sensor.thermal_efficiency_office_time_constant'],
+                        ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
+                        ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
+                        ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
+                        ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
+                        ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
+                      ].map(([name, id]) => ({
+                        name,
+                        value: Number(hass.states[id]?.state),
+                        nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
+                      })).filter(room => Number.isFinite(room.value))
+                         .sort((a, b) => b.value - a.value);
+                      return getRows().map((room, index) =>
+                        ['#2e7d32', '#7cb342', '#f9a825', '#ef6c00', '#d84315', '#c62828'][index % 6]
+                      );
+                    }
                 texttemplate: "%{x:.1f} h"
                 textposition: auto
                 hovertemplate: >-
@@ -159,25 +206,28 @@ views:
                 type: area
                 stroke_width: 3
                 opacity: 0.1
-                group_by:
-                  duration: 7d
-                  func: avg
+                statistics:
+                  type: mean
+                  period: week
+                  align: middle
               - entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
                 name: Fabric
                 color: "#ef5350"
                 type: line
                 stroke_width: 2
-                group_by:
-                  duration: 7d
-                  func: avg
+                statistics:
+                  type: mean
+                  period: week
+                  align: middle
               - entity: sensor.metahome_thermal_efficiency_ventilation_heat_loss
                 name: Ventilation
                 color: "#42a5f5"
                 type: line
                 stroke_width: 2
-                group_by:
-                  duration: 7d
-                  func: avg
+                statistics:
+                  type: mean
+                  period: week
+                  align: middle
       - type: grid
         cards:
           - type: heading
@@ -231,9 +281,9 @@ views:
                 type: area
                 stroke_width: 2
                 opacity: 0.18
-                group_by:
-                  duration: 1d
-                  func: avg
+                statistics:
+                  type: mean
+                  period: day
               - entity: >-
                   sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
                 name: Space heating
@@ -241,9 +291,9 @@ views:
                 type: area
                 stroke_width: 2
                 opacity: 0.14
-                group_by:
-                  duration: 1d
-                  func: avg
+                statistics:
+                  type: mean
+                  period: day
       - type: grid
         cards:
           - type: heading
@@ -284,9 +334,9 @@ views:
                 type: area
                 stroke_width: 2
                 opacity: 0.2
-                group_by:
-                  duration: 1d
-                  func: avg
+                statistics:
+                  type: mean
+                  period: day
       - type: grid
         cards:
           - type: heading
@@ -324,6 +374,6 @@ views:
                 type: area
                 stroke_width: 2
                 opacity: 0.18
-                group_by:
-                  duration: 1d
-                  func: avg
+                statistics:
+                  type: mean
+                  period: day
