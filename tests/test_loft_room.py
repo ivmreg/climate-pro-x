@@ -168,6 +168,10 @@ async def test_v06_loft_archive_is_bridged_into_dated_room_history(hass):
             loft_sensor.entity_id,
             humidity_sensor.entity_id,
         }
+    assert {
+        loft_sensor.entity_id,
+        humidity_sensor.entity_id,
+    } <= manager.statistic_ids()
 
     await manager._save()
     await manager.async_shutdown()

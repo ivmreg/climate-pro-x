@@ -548,6 +548,10 @@ class RoomHistoryManager:
             s["statistic_id"] for s in self.data["migration"]["sources"].values()
         } | global_ids | (set() if self.ready else set(self.data["migration"]["sources"])) | {
             alias for stream in self.data["streams"].values() for alias in stream.get("aliases", [])
+        } | {
+            stream["original_entity_id"]
+            for stream in self.data["streams"].values()
+            if stream.get("legacy_bridge_end") is not None
         }
 
     def prepare(self, stats, conf, tz):
