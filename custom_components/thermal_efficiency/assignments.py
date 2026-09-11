@@ -200,9 +200,18 @@ def compose(stats: dict, config: dict, data: dict, tz) -> tuple[dict, dict]:
             if role in (CONF_TEMPERATURE, CONF_HUMIDITY) or expected:
                 room_conf[role] = key
             if role == CONF_HEATING_POWER:
+                first_obs = min(by_time) if by_time else None
                 room_conf["heating_expected_intervals"] = [
-                    {"start": v.get("start"), "end": v.get("end")}
+                    {
+                        "start": (
+                            v.get("start")
+                            if v.get("start") is not None
+                            else first_obs
+                        ),
+                        "end": v.get("end"),
+                    }
                     for v in expected
+                    if v.get("start") is not None or first_obs is not None
                 ]
         if is_loft:
             conf["loft"] = room_conf.get(CONF_TEMPERATURE)

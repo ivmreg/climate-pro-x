@@ -311,3 +311,84 @@ def test_compose_pre_cutover_move_preserves_archived_history():
     # New room must contain hours 4..12 (including hours 4..9 between move and cutoff claimed from archive)
     expected_new_hours = [int((base + timedelta(hours=h)).timestamp()) for h in range(4, 13)]
     assert new_room_hours == expected_new_hours
+
+
+def test_legacy_heating_expected_intervals_anchored_to_first_observation(thermal_math):
+    """A legacy radiator visit with start: None must anchor its expectation to its
+    earliest recorded observation, never excluding winter days prior to its existence."""
+    from custom_components.thermal_efficiency.assignments import compose
+
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    cutoff = (base + timedelta(days=100)).timestamp()
+    heat_start_ts = (base + timedelta(days=80)).timestamp()
+
+    data = {
+        "migration": {
+            "cutoff": cutoff,
+            "status": "complete",
+            "sources": {
+                "sensor.gas": {"statistic_id": "sensor.gas"},
+                "sensor.temp": {"statistic_id": "sensor.temp"},
+                "sensor.heat": {"statistic_id": "sensor.heat"},
+            },
+        },
+        "streams": {
+            "s_temp": {"id": "s_temp", "entity_id": "s_temp", "original_entity_id": "sensor.temp", "role": "temperature", "coverage": [{"start": 0, "end": None}]},
+            "s_heat": {"id": "s_heat", "entity_id": "s_heat", "original_entity_id": "sensor.heat", "role": "heating_power", "coverage": [{"start": 0, "end": None}]},
+        },
+        "rooms": {
+            "living_room": {
+                "name": "Living Room",
+                "visits": [
+                    {"id": "v_temp", "stream": "s_temp", "role": "temperature", "start": None, "end": None, "cause": "legacy", "legacy": True, "expected": True},
+                    {"id": "v_heat", "stream": "s_heat", "role": "heating_power", "start": None, "end": None, "cause": "legacy", "legacy": True, "expected": True},
+                ],
+            }
+        },
+    }
+    config = {
+        "outdoor": "sensor.outdoor",
+        "gas_meter": "sensor.gas",
+        "boiler_efficiency": 0.9,
+        "rooms": {
+            "living_room": {
+                "name": "Living Room",
+                "temperature": "sensor.temp",
+                "heating_power": "sensor.heat",
+            }
+        },
+    }
+
+    # 100 days: gas and temp available throughout; heat only from day 80 onwards
+    stats = {
+        "sensor.outdoor": [],
+        "sensor.gas": [],
+        "sensor.temp": [],
+        "sensor.heat": [],
+    }
+    current = base
+    cum_gas = 100.0
+    for day in range(100):
+        t_out = 0.0 + (day % 15)
+        gas = (20.0 - t_out) * 5.0 + 10.0
+        for h in range(24):
+            ts = (current + timedelta(hours=h)).timestamp()
+            cum_gas += gas / 24.0
+            stats["sensor.outdoor"].append({"start": ts, "mean": t_out})
+            stats["sensor.gas"].append({"start": ts, "sum": cum_gas})
+            stats["sensor.temp"].append({"start": ts, "mean": 20.0})
+            if day >= 80:
+                stats["sensor.heat"].append({"start": ts, "mean": 40.0})
+        current += timedelta(days=1)
+
+    result_stats, result_conf = compose(stats, config, data, UTC)
+    intervals = result_conf["rooms"]["living_room"]["heating_expected_intervals"]
+    assert len(intervals) == 1
+    assert intervals[0]["start"] == heat_start_ts
+    assert intervals[0]["end"] is None
+
+    # Compute all must not exclude days 0..79
+    res = thermal_math.compute_all(result_stats, result_conf, UTC, base + timedelta(days=100), (120,))
+    assert res.get("hlc") is not None
+    assert res["hlc"]["days_used"] == 100
+
