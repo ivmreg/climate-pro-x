@@ -135,6 +135,7 @@
       "duplicate_room": "A room with this name was already added",
       "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100",
       "at_least_one_room": "Keep or add at least one room before finishing",
+      "invalid_source": "Choose an external sensor. Integration-owned room history entities cannot be used as replacement sources.",
       "invalid_correction": "Choose a time between the last verified assignment and now. If assignments changed while this form was open, review and retry."
     },
     "abort": {

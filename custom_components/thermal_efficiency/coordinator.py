@@ -11,6 +11,7 @@ from homeassistant.const import (
     UnitOfTemperature,
     UnitOfVolume,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -49,10 +50,17 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class ThermalCoordinator(DataUpdateCoordinator[dict]):
-    def __init__(self, hass: HomeAssistant, conf: dict, history: RoomHistoryManager | None = None) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        conf: dict,
+        history: RoomHistoryManager | None = None,
+        entry: ConfigEntry | None = None,
+    ) -> None:
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=entry or (history.entry if history else None),
             name=DOMAIN,
             update_interval=timedelta(hours=UPDATE_INTERVAL_HOURS),
         )

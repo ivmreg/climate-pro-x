@@ -112,3 +112,81 @@ async def test_raw_boundary_attributes_and_short_term_preserved(recorder_mock, h
     await committed(hass)
     assert (await migrator._archive("sensor.a", "raw", start, start + timedelta(hours=1), meta))[0] == raw
     assert (await migrator._archive("sensor.a", "5minute", start, start + timedelta(hours=1), meta))[0] == short
+
+
+def test_fields_contains_mean_weight():
+    from custom_components.thermal_efficiency.history_migration import FIELDS, ARCHIVE_FIELDS
+    assert "mean_weight" in FIELDS
+    assert ARCHIVE_FIELDS == set(FIELDS)
+
+
+async def test_interrupted_migration_cutoff_rebasing(recorder_mock, hass):
+    base = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+    t0 = base                      # 10:00
+    t1 = base + timedelta(hours=1) # 11:00 (original cutoff)
+    t2 = base + timedelta(hours=2) # 12:00 (rebased cutoff)
+
+    config = {"outdoor": "sensor.a", "rooms": {"office": {"temperature": "sensor.a"}}}
+    entry = MockConfigEntry(domain="thermal_efficiency", data=config)
+    entry.add_to_hass(hass)
+
+    meta = {
+        "source": "recorder", "statistic_id": "sensor.a", "name": "Temperature",
+        "unit_of_measurement": "°C", "unit_class": "temperature",
+        "mean_type": StatisticMeanType.ARITHMETIC, "has_sum": False,
+    }
+    stats = [
+        {"start": t0 - timedelta(days=1), "mean": 20.0},
+        {"start": t0, "mean": 20.5},
+        {"start": t1, "mean": 21.0},
+    ]
+    async_import_statistics(hass, meta, stats)
+    await committed(hass)
+
+    # Simulate an interruption between 10:45 and 11:30 across original cutoff 11:00
+    t_interrupted = t0 + timedelta(minutes=45)
+    t_restart = t1 + timedelta(minutes=30)
+    data = {
+        "migration": migration_manifest(config, entry.entry_id, t0.timestamp()),
+        "streams": {
+            "s_a": {
+                "id": "s_a",
+                "coverage": [
+                    {"start": t0.timestamp(), "end": t_interrupted.timestamp()},
+                    {"start": t_restart.timestamp(), "end": None},
+                ],
+            }
+        },
+        "rooms": {
+            "office": {
+                "visits": [
+                    {"stream": "s_a", "end": None, "role": "temperature", "expected": True}
+                ]
+            }
+        },
+    }
+
+    async def save():
+        pass
+
+    migrator = HistoryMigrator(hass, entry, data, save)
+
+    # Run at 11:35 (past original cutoff + 6 min, but interrupted)
+    with freeze_time(t_restart + timedelta(minutes=5)):
+        await migrator.run()
+
+    # Cutoff must be rebased to 12:00 (t2) and status must be finalizing
+    assert data["migration"]["cutoff"] == t2.timestamp()
+    assert data["migration"]["status"] == "finalizing"
+    assert not data["migration"]["sources"]["sensor.a"].get("tail_done")
+
+    # Fast forward to 12:10 (past rebased cutoff + 6 min, active uninterrupted capture at 12:00)
+    with freeze_time(t2 + timedelta(minutes=10)):
+        await migrator.run()
+
+    assert data["migration"]["status"] == "complete"
+    assert data["migration"]["sources"]["sensor.a"]["tail_done"]
+    # Verify rows through 12:00 were imported
+    source_record = data["migration"]["sources"]["sensor.a"]
+    copied = await migrator.query(source_record["statistic_id"], t0 - timedelta(days=2), t2, "hour", source_record["metadata"])
+    assert len(copied) == 3

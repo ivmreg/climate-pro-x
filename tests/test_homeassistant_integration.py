@@ -343,3 +343,60 @@ async def test_replacement_options_preview_before_write(recorder_mock, hass):
     assert (await flow.async_step_confirm({}))["type"] is FlowResultType.CREATE_ENTRY
     assert manager.current_rooms()["living_room"]["temperature"] == "sensor.new"
     await manager.async_shutdown()
+
+
+async def test_replacement_rejects_owned_entities(hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+
+    binding = manager.bindings()[0]
+    # Set valid state on the owned entity to prove the rejection is due to ownership, not observation
+    hass.states.async_set(binding.entity_id, "20", {"unit_of_measurement": "°C"})
+
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass, flow.handler = hass, entry.entry_id
+    form = await flow.async_step_replace({"room": "living_room", "role": "temperature", "source": binding.entity_id})
+    assert form["type"] is FlowResultType.FORM
+    assert form["errors"]["base"] == "invalid_source"
+
+    with pytest.raises(ValueError, match="invalid_source"):
+        await manager.async_replace("living_room", "temperature", binding.entity_id, manager.data["revision"])
+
+    await manager.async_shutdown()
+
+
+async def test_history_status_sensor_live_updates(hass):
+    from unittest.mock import MagicMock
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+    from custom_components.thermal_efficiency.room_sensor import HistoryStatusSensor
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    coordinator = MagicMock()
+    sensor = HistoryStatusSensor(coordinator, manager)
+    sensor.hass = hass
+    sensor.entity_id = "sensor.history_status"
+
+    await sensor.async_added_to_hass()
+    assert sensor in manager._status_sensors
+
+    manager.data["migration"]["status"] = "copying"
+    manager._publish_migration_status()
+    assert sensor.native_value == "copying"
+
+    manager.data["migration"]["status"] = "complete"
+    manager._publish_migration_status()
+    assert sensor.native_value == "complete"
+
+    await sensor.async_will_remove_from_hass()
+    assert sensor not in manager._status_sensors
+    await manager.async_shutdown()
+

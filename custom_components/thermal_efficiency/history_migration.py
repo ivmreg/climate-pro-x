@@ -25,8 +25,8 @@ from .assignments import configured_inputs, identity, timestamp
 from .const import DOMAIN
 from .thermal_math import compute_all
 
-FIELDS = {"mean", "min", "max", "sum", "state", "last_reset"}
-ARCHIVE_FIELDS = FIELDS | {"mean_weight"}
+FIELDS = {"mean", "min", "max", "sum", "state", "last_reset", "mean_weight"}
+ARCHIVE_FIELDS = set(FIELDS)
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -78,8 +78,9 @@ def import_rows(rows):
 
 
 class HistoryMigrator:
-    def __init__(self, hass, entry, data, save):
+    def __init__(self, hass, entry, data, save, on_status=None):
         self.hass, self.entry, self.data, self.save = hass, entry, data, save
+        self.on_status = on_status
         self.prefix = f"{DOMAIN}.archive.{entry.entry_id}"
 
     def _chunk_summary(self, rows, kind):
@@ -87,6 +88,28 @@ class HistoryMigrator:
         return {"count": len(rows), "digest": digest(rows), "kind": kind,
                 "first_observation": min(times) if times else None,
                 "last_observation": max(times) if times else None}
+
+    def _has_uninterrupted_live_capture(self, cutoff_ts: float) -> bool:
+        streams = self.data.get("streams", {})
+        active_streams = [
+            s for s in streams.values()
+            if any(
+                v.get("stream") == s["id"] and v.get("end") is None
+                for r in self.data.get("rooms", {}).values()
+                for v in r.get("visits", [])
+            )
+        ]
+        if not active_streams:
+            return True
+        for stream in active_streams:
+            coverage = stream.get("coverage", [])
+            covered = any(
+                c["start"] <= cutoff_ts and c.get("end") is None
+                for c in coverage
+            )
+            if not covered:
+                return False
+        return True
 
     async def query(self, source, start, end, period, metadata=None):
         units = None
@@ -139,6 +162,8 @@ class HistoryMigrator:
             return
         migration["status"] = "copying"
         migration.pop("error", None)
+        if self.on_status:
+            self.on_status()
         instance = get_instance(self.hass)
         await committed(self.hass)
         initial_end = datetime.fromtimestamp(migration["snapshot_end"], UTC)
@@ -180,9 +205,31 @@ class HistoryMigrator:
             await self.save()
         # Live capture started before this top-of-hour boundary. Wait for the
         # recorder to finalize the bridge bucket instead of creating an upgrade gap.
+        if not self._has_uninterrupted_live_capture(cutoff.timestamp()):
+            now_dt = dt_util.utcnow()
+            now_ts = now_dt.timestamp()
+            current_hour_floor = float((int(now_ts) // 3600) * 3600)
+            if (
+                current_hour_floor > cutoff.timestamp()
+                and self._has_uninterrupted_live_capture(current_hour_floor)
+                and now_ts >= current_hour_floor + 360
+            ):
+                new_cutoff_ts = current_hour_floor
+            else:
+                new_cutoff_ts = float(((int(now_ts) // 3600) + 1) * 3600)
+
+            if new_cutoff_ts > cutoff.timestamp():
+                migration["cutoff"] = new_cutoff_ts
+                cutoff = datetime.fromtimestamp(new_cutoff_ts, UTC)
+                for record in migration["sources"].values():
+                    record["tail_done"] = False
+                await self.save()
+
         if dt_util.utcnow() < cutoff + timedelta(minutes=6):
             migration["status"] = "finalizing"
             await self.save()
+            if self.on_status:
+                self.on_status()
             return
         for source, record in migration["sources"].items():
             meta = record["metadata"]
@@ -199,6 +246,8 @@ class HistoryMigrator:
         migration["status"] = "complete"
         migration["completed_at"] = dt_util.utcnow().timestamp()
         await self.save()
+        if self.on_status:
+            self.on_status()
 
     async def _verify_model_parity(self, cutoff):
         """Evaluate both copies on the same date, mappings, units and window."""
@@ -245,6 +294,8 @@ class HistoryMigrator:
                 raise ValueError("Imported history did not match the archived observations")
         record["chunks"][key]["verified"] = True
         await self.save()
+        if self.on_status:
+            self.on_status()
 
 
 def migration_manifest(config, entry_id, now):

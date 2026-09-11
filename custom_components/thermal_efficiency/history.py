@@ -10,7 +10,11 @@ from math import isfinite
 from homeassistant.components.recorder import get_instance
 from homeassistant.core import callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import (
+    area_registry as ar,
+    device_registry as dr,
+    entity_registry as er,
+)
 from homeassistant.helpers.event import (
     async_track_state_change_event, async_track_state_report_event,
     async_track_time_interval,
@@ -19,7 +23,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
-from .assignments import ROLES, compose, identity, validate_visits
+from .assignments import GLOBAL_INPUTS, ROLES, compose, identity, validate_visits
 from .const import DOMAIN, HISTORY_STORE_KEY, HISTORY_STORE_VERSION
 from .history_migration import HistoryMigrator, migration_manifest
 
@@ -66,6 +70,30 @@ class RoomHistoryManager:
         self._coordinator = None
         self._migration_task = None
         self._stopping = False
+        self._status_sensors = set()
+
+    def register_status_sensor(self, sensor):
+        self._status_sensors.add(sensor)
+
+    def unregister_status_sensor(self, sensor):
+        self._status_sensors.discard(sensor)
+
+    @callback
+    def _publish_migration_status(self):
+        for sensor in list(self._status_sensors):
+            if sensor.hass:
+                sensor.async_write_ha_state()
+
+    def _is_owned_entity(self, entity_id: str) -> bool:
+        if not entity_id:
+            return False
+        reg_entry = er.async_get(self.hass).async_get(entity_id)
+        if reg_entry and reg_entry.platform == DOMAIN:
+            return True
+        for stream in self.data.get("streams", {}).values():
+            if entity_id == stream.get("entity_id") or entity_id in stream.get("aliases", []):
+                return True
+        return False
 
     @property
     def ready(self):
@@ -127,10 +155,14 @@ class RoomHistoryManager:
         stream = self.data["streams"].get(sid)
         if not stream:
             return
+        closed = False
         for interval in stream["coverage"]:
             if interval.get("end") is None:
                 interval["end"] = max(interval["start"], when)
+                closed = True
         self.values.pop(sid, None)
+        if closed and not self._stopping:
+            self._spawn(self._save())
         if not self._stopping and (entity := self.entities.get(sid)) and entity.hass:
             entity.async_write_ha_state()
 
@@ -176,12 +208,24 @@ class RoomHistoryManager:
         # Reconcile only explicit config deltas. An unchanged saved config must
         # never undo a move already observed through the HA registry.
         previous = self.data.get("configured", {})
+        area_reg = ar.async_get(self.hass)
         for rid, spec in self.config["rooms"].items():
+            room_area_id = None
+            if rid in area_reg.areas:
+                room_area_id = rid
+            else:
+                room_name = spec.get("name", rid.replace("_", " ").title()).lower()
+                for a in area_reg.areas.values():
+                    if a.name.lower() == room_name or a.id.lower() == rid.lower():
+                        room_area_id = a.id
+                        break
             room = self.data["rooms"].setdefault(rid, {
                 "name": spec.get("name", rid.replace("_", " ").title()),
-                "area_id": self._area(spec["temperature"]), "visits": [],
+                "area_id": room_area_id or self._area(spec["temperature"]), "visits": [],
             })
             room["name"] = spec.get("name", room["name"])
+            if room_area_id and room.get("area_id") != room_area_id:
+                room["area_id"] = room_area_id
             for role in ROLES:
                 current = spec.get(role)
                 if current == previous.get(rid, {}).get(role):
@@ -191,8 +235,20 @@ class RoomHistoryManager:
                     if any(v.get("end") is None and self.data["streams"].get(v.get("stream"), {}).get("source_id") == source["id"]
                            for v in room["visits"]):
                         continue
-                    self._assign(source, rid, now,
-                                 "legacy" if not stored else "replacement", legacy=not stored)
+                    sensor_area = self._area(current)
+                    if not stored and room_area_id is not None and sensor_area != room_area_id:
+                        self._assign(source, rid, now, "legacy", legacy=True)
+                        visit = room["visits"][-1]
+                        self._close(visit, now)
+                        room["visits"].append({
+                            "id": identity(rid, role, str(now), "gap"), "stream": None,
+                            "role": role, "start": now, "end": None, "cause": "gap",
+                            "legacy": False, "expected": True,
+                        })
+                        source["pending"] = {"since": now, "observed": now}
+                    else:
+                        self._assign(source, rid, now,
+                                     "legacy" if not stored else "replacement", legacy=not stored)
                 else:
                     for visit in room["visits"]:
                         if visit["role"] == role and visit.get("end") is None:
@@ -289,6 +345,7 @@ class RoomHistoryManager:
                 continue
             if not stream["coverage"] or stream["coverage"][-1].get("end") is not None:
                 stream["coverage"].append({"start": when, "end": None})
+                self._spawn(self._save())
             stream["last_report"] = when
             stream["quality"] = "capturing"
             self.values[binding.id] = value
@@ -360,26 +417,59 @@ class RoomHistoryManager:
             self.data["last_verified"] = when
             await self._save()
 
-    def _start_migration(self):
+    def _start_migration(self, force=False):
         if self.ready or self._stopping or self._migration_task and not self._migration_task.done():
             return
+        migration = self.data.get("migration", {})
+        if not force and migration.get("status") == "failed":
+            next_retry = migration.get("next_retry", 0)
+            if self._now() < next_retry:
+                return
         self._migration_task = self.hass.async_create_background_task(
             self.async_migrate_history(), f"{DOMAIN} preserve retained history"
         )
 
     async def async_migrate_history(self):
         try:
-            await HistoryMigrator(self.hass, self.entry, self.data, self._save).run()
+            await HistoryMigrator(
+                self.hass, self.entry, self.data, self._save, self._publish_migration_status
+            ).run()
+            if self.ready:
+                self.data["migration"].pop("retries", None)
+                self.data["migration"].pop("next_retry", None)
+                await self._save()
         except Exception as err:
-            self.data["migration"].update(status="failed", error=type(err).__name__)
+            retries = self.data["migration"].get("retries", 0)
+            backoff = min(3600, 60 * (2 ** retries))
+            now = self._now()
+            self.data["migration"].update(
+                status="failed",
+                error=type(err).__name__,
+                retries=retries + 1,
+                next_retry=now + backoff,
+            )
             await self._save()
+        self._publish_migration_status()
         if self._coordinator:
             await self._coordinator.async_request_refresh()
 
+    async def async_retry_migration(self):
+        """Immediately retry migration, resetting backoff."""
+        if self.ready or self._stopping:
+            return
+        if "migration" in self.data:
+            self.data["migration"]["next_retry"] = 0
+        self._start_migration(force=True)
+
     def statistic_ids(self):
+        global_ids = set()
+        for key in GLOBAL_INPUTS:
+            val = self.config.get(key)
+            if val:
+                global_ids.update(val if isinstance(val, list) else [val])
         return {s["entity_id"] for s in self.data["streams"].values()} | {
             s["statistic_id"] for s in self.data["migration"]["sources"].values()
-        } | (set() if self.ready else set(self.data["migration"]["sources"])) | {
+        } | global_ids | (set() if self.ready else set(self.data["migration"]["sources"])) | {
             alias for stream in self.data["streams"].values() for alias in stream.get("aliases", [])
         }
 
@@ -433,15 +523,20 @@ class RoomHistoryManager:
                 raise ValueError("stale_revision")
             if room_id not in self.config["rooms"] or role not in ROLES:
                 raise ValueError("invalid_selection")
-            if observation(self.hass.states.get(entity_id), role) is None:
+            if self._is_owned_entity(entity_id) or observation(self.hass.states.get(entity_id), role) is None:
                 raise ValueError("invalid_source")
             source = self._source(entity_id, role)
             active_here = any(v.get("end") is None and self.data["streams"].get(v.get("stream"), {}).get("source_id") == source["id"]
                               for v in self.data["rooms"][room_id]["visits"])
             now = self._now()
+            room_area = self.data["rooms"][room_id].get("area_id") or self._area(entity_id)
             if active_here:
                 source["retired"] = True
+                source["pending"] = None
+                source["area_id"] = room_area
                 source = self._source(entity_id, role)
+            source["pending"] = None
+            source["area_id"] = room_area
             self._assign(source, room_id, now, "replacement")
             self.data["revision"] += 1
             await self._save()

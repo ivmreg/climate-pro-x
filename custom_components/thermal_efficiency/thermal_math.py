@@ -1440,10 +1440,11 @@ def compute_all(
 
     for name, temps in room_temp.items():
         result["rooms"][name] = None
+        room_excluded = set(room_confs[name].get("excluded_model_days") if "excluded_model_days" in room_confs[name] else excluded_days)
         for window in windows_days:
             since = (now - timedelta(days=window)).astimezone(tz).date()
             safe_temps = {ts: value for ts, value in temps.items()
-                          if _local(ts, tz).date().isoformat() not in excluded_days}
+                          if _local(ts, tz).date().isoformat() not in room_excluded}
             fits = night_taus(safe_temps, outdoor, room_heat.get(name), tz, since,
                              room_confs[name].get("heating_expected_intervals"))
             if len(fits) >= TAU_MIN_NIGHTS:

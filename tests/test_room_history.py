@@ -244,3 +244,136 @@ async def test_same_id_replacement_and_non_destructive_correction(recorder_mock,
         await manager.async_edit_visit(retired["id"], end, end - 1, False, manager.data["revision"])
     assert manager.data == snapshot
     await manager.async_shutdown()
+
+
+async def test_statistic_ids_retains_global_inputs_when_ready(manager):
+    assert "sensor.outdoor" in manager.statistic_ids()
+    manager.config["gas_meter"] = "sensor.gas"
+    assert "sensor.gas" in manager.statistic_ids()
+    manager.data["migration"]["status"] = "complete"
+    assert manager.ready
+    ids_ready = manager.statistic_ids()
+    assert "sensor.outdoor" in ids_ready
+    assert "sensor.gas" in ids_ready
+
+
+def test_validate_visits_detects_cross_room_overlap():
+    data_same_stream = {
+        "rooms": {
+            "a": {"visits": [{"role": "temperature", "stream": "s1", "start": 100, "end": 200}]},
+            "b": {"visits": [{"role": "temperature", "stream": "s1", "start": 150, "end": 250}]},
+        },
+        "streams": {"s1": {"id": "s1", "source_id": "src1"}},
+    }
+    with pytest.raises(ValueError, match="Assignments overlap"):
+        validate_visits(data_same_stream)
+
+    data_same_source = {
+        "rooms": {
+            "a": {"visits": [{"role": "temperature", "stream": "s1", "start": 100, "end": 200}]},
+            "b": {"visits": [{"role": "temperature", "stream": "s2", "start": 150, "end": 250}]},
+        },
+        "streams": {
+            "s1": {"id": "s1", "source_id": "src1"},
+            "s2": {"id": "s2", "source_id": "src1"},
+        },
+    }
+    with pytest.raises(ValueError, match="Assignments overlap"):
+        validate_visits(data_same_source)
+
+
+async def test_first_startup_area_mismatch_creates_pending(hass):
+    area_reg = ar.async_get(hass)
+    living_area = area_reg.async_create("Living Room")
+    kitchen_area = area_reg.async_create("Kitchen")
+
+    entity_reg = er.async_get(hass)
+    sensor = entity_reg.async_get_or_create("sensor", "test", "temp", suggested_object_id="temp")
+    entity_reg.async_update_entity(sensor.entity_id, area_id=kitchen_area.id)
+
+    config = {
+        "outdoor": "sensor.out",
+        "rooms": {
+            "living_room": {"name": "Living Room", "temperature": sensor.entity_id}
+        },
+    }
+    entry = MockConfigEntry(domain="thermal_efficiency", data=config, version=2)
+    entry.add_to_hass(hass)
+    mgr = RoomHistoryManager(hass, entry, config)
+    await mgr.async_initialize()
+
+    # Room adopts true room area from area registry
+    assert mgr.data["rooms"]["living_room"]["area_id"] == living_area.id
+    # Source is marked pending because sensor was in kitchen_area
+    source = next(s for s in mgr.data["sources"].values() if s["entity_id"] == sensor.entity_id)
+    assert source.get("pending") is not None
+    visits = mgr.data["rooms"]["living_room"]["visits"]
+    assert len(visits) == 2
+    assert visits[0]["cause"] == "legacy"
+    assert visits[0]["end"] is not None
+    assert visits[1]["cause"] == "gap"
+    assert visits[1]["stream"] is None
+    binding = mgr.bindings()[0]
+    assert not mgr._stream_active(binding.id)
+    await mgr.async_shutdown()
+
+
+async def test_coverage_boundaries_persisted_immediately(recorder_mock, hass, manager):
+    save_calls = []
+    orig_save = manager._save
+    async def track_save():
+        save_calls.append(manager._now())
+        await orig_save()
+    manager._save = track_save
+
+    manager._subscribe_states()
+    # First state change opens coverage interval: must immediately persist
+    hass.states.async_set("sensor.a", "21", {"unit_of_measurement": "°C"})
+    await hass.async_block_till_done()
+    assert len(save_calls) >= 1
+
+    save_calls.clear()
+    # Going unavailable closes coverage interval via _gap: must immediately persist
+    hass.states.async_set("sensor.a", "unavailable")
+    await hass.async_block_till_done()
+    assert len(save_calls) >= 1
+    await manager.async_shutdown()
+
+
+async def test_async_replace_clears_pending_and_updates_area(hass, manager):
+    binding = manager.bindings()[0]
+    source = manager.data["sources"][binding.source_id]
+    source["pending"] = {"since": 1000, "observed": 1000}
+    source["area_id"] = "unknown_area"
+
+    hass.states.async_set("sensor.a", "20", {"unit_of_measurement": "°C"})
+    await manager.async_replace("a", "temperature", "sensor.a", manager.data["revision"])
+
+    assert source.get("pending") is None
+    assert source["area_id"] == manager.data["rooms"]["a"]["area_id"]
+    await manager.async_shutdown()
+
+
+async def test_migration_failure_exponential_backoff_and_retry(manager, monkeypatch):
+    from custom_components.thermal_efficiency.history_migration import HistoryMigrator
+    monkeypatch.setattr(HistoryMigrator, "run", AsyncMock(side_effect=RuntimeError("db error")))
+
+    await manager.async_migrate_history()
+    assert manager.data["migration"]["status"] == "failed"
+    assert manager.data["migration"]["retries"] == 1
+    next_retry1 = manager.data["migration"]["next_retry"]
+    assert next_retry1 >= manager._now() + 59
+
+    # Normal tick or _start_migration within backoff window does not retry
+    manager._start_migration()
+    assert manager._migration_task is None
+
+    # Explicit manual retry resets backoff and spawns immediately
+    await manager.async_retry_migration()
+    assert manager._migration_task is not None
+    await manager._migration_task
+
+    assert manager.data["migration"]["retries"] == 2
+    next_retry2 = manager.data["migration"]["next_retry"]
+    assert next_retry2 >= manager._now() + 119
+

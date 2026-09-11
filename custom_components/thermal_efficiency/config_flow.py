@@ -464,16 +464,27 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
 
     async def async_step_replace(self, user_input=None):
         history = self._history()
+        ent_reg = er.async_get(self.hass)
+        owned = {e.entity_id for e in ent_reg.entities.values() if e.platform == DOMAIN}
+        if history:
+            for s in history.data.get("streams", {}).values():
+                if s.get("entity_id"):
+                    owned.add(s["entity_id"])
+                owned.update(s.get("aliases", []))
+        errors = {}
         if user_input is not None:
-            self._change = ("async_replace", [user_input["room"], user_input["role"], user_input["source"]], self._revision)
-            return await self.async_step_confirm()
+            if user_input["source"] in owned:
+                errors["base"] = "invalid_source"
+            else:
+                self._change = ("async_replace", [user_input["room"], user_input["role"], user_input["source"]], self._revision)
+                return await self.async_step_confirm()
         self._revision = history.data["revision"]
-        return self.async_show_form(step_id="replace", data_schema=vol.Schema({
+        return self.async_show_form(step_id="replace", errors=errors, data_schema=vol.Schema({
             vol.Required("room"): selector.SelectSelector(selector.SelectSelectorConfig(options=[
                 {"value": rid, "label": history.data["rooms"][rid]["name"]} for rid in history.config["rooms"]])),
             vol.Required("role"): selector.SelectSelector(selector.SelectSelectorConfig(options=[
                 {"value": "temperature", "label": "Temperature"}, {"value": "heating_power", "label": "Heating demand (%)"}])),
-            vol.Required("source"): _entity_selector(),
+            vol.Required("source"): _entity_selector(exclude_entities=sorted(owned)),
         }))
 
     async def async_step_correct_visit(self, user_input=None):

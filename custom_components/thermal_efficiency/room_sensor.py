@@ -57,6 +57,16 @@ class HistoryStatusSensor(CoordinatorEntity, SensorEntity):
         self.manager = manager
         self._attr_unique_id = f"{DOMAIN}_{manager.entry.entry_id}_history_status"
 
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        if self.manager:
+            self.manager.register_status_sensor(self)
+
+    async def async_will_remove_from_hass(self):
+        if self.manager:
+            self.manager.unregister_status_sensor(self)
+        await super().async_will_remove_from_hass()
+
     @property
     def native_value(self):
         return self.manager.data["migration"]["status"]

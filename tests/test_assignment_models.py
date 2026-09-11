@@ -34,3 +34,76 @@ def test_dated_heating_quality_blocks_fallback(thermal_math, monkeypatch, missin
         assert not captured["heat"]
     else:
         assert len(captured["heat"]) == 3
+
+
+def test_room_isolated_transition_exclusions(thermal_math, monkeypatch):
+    from custom_components.thermal_efficiency.assignments import compose
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    t_trans = (start + timedelta(days=1)).timestamp()  # 2026-01-02
+    data = {
+        "migration": {
+            "cutoff": (start + timedelta(days=10)).timestamp(),
+            "status": "complete",
+            "sources": {
+                "sensor.a": {"statistic_id": "sensor.a"},
+                "sensor.b": {"statistic_id": "sensor.b"},
+            },
+        },
+        "streams": {
+            "s_a1": {"entity_id": "s_a1", "original_entity_id": "sensor.a", "coverage": [{"start": 0, "end": None}]},
+            "s_a2": {"entity_id": "s_a2", "original_entity_id": "sensor.a", "coverage": [{"start": 0, "end": None}]},
+            "s_b": {"entity_id": "s_b", "original_entity_id": "sensor.b", "coverage": [{"start": 0, "end": None}]},
+        },
+        "rooms": {
+            "a": {
+                "visits": [
+                    {"role": "temperature", "start": None, "end": t_trans, "cause": "legacy", "legacy": True, "stream": "s_a1"},
+                    {"role": "temperature", "start": t_trans, "end": None, "cause": "replacement", "legacy": False, "stream": "s_a2"},
+                ]
+            },
+            "b": {
+                "visits": [
+                    {"role": "temperature", "start": None, "end": None, "cause": "legacy", "legacy": True, "stream": "s_b"},
+                ]
+            },
+        },
+    }
+    config = {
+        "outdoor": "sensor.out",
+        "rooms": {
+            "a": {"temperature": "sensor.a"},
+            "b": {"temperature": "sensor.b"},
+        },
+    }
+    stats = {
+        "sensor.out": [], "sensor.a": [], "sensor.b": [],
+        "s_a1": [], "s_a2": [], "s_b": [],
+    }
+    for hour in range(24 * 4):
+        ts = (start + timedelta(hours=hour)).timestamp()
+        stats["sensor.out"].append({"start": ts, "mean": 5})
+        stats["sensor.a"].append({"start": ts, "mean": 20})
+        stats["sensor.b"].append({"start": ts, "mean": 20})
+        stats["s_a1"].append({"start": ts, "mean": 20})
+        stats["s_a2"].append({"start": ts, "mean": 20})
+        stats["s_b"].append({"start": ts, "mean": 20})
+
+    composed_stats, composed_conf = compose(stats, config, data, UTC)
+    assert composed_conf["rooms"]["a"]["excluded_model_days"] == ["2026-01-02"]
+    assert composed_conf["rooms"]["b"]["excluded_model_days"] == []
+    assert composed_conf["excluded_model_days"] == ["2026-01-02"]
+
+    captured_room_safe_temps = {}
+    def mock_night_taus(room, outdoor, heating, tz, since, expected_intervals=None):
+        captured_room_safe_temps[len(captured_room_safe_temps)] = list(room.keys())
+        return [{"date": "2026-01-01", "tau_hours": 15.0, "r_squared": 0.9}]
+
+    monkeypatch.setattr(thermal_math, "night_taus", mock_night_taus)
+    thermal_math.compute_all(composed_stats, composed_conf, UTC, start + timedelta(days=4), (30,))
+
+    # Room A has hours from 2026-01-02 filtered out
+    # Room B retains hours from 2026-01-02
+    ts_jan2 = int(t_trans)
+    assert ts_jan2 not in captured_room_safe_temps[0]  # room a
+    assert ts_jan2 in captured_room_safe_temps[1]      # room b
+

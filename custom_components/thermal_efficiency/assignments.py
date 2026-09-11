@@ -54,6 +54,8 @@ def configured_inputs(config: dict) -> set[str]:
 def validate_visits(data: dict) -> None:
     """Reject overlaps before committing a manual correction."""
     intervals = {}
+    stream_intervals = {}
+    source_intervals = {}
     for room_id, room in data["rooms"].items():
         for visit in room["visits"]:
             start, end = visit.get("start"), visit.get("end")
@@ -61,12 +63,20 @@ def validate_visits(data: dict) -> None:
                 raise ValueError("Visit end must be after start")
             if end is not None and not isfinite(end):
                 raise ValueError("Invalid visit end")
+            period = (float("-inf") if start is None else start, float("inf") if end is None else end)
             key = (room_id, visit["role"])
-            intervals.setdefault(key, []).append((float("-inf") if start is None else start, float("inf") if end is None else end))
-    for periods in intervals.values():
-        periods.sort()
-        if any(a[1] > b[0] for a, b in zip(periods, periods[1:])):
-            raise ValueError("Assignments overlap")
+            intervals.setdefault(key, []).append(period)
+            stream_id = visit.get("stream")
+            if stream_id:
+                stream_intervals.setdefault(stream_id, []).append(period)
+                source_id = data.get("streams", {}).get(stream_id, {}).get("source_id")
+                if source_id:
+                    source_intervals.setdefault(source_id, []).append(period)
+    for group in (intervals, stream_intervals, source_intervals):
+        for periods in group.values():
+            periods.sort()
+            if any(a[1] > b[0] for a, b in zip(periods, periods[1:])):
+                raise ValueError("Assignments overlap")
 
 
 def compose(stats: dict, config: dict, data: dict, tz) -> tuple[dict, dict]:
@@ -80,23 +90,29 @@ def compose(stats: dict, config: dict, data: dict, tz) -> tuple[dict, dict]:
         if room_id not in conf["rooms"]:
             continue
         room_conf = {}
+        room_excluded_days = set()
         for visit in room["visits"]:
             if visit.get("cause") != "legacy":
                 for boundary in (visit.get("start"), visit.get("end")):
                     if boundary is not None:
-                        excluded_days.add(datetime.fromtimestamp(boundary, tz).date().isoformat())
+                        day_str = datetime.fromtimestamp(boundary, tz).date().isoformat()
+                        excluded_days.add(day_str)
+                        room_excluded_days.add(day_str)
             elif visit.get("end") is not None:
-                excluded_days.add(datetime.fromtimestamp(visit["end"], tz).date().isoformat())
+                day_str = datetime.fromtimestamp(visit["end"], tz).date().isoformat()
+                excluded_days.add(day_str)
+                room_excluded_days.add(day_str)
+        room_conf["excluded_model_days"] = sorted(room_excluded_days)
         for role in ROLES:
             key = f"thermal_efficiency:room_{identity(room_id, role)}"
             by_time = {}
             relevant = [v for v in room["visits"] if v["role"] == role]
             expected = [v for v in relevant if v.get("expected", True)]
             for visit in relevant:
-                stream = data["streams"].get(visit.get("stream"))
+                stream = data.get("streams", {}).get(visit.get("stream"))
                 if stream is None:
                     continue
-                archive = data["migration"]["sources"].get(stream["original_entity_id"])
+                archive = data.get("migration", {}).get("sources", {}).get(stream["original_entity_id"])
                 archived_id = archive["statistic_id"] if archive and verified else stream["original_entity_id"]
                 # Only the migration's initial assignments may claim pre-upgrade history.
                 historical = [(archived_id, True)] if visit.get("legacy") else []
