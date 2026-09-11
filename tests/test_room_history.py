@@ -591,3 +591,64 @@ async def test_checkpoint_publishes_stale_quality(hass, manager):
     await manager.async_shutdown()
 
 
+async def test_async_correct_staged_failure_preserves_state(hass, manager, monkeypatch):
+    source_id = manager.bindings()[0].source_id
+    source = manager.data["sources"][source_id]
+    when = manager._now() - 200
+    source["pending"] = {"since": when, "observed": when}
+    snapshot = deepcopy(manager.data)
+
+    from custom_components.thermal_efficiency import history as h_mod
+    def mock_validate(data):
+        raise ValueError("simulated_validation_failure")
+    monkeypatch.setattr(h_mod, "validate_visits", mock_validate)
+
+    with pytest.raises(ValueError, match="simulated_validation_failure"):
+        await manager.async_correct(source_id, "b", when + 10, manager.data["revision"])
+
+    # Manager data must be identical to snapshot (no in-place mutations preserved)
+    assert manager.data == snapshot
+    await manager.async_shutdown()
+
+
+async def test_async_correct_only_closes_matching_source_gap(hass, manager):
+    # Close existing visit in destination room b before effective time
+    when_a = manager._now() - 200
+    for v in manager.data["rooms"]["b"]["visits"]:
+        v["end"] = when_a
+
+    # Room a has pending move for sensor a: close active stream visit and open gap
+    source_a_id = manager.bindings()[0].source_id
+    for v in manager.data["rooms"]["a"]["visits"]:
+        if v.get("end") is None:
+            v["end"] = when_a
+    manager.data["sources"][source_a_id]["pending"] = {"since": when_a, "observed": when_a}
+    manager.data["rooms"]["a"]["visits"].append({
+        "id": "gap_a", "stream": None, "role": "temperature",
+        "start": when_a, "end": None, "cause": "gap", "legacy": False, "expected": True,
+        "source_id": source_a_id,
+    })
+
+    # An unrelated room "other" has an open gap for temperature
+    manager.data["rooms"]["other"] = {"name": "Other", "visits": []}
+    when_other = manager._now() - 300
+    manager.data["rooms"]["other"]["visits"].append({
+        "id": "gap_other", "stream": None, "role": "temperature",
+        "start": when_other, "end": None, "cause": "gap", "legacy": False, "expected": True,
+        "source_id": "unrelated_source",
+    })
+
+    # Correct source a into room b
+    await manager.async_correct(source_a_id, "b", when_a + 50, manager.data["revision"])
+
+    # Room a's gap was closed at when_a + 50
+    gap_a = next(v for v in manager.data["rooms"]["a"]["visits"] if v["id"] == "gap_a")
+    assert gap_a["end"] == when_a + 50
+
+    # Unrelated room "other"'s gap remains open (end is None)
+    gap_other = next(v for v in manager.data["rooms"]["other"]["visits"] if v["id"] == "gap_other")
+    assert gap_other["end"] is None
+    await manager.async_shutdown()
+
+
+

@@ -289,3 +289,29 @@ async def test_verify_model_parity_rewrites_config_to_owned_ids(recorder_mock, h
     assert captured_configs[1]["gas_meter"] == "thermal_efficiency:gas"
 
 
+async def test_parity_fails_if_inventory_lost(recorder_mock, hass, monkeypatch):
+    cutoff = datetime(2026, 1, 2, 0, 0, tzinfo=UTC)
+    config = {
+        "outdoor": "sensor.out",
+        "rooms": {"office": {"name": "Office", "temperature": "sensor.room"}},
+    }
+    entry = MockConfigEntry(domain="thermal_efficiency", data=config)
+    entry.add_to_hass(hass)
+    manifest = migration_manifest(config, entry.entry_id, cutoff.timestamp())
+    manifest["sources"]["sensor.out"]["statistic_id"] = "thermal_efficiency:out"
+    manifest["sources"]["sensor.room"]["statistic_id"] = "thermal_efficiency:room"
+    # Pre-copy inventory recorded 10 rows for sensor.out
+    manifest["inventory"] = {"sensor.out": {"count": 10}, "sensor.room": {"count": 10}}
+
+    data = {"migration": manifest, "streams": {}, "rooms": {}}
+    migrator = HistoryMigrator(hass, entry, data, AsyncMock())
+
+    # Mock statistics_during_period returning empty lists (simulating purged/lost records)
+    from custom_components.thermal_efficiency import history_migration as hm
+    monkeypatch.setattr(hm, "statistics_during_period", lambda *args, **kwargs: {})
+
+    with pytest.raises(ValueError, match="lost history during preservation"):
+        await migrator._verify_model_parity(cutoff)
+
+
+

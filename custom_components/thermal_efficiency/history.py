@@ -134,27 +134,29 @@ class RoomHistoryManager:
             "entity_id": entity_id, "role": role, "area_id": self._area(entity_id),
         })
 
-    def _stream(self, source, room_id):
+    def _stream(self, source, room_id, data=None):
+        data = data if data is not None else self.data
         sid = identity(self.entry.entry_id, source["id"], room_id, source["role"])
-        if sid not in self.data["streams"]:
+        if sid not in data["streams"]:
             unique = f"{DOMAIN}_room_stream_{sid}"
             entity = er.async_get(self.hass).async_get_or_create(
                 "sensor", DOMAIN, unique, config_entry=self.entry,
                 suggested_object_id=f"thermal_efficiency_{room_id}_{source['role']}_{sid[:6]}",
             )
-            self.data["streams"][sid] = {
+            data["streams"][sid] = {
                 "id": sid, "unique_id": unique, "entity_id": entity.entity_id,
                 "room_id": room_id, "role": source["role"], "source_id": source["id"],
                 "original_entity_id": source["entity_id"], "coverage": [], "quarantine": [],
             }
         return sid
 
-    def _close(self, visit, when):
+    def _close(self, visit, when, data=None):
         visit["end"] = max(when, visit.get("start") or when)
-        self._gap(visit.get("stream"), when)
+        self._gap(visit.get("stream"), when, data=data)
 
-    def _gap(self, sid, when):
-        stream = self.data["streams"].get(sid)
+    def _gap(self, sid, when, data=None):
+        data = data if data is not None else self.data
+        stream = data["streams"].get(sid)
         if not stream:
             return
         closed = False
@@ -162,34 +164,37 @@ class RoomHistoryManager:
             if interval.get("end") is None:
                 interval["end"] = max(interval["start"], when)
                 closed = True
-        self.values.pop(sid, None)
-        if closed and not self._stopping:
-            self._spawn(self._save())
-        if not self._stopping and (entity := self.entities.get(sid)) and entity.hass:
-            entity.async_write_ha_state()
+        if data is self.data:
+            self.values.pop(sid, None)
+            if closed and not self._stopping:
+                self._spawn(self._save())
+            if not self._stopping and (entity := self.entities.get(sid)) and entity.hass:
+                entity.async_write_ha_state()
 
-    def _assign(self, source, room_id, when, cause="area_change", legacy=False):
+    def _assign(self, source, room_id, when, cause="area_change", legacy=False, data=None):
+        data = data if data is not None else self.data
         role = source["role"]
         vacated = set()
-        for rid, room in self.data["rooms"].items():
+        for rid, room in data["rooms"].items():
             for visit in room["visits"]:
-                stream = self.data["streams"].get(visit.get("stream"), {})
+                stream = data["streams"].get(visit.get("stream"), {})
                 if visit.get("end") is None and (
                     stream.get("source_id") == source["id"] or rid == room_id and visit["role"] == role
                 ):
-                    self._close(visit, when)
+                    self._close(visit, when, data=data)
                     if rid != room_id:
                         vacated.add(rid)
         for rid in vacated:
-            self.data["rooms"][rid]["visits"].append({
+            data["rooms"][rid]["visits"].append({
                 "id": identity(rid, role, str(when), "gap"), "stream": None,
                 "role": role, "start": when, "end": None, "cause": "gap",
                 "legacy": False, "expected": True,
+                "source_id": source["id"],
             })
         if room_id is not None:
-            sid = self._stream(source, room_id)
-            self.data["rooms"][room_id]["visits"].append({
-                "id": identity(sid, str(when), str(self.data["revision"])),
+            sid = self._stream(source, room_id, data=data)
+            data["rooms"][room_id]["visits"].append({
+                "id": identity(sid, str(when), str(data["revision"])),
                 "stream": sid, "role": role, "start": None if legacy else when,
                 "end": None, "cause": cause, "legacy": legacy, "expected": True,
                 "provenance": "legacy_mapping_unverified" if legacy else cause,
@@ -513,25 +518,34 @@ class RoomHistoryManager:
         async with self._lock:
             if revision != self.data["revision"]:
                 raise ValueError("stale_revision")
-            source = self.data["sources"][source_id]
+            source = self.data["sources"].get(source_id)
+            if not source:
+                raise ValueError("invalid_source")
             pending = source.get("pending")
             if room_id not in self.config["rooms"] or source.get("missing") or not pending or not isfinite(effective) or not pending["since"] <= effective <= self._now():
                 raise ValueError("invalid_time")
             if any(v.get("end") is None and v["role"] == source["role"] and v.get("start") is not None and v["start"] > effective
                    for v in self.data["rooms"][room_id]["visits"]):
                 raise ValueError("invalid_time")
-            self._assign(source, room_id, effective, "correction")
-            for room in self.data["rooms"].values():
+
+            staged = deepcopy(self.data)
+            staged_source = staged["sources"][source_id]
+            self._assign(staged_source, room_id, effective, "correction", data=staged)
+            for room in staged["rooms"].values():
                 for v in room["visits"]:
-                    if v.get("stream") is None and v["role"] == source["role"] and v.get("end") is None:
-                        v["end"] = max(v.get("start") or effective, effective)
-                    stream = self.data["streams"].get(v.get("stream"), {})
-                    if stream.get("source_id") == source["id"] and v.get("end") is not None and v["end"] > effective:
+                    if v.get("stream") is None and v["role"] == staged_source["role"] and v.get("end") is None:
+                        if v.get("source_id") == staged_source["id"] or v.get("start") == pending["since"]:
+                            v["end"] = max(v.get("start") or effective, effective)
+                    stream = staged["streams"].get(v.get("stream"), {})
+                    if stream.get("source_id") == staged_source["id"] and v.get("end") is not None and v["end"] > effective:
                         v["end"] = effective
-            for room in self.data["rooms"].values():
+            for room in staged["rooms"].values():
                 room["visits"] = [v for v in room["visits"] if v.get("start") is None or v.get("start") != v.get("end")]
+            staged_source["pending"] = None
+            validate_visits(staged)
+            self.data["rooms"] = staged["rooms"]
+            self.data["streams"] = staged["streams"]
             source["pending"] = None
-            validate_visits(self.data)
             self.data["revision"] += 1
             await self._save()
             self._publish_new()

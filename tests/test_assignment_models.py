@@ -178,3 +178,138 @@ def test_compose_preserves_non_legacy_stream_prior_to_cutoff():
     expected_hours = [int((base + timedelta(hours=h)).timestamp()) for h in range(13)]
     assert composed_hours == expected_hours
 
+
+def test_compose_heating_power_without_metadata_preserves_rows():
+    base = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    cutoff = base + timedelta(hours=10)
+
+    data = {
+        "revision": 1,
+        "migration": {
+            "status": "pending",
+            "cutoff": cutoff.timestamp(),
+            "sources": {
+                "sensor.heating": {
+                    "statistic_id": "sensor.heating",
+                    "metadata": None,  # Metadata not yet loaded during early startup
+                }
+            },
+        },
+        "rooms": {
+            "bedroom": {
+                "visits": [
+                    {
+                        "role": "heating_power",
+                        "stream": "s_heat",
+                        "legacy": True,
+                        "start": None,
+                        "end": None,
+                        "cause": "legacy",
+                    }
+                ]
+            }
+        },
+        "streams": {
+            "s_heat": {
+                "id": "s_heat",
+                "entity_id": "sensor.heat_stream",
+                "original_entity_id": "sensor.heating",
+                "role": "heating_power",
+                "coverage": [{"start": 0, "end": None}],
+            }
+        },
+    }
+    config = {"rooms": {"bedroom": {"name": "Bedroom"}}}
+    stats = {
+        "sensor.heating": [{"start": (base + timedelta(hours=h)).timestamp(), "mean": 60.0} for h in range(5)],
+    }
+
+    result_stats, result_conf = compose(stats, config, data, UTC)
+    heat_key = result_conf["rooms"]["bedroom"]["heating_power"]
+    # Rows should NOT be dropped just because metadata is None at startup
+    assert len(result_stats[heat_key]) == 5
+
+
+def test_compose_pre_cutover_move_preserves_archived_history():
+    base = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    cutoff = base + timedelta(hours=10)
+    t_move = base + timedelta(hours=4)
+
+    data = {
+        "revision": 1,
+        "migration": {
+            "status": "complete",
+            "cutoff": cutoff.timestamp(),
+            "sources": {
+                "sensor.temp": {
+                    "statistic_id": "sensor.archived_temp",
+                    "metadata": {"unit_of_measurement": "°C"},
+                }
+            },
+        },
+        "rooms": {
+            "old_room": {
+                "visits": [
+                    {
+                        "role": "temperature",
+                        "stream": "s_old",
+                        "legacy": True,
+                        "start": None,
+                        "end": t_move.timestamp(),
+                        "cause": "legacy",
+                    }
+                ]
+            },
+            "new_room": {
+                "visits": [
+                    {
+                        "role": "temperature",
+                        "stream": "s_new",
+                        "legacy": False,
+                        "start": t_move.timestamp(),
+                        "end": None,
+                        "cause": "area_change",  # Sensor moved before cutoff
+                    }
+                ]
+            },
+        },
+        "streams": {
+            "s_old": {
+                "id": "s_old",
+                "entity_id": "sensor.stream_old",
+                "original_entity_id": "sensor.temp",
+                "role": "temperature",
+                "coverage": [{"start": 0, "end": t_move.timestamp()}],
+            },
+            "s_new": {
+                "id": "s_new",
+                "entity_id": "sensor.stream_new",
+                "original_entity_id": "sensor.temp",
+                "role": "temperature",
+                "coverage": [{"start": t_move.timestamp(), "end": None}],
+            },
+        },
+    }
+    config = {
+        "rooms": {
+            "old_room": {"name": "Old Room"},
+            "new_room": {"name": "New Room"},
+        }
+    }
+
+    # Archived stats has all hours 0..9 (pre-cutoff)
+    # Live stats has hours 4..12
+    stats = {
+        "sensor.archived_temp": [{"start": (base + timedelta(hours=h)).timestamp(), "mean": 20.0} for h in range(10)],
+        "sensor.stream_new": [{"start": (base + timedelta(hours=h)).timestamp(), "mean": 21.0} for h in range(4, 13)],
+    }
+
+    result_stats, result_conf = compose(stats, config, data, UTC)
+    new_room_key = result_conf["rooms"]["new_room"]["temperature"]
+    new_room_hours = [int(r["start"]) for r in result_stats[new_room_key]]
+
+    # New room must contain hours 4..12 (including hours 4..9 between move and cutoff claimed from archive)
+    expected_new_hours = [int((base + timedelta(hours=h)).timestamp()) for h in range(4, 13)]
+    assert new_room_hours == expected_new_hours
+
+

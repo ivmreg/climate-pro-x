@@ -114,14 +114,14 @@ def compose(stats: dict, config: dict, data: dict, tz) -> tuple[dict, dict]:
                     continue
                 archive = data.get("migration", {}).get("sources", {}).get(stream["original_entity_id"])
                 archived_id = archive["statistic_id"] if archive and verified else stream["original_entity_id"]
-                # Only the migration's initial assignments may claim pre-upgrade history.
-                historical = [(archived_id, True)] if visit.get("legacy") else []
+                can_claim_archive = visit.get("legacy") or visit.get("cause") in ("area_change", "correction")
+                historical = [(archived_id, True)] if can_claim_archive else []
                 for stat_id, legacy in historical + [(s, False) for s in [stream.get("entity_id"), *stream.get("aliases", [])]]:
                     for row in stats.get(stat_id, []):
                         start = timestamp(row["start"])
                         if legacy and start + 3600 > cutoff:
                             continue
-                        if visit.get("legacy") and not legacy and start < cutoff:
+                        if can_claim_archive and not legacy and start < cutoff and archive:
                             continue
                         if not inside(start, [visit]):
                             continue
@@ -129,7 +129,7 @@ def compose(stats: dict, config: dict, data: dict, tz) -> tuple[dict, dict]:
                             continue
                         if any(start + 3600 > q["start"] and (q.get("end") is None or start < q["end"]) for q in stream.get("quarantine", [])):
                             continue
-                        if stream.get("role") == "heating_power" and legacy and archive:
+                        if stream.get("role") == "heating_power" and legacy and archive and archive.get("metadata") is not None:
                             unit = (archive.get("metadata") or {}).get("unit_of_measurement")
                             norm_unit = unit.strip().casefold() if isinstance(unit, str) else None
                             if norm_unit not in {"%", "percent", "percentage"}:

@@ -177,6 +177,15 @@ class HistoryMigrator:
         raw_start = dt_util.as_utc(instance.recorder_runs_manager.first.start)
         raw_start = raw_start.replace(hour=0, minute=0, second=0, microsecond=0)
         migration.setdefault("raw_start", raw_start.timestamp())
+        if "inventory" not in migration:
+            inventory = {}
+            for source in migration["sources"]:
+                if source in metadata:
+                    probe = await self.query(source, EPOCH, initial_end, "hour", metadata[source][1])
+                    inventory[source] = {"count": len(probe)}
+                else:
+                    inventory[source] = {"count": 0}
+            migration["inventory"] = inventory
         await self.save()
         for source, record in migration["sources"].items():
             if record.get("copied"):
@@ -185,12 +194,7 @@ class HistoryMigrator:
                 record["metadata"] = dict(metadata[source][1]) if source in metadata else None
                 await self.save()
             meta = record["metadata"]
-            # Preserve the observations at risk of normal retention first.
-            keep_days = getattr(instance, "keep_days", 10) or 10
-            retention_floor = (initial_end - timedelta(days=keep_days + 2)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-            raw_base = max(datetime.fromtimestamp(migration["raw_start"], UTC), retention_floor)
+            raw_base = datetime.fromtimestamp(migration["raw_start"], UTC)
 
             # Bound raw preservation to source's actual retained states
             raw_start_day = None
@@ -213,9 +217,9 @@ class HistoryMigrator:
             # Bound 5-minute preservation to source's actual retained statistics
             fivemin_start_day = None
             if meta:
-                hourly = await self.query(source, raw_base, initial_end, "hour", meta)
-                if hourly:
-                    min_ts = min(timestamp(r["start"]) for r in hourly)
+                fivemin_probe = await self.query(source, raw_base, initial_end, "5minute", meta)
+                if fivemin_probe:
+                    min_ts = min(timestamp(r["start"]) for r in fivemin_probe)
                     first_dt = datetime.fromtimestamp(min_ts, UTC)
                     fivemin_start_day = max(raw_base, first_dt.replace(hour=0, minute=0, second=0, microsecond=0))
 
@@ -304,6 +308,9 @@ class HistoryMigrator:
         original = {sid: stats.get(sid, []) for sid in sources}
         owned = {record["statistic_id"]: stats.get(record["statistic_id"], []) for record in sources.values()}
         for sid, record in sources.items():
+            expected = migration.get("inventory", {}).get(sid, {}).get("count", 0)
+            if expected > 0 and len(owned[record["statistic_id"]]) == 0:
+                raise ValueError(f"Source {sid} lost history during preservation")
             if canonical(original[sid]) != canonical(owned[record["statistic_id"]]):
                 raise ValueError("Source changed or disappeared during preservation")
         baseline = await self.hass.async_add_executor_job(
