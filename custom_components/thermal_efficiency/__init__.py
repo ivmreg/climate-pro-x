@@ -102,6 +102,15 @@ def _validate_rooms(rooms: dict) -> dict:
         raise vol.Invalid("Only one loft room is supported")
     if ROOM_TYPE_CONDITIONED not in kinds:
         raise vol.Invalid("At least one conditioned room is required")
+    assigned = set()
+    for room in rooms.values():
+        for role in (CONF_TEMPERATURE, CONF_HEATING_POWER, CONF_HUMIDITY):
+            if source := room.get(role):
+                if source in assigned:
+                    raise vol.Invalid(
+                        f"Source {source} cannot be assigned to multiple rooms"
+                    )
+                assigned.add(source)
     return rooms
 
 

@@ -21,10 +21,13 @@ def loft_ratio(
     loft: pd.Series,
     outdoor: pd.Series,
 ) -> dict:
-    indoor = pd.DataFrame(indoor_by_room).mean(axis=1)
+    if not indoor_by_room:
+        indoor = pd.Series(dtype=float)
+    else:
+        indoor = pd.DataFrame(indoor_by_room).dropna().mean(axis=1)
     df = pd.DataFrame(
         {"in": indoor, "loft": loft, "out": outdoor}
-    ).interpolate(limit=24).dropna()
+    ).dropna()
     dt = df["in"] - df["out"]
     # Only cold, steady periods: night hours with a real gradient, so sun on
     # the roof and daytime heating transients don't skew the ratio.

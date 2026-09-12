@@ -290,7 +290,9 @@ class RoomHistoryManager:
                         effective = assignment_timestamp(
                             spec.get(CONF_ASSIGNMENT_SINCE)
                         )
-                        for visit in room["visits"]:
+                        staged = deepcopy(self.data)
+                        staged_room = staged["rooms"][rid]
+                        for visit in staged_room["visits"]:
                             if visit["role"] == role and visit.get("end") is None:
                                 visit["start"] = effective
                                 visit["legacy"] = effective is None
@@ -302,9 +304,12 @@ class RoomHistoryManager:
                                     visit["provenance"] = "legacy_mapping_unverified"
                                 if visit.get("stream") and (
                                     effective is not None
-                                    or current in self.data.get("migration", {}).get("sources", {})
+                                    or current in staged.get("migration", {}).get("sources", {})
                                 ):
-                                    self.data["streams"][visit["stream"]]["legacy_bridge_end"] = now
+                                    staged["streams"][visit["stream"]]["legacy_bridge_end"] = now
+                        validate_visits(staged)
+                        self.data["rooms"] = staged["rooms"]
+                        self.data["streams"] = staged["streams"]
                     continue
                 if current:
                     if self._is_owned_entity(current):
@@ -367,6 +372,7 @@ class RoomHistoryManager:
         self.data["configured"] = deepcopy(self.config["rooms"])
         if stored:
             self._reconcile_registry(now, offline_since=last)
+        validate_visits(self.data)
         self.data["last_verified"] = now
         self.data["revision"] += 1
         await self._save()

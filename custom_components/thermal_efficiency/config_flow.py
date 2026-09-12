@@ -358,6 +358,29 @@ def _other_room_slugs(
     return slugs
 
 
+def _assigned_sources(
+    rooms: dict | list,
+    exclude_room_id: str | None = None,
+    pending_rooms: list | None = None,
+) -> set[str]:
+    assigned = set()
+    items = list(rooms.items()) if isinstance(rooms, dict) else list(rooms)
+    if pending_rooms:
+        items.extend(pending_rooms)
+    for item in items:
+        rid = item[0] if isinstance(item, (tuple, list)) else item
+        spec = item[1] if isinstance(item, (tuple, list)) and len(item) > 1 else {}
+        if exclude_room_id is not None and rid == exclude_room_id:
+            continue
+        if not isinstance(spec, dict):
+            continue
+        for role in (CONF_TEMPERATURE, CONF_HEATING_POWER, CONF_HUMIDITY):
+            val = spec.get(role)
+            if isinstance(val, str) and val:
+                assigned.add(val)
+    return assigned
+
+
 def _validate_room_name(name: str, taken: set[str] | dict) -> tuple[str | None, dict[str, str]]:
     slug = slugify(name)
     if not slug:
@@ -375,12 +398,19 @@ def _validate_room_name(name: str, taken: set[str] | dict) -> tuple[str | None, 
 
 
 def _validate_room_input(
-    hass: HomeAssistant, user_input: dict, taken: set[str] | dict
+    hass: HomeAssistant,
+    user_input: dict,
+    taken: set[str] | dict,
+    other_sources: set[str] | None = None,
 ) -> tuple[str | None, dict[str, str]]:
     slug, errors = _validate_room_name(user_input["name"], taken)
     temp_sensor = user_input.get(CONF_TEMPERATURE)
-    if temp_sensor and _is_owned_entity(hass, temp_sensor):
-        errors[CONF_TEMPERATURE] = "invalid_source"
+    other_sources = other_sources or set()
+    if temp_sensor:
+        if _is_owned_entity(hass, temp_sensor):
+            errors[CONF_TEMPERATURE] = "invalid_source"
+        elif temp_sensor in other_sources:
+            errors[CONF_TEMPERATURE] = "duplicate_source"
     heating_power = user_input.get(CONF_HEATING_POWER)
     room_type = user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED)
     if room_type not in (ROOM_TYPE_CONDITIONED, ROOM_TYPE_LOFT):
@@ -390,6 +420,10 @@ def _validate_room_input(
             errors[CONF_HEATING_POWER] = "role_not_supported"
         elif _is_owned_entity(hass, heating_power):
             errors[CONF_HEATING_POWER] = "invalid_source"
+        elif heating_power in other_sources:
+            errors[CONF_HEATING_POWER] = "duplicate_source"
+        elif temp_sensor and heating_power == temp_sensor:
+            errors[CONF_HEATING_POWER] = "duplicate_source"
         elif heating_power_issue(hass, heating_power):
             errors[CONF_HEATING_POWER] = "heating_power_must_be_percent"
     humidity = user_input.get(CONF_HUMIDITY)
@@ -398,6 +432,10 @@ def _validate_room_input(
             errors[CONF_HUMIDITY] = "role_not_supported"
         elif _is_owned_entity(hass, humidity):
             errors[CONF_HUMIDITY] = "invalid_source"
+        elif humidity in other_sources:
+            errors[CONF_HUMIDITY] = "duplicate_source"
+        elif temp_sensor and humidity == temp_sensor:
+            errors[CONF_HUMIDITY] = "duplicate_source"
     assignment_since = user_input.get(CONF_ASSIGNMENT_SINCE)
     if assignment_since:
         if room_type != ROOM_TYPE_LOFT:
@@ -463,7 +501,9 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
-            slug, errors = _validate_room_input(self.hass, user_input, self._rooms)
+            slug, errors = _validate_room_input(
+                self.hass, user_input, self._rooms, _assigned_sources(self._rooms)
+            )
             if (
                 user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
                 and _has_loft(self._rooms)
@@ -616,8 +656,18 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
                 owned.update(s.get("aliases", []))
         errors = {}
         if user_input is not None:
+            other_active = (
+                _assigned_sources(
+                    history.config["rooms"],
+                    exclude_room_id=user_input.get("room"),
+                )
+                if history
+                else set()
+            )
             if user_input["source"] in owned:
                 errors["base"] = "invalid_source"
+            elif user_input["source"] in other_active:
+                errors["base"] = "duplicate_source"
             elif (
                 user_input["room"] not in history.config["rooms"]
                 or user_input["role"]
@@ -701,7 +751,14 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
                 current_id=self._current_room[0],
                 pending_rooms=self._pending_rooms,
             )
-            slug, errors = _validate_room_input(self.hass, user_input, other_slugs)
+            other_sources = _assigned_sources(
+                self._rooms,
+                exclude_room_id=self._current_room[0],
+                pending_rooms=self._pending_rooms,
+            )
+            slug, errors = _validate_room_input(
+                self.hass, user_input, other_slugs, other_sources
+            )
             other_rooms = dict(self._rooms)
             other_rooms.update(dict(self._pending_rooms))
             if (
@@ -709,6 +766,26 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
                 and _has_loft(other_rooms, self._current_room[0])
             ):
                 errors[CONF_ROOM_TYPE] = "duplicate_loft"
+            if (
+                not errors
+                and user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
+                and user_input.get(CONF_ASSIGNMENT_SINCE)
+                and (history := self._history())
+            ):
+                from copy import deepcopy
+                from .assignments import validate_visits
+                from .history import assignment_timestamp
+                staged = deepcopy(history.data)
+                loft_id = self._current_room[0]
+                if loft_id and loft_id in staged.get("rooms", {}):
+                    eff = assignment_timestamp(user_input[CONF_ASSIGNMENT_SINCE])
+                    for v in staged["rooms"][loft_id]["visits"]:
+                        if v["role"] == CONF_TEMPERATURE and v.get("end") is None:
+                            v["start"] = eff
+                    try:
+                        validate_visits(staged)
+                    except ValueError:
+                        errors[CONF_ASSIGNMENT_SINCE] = "overlapping_visit"
             if slug and not errors:
                 # Display names may change; established room identity never does.
                 room_id = self._current_room[0] or slug
@@ -769,7 +846,10 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
         if user_input is not None:
             other_slugs = _other_room_slugs(self._rooms)
-            slug, errors = _validate_room_input(self.hass, user_input, other_slugs)
+            other_sources = _assigned_sources(self._rooms)
+            slug, errors = _validate_room_input(
+                self.hass, user_input, other_slugs, other_sources
+            )
             if (
                 user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
                 and _has_loft(self._rooms)

@@ -48,6 +48,49 @@ def test_loft_ratio_rejects_physically_impossible_result(thermal_math, ratio):
     assert result is None
 
 
+def test_loft_ratio_requires_all_rooms_and_prevents_bias(thermal_math):
+    # Two conditioned rooms: living (warm, 22C) and bedroom (cold, 16C)
+    # Mean is 19C. Outdoor is 5C. dT = 14C. Loft is 12C -> ratio = (12 - 5) / 14 = 0.5.
+    # On day 2, bedroom is missing. If bedroom was ignored, average would be 22C,
+    # dT = 17C, biasing ratio to (12 - 5) / 17 = 0.41.
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    living = {}
+    bedroom = {}
+    loft = {}
+    outdoor = {}
+    for day in range(4):
+        for hour in range(1, 6):
+            ts = int((start + timedelta(days=day, hours=hour)).timestamp())
+            outdoor[ts] = 5.0
+            loft[ts] = 12.0
+            living[ts] = 22.0
+            if day != 2:
+                bedroom[ts] = 16.0
+    rooms = [living, bedroom]
+    result = thermal_math.loft_ratio(
+        rooms, loft, outdoor, ZoneInfo("Europe/London"), date(2026, 1, 1)
+    )
+    assert result is not None
+    # 4 days * 5 hours = 20 total hours, minus 5 hours on day 2 = 15 hours used
+    assert result["hours_used"] == 15
+    assert result["ratio"] == pytest.approx(0.5)
+
+    # Crosscheck offline
+    from ha_efficiency import loft as offline_loft
+    all_ts = sorted(living.keys())
+    idx = pd.to_datetime(all_ts, unit="s", utc=True)
+    s_living = pd.Series([living[t] for t in all_ts], index=idx)
+    s_bedroom = pd.Series([bedroom.get(t, float("nan")) for t in all_ts], index=idx)
+    s_loft = pd.Series([loft[t] for t in all_ts], index=idx)
+    s_outdoor = pd.Series([outdoor[t] for t in all_ts], index=idx)
+    offline_res = offline_loft.loft_ratio(
+        {"living": s_living, "bedroom": s_bedroom}, s_loft, s_outdoor
+    )
+    assert offline_res["hours_used"] == 15
+    assert offline_res["ratio"] == pytest.approx(0.5)
+
+
+
 def test_nominal_loss_components_reconcile_and_share_is_bounded():
     result = ventilation.split_losses(
         ach=0.3,

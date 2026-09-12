@@ -76,6 +76,7 @@ DHW_WATER_MIN_DAYS = 10
 # cold draws, so a plausible whole-house rate sits well inside these.
 DHW_RATE_MIN_WH_PER_L_PER_K = 0.05
 DHW_RATE_MAX_WH_PER_L_PER_K = 1.5
+DHW_RATE_MAX_IQR_WH_PER_L_PER_K = 0.4
 HEATING_OFF_MAX_PCT = 1.0  # daily mean of the busiest room's heating power
 ELEC_MAX_STEP_KWH = 20.0  # bigger hourly steps are meter/statistics artifacts
 ELEC_MIN_DAYS = 14
@@ -478,6 +479,8 @@ def fit_dhw_water_rate(
         return None
     ordered = sorted(samples)
     iqr = ordered[(3 * len(ordered)) // 4] - ordered[len(ordered) // 4]
+    if iqr > DHW_RATE_MAX_IQR_WH_PER_L_PER_K:
+        return None
     return {
         "wh_per_litre_per_k": rate,
         "days_used": len(samples),
@@ -847,8 +850,8 @@ def loft_ratio(
         if local.hour not in LOFT_NIGHT_HOURS or local.date() < since:
             continue
         t_out = outdoor.get(ts)
-        temps = [room[ts] for room in rooms if ts in room]
-        if t_out is None or not temps:
+        temps = [room[ts] for room in rooms if ts in room and room[ts] is not None]
+        if t_out is None or not rooms or len(temps) != len(rooms):
             continue
         dt = sum(temps) / len(temps) - t_out
         if dt > LOFT_MIN_DT:

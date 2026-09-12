@@ -50,7 +50,8 @@
       "role_not_supported": "Heating demand belongs to conditioned rooms; humidity belongs to the loft",
       "conditioned_room_required": "Add at least one conditioned room before finishing",
       "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100",
-      "invalid_source": "Choose an external sensor. Integration-owned room history entities cannot be used as room sources."
+      "invalid_source": "Choose an external sensor. Integration-owned room history entities cannot be used as room sources.",
+      "duplicate_source": "This sensor is already assigned to another room"
     },
     "abort": {
       "single_instance_allowed": "Only one Thermal Efficiency instance is allowed"
@@ -147,6 +148,8 @@
       "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100",
       "at_least_one_room": "Keep or add at least one room before finishing",
       "invalid_source": "Choose an external sensor. Integration-owned room history entities cannot be used as replacement sources.",
+      "duplicate_source": "This sensor is already assigned to another room",
+      "overlapping_visit": "The assignment start date overlaps with an existing visit for this room or sensor",
       "invalid_correction": "Choose a time between the last verified assignment and now. If assignments changed while this form was open, review and retry."
     },
     "abort": {

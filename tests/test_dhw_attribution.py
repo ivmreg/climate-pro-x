@@ -269,6 +269,28 @@ def test_offline_water_rate_crosschecks_the_integration_math(thermal_math):
     assert offline["days_used"] == live["days_used"]
 
 
+def test_water_rate_rejects_inconsistent_samples_exceeding_dispersion_gate(thermal_math):
+    # 16 days with wild variance: half at 0.1, half at 0.9 Wh/L/K
+    # Median is ~0.5 (within 0.05-1.5), but IQR is 0.8 (> 0.4)
+    days = _days(16)
+    outdoor = {d: 15.0 for d in days}
+    water = {d: 200.0 for d in days}
+    q = {}
+    for i, d in enumerate(days):
+        rate_i = 0.1 if i % 2 == 0 else 0.9
+        rise = 55.0 - _mains(outdoor[d])
+        q[d] = water[d] * rate_i * rise / 1000
+
+    live = thermal_math.fit_dhw_water_rate(q, water, outdoor, set(days), SINCE)
+    assert live is None
+
+    offline = dhw.fit_dhw_water_rate(
+        pd.Series(q), pd.Series(water), pd.Series(outdoor), set(days)
+    )
+    assert offline is None
+
+
+
 # --- electricity -------------------------------------------------------------
 
 

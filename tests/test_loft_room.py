@@ -25,6 +25,7 @@ from custom_components.thermal_efficiency.config_migration import (
 )
 from custom_components.thermal_efficiency.const import (
     CONF_ASSIGNMENT_SINCE,
+    CONF_HEATING_POWER,
     CONF_HUMIDITY,
     CONF_LOFT,
     CONF_LOFT_HUMIDITY,
@@ -859,5 +860,153 @@ async def test_replaced_loft_with_assignment_since_and_migrated_source(hass):
     stream3 = manager2.data["streams"][active_visit3["stream"]]
     assert stream3["legacy_bridge_end"] == t3
     await manager2.async_shutdown()
+
+
+async def test_loft_assignment_since_overlap_rejected(hass):
+    loft_area = ar.async_get(hass).async_create("Loft")
+    living_area = ar.async_get(hass).async_create("Living")
+    living = _create_sensor(hass, "overlap_living_temp", living_area.id)
+    loft1 = _create_sensor(hass, "overlap_loft_temp_1", loft_area.id)
+
+    initial_config = {
+        "outdoor": "sensor.outdoor",
+        CONF_ROOMS: {
+            "living": {
+                "name": "Living",
+                CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                CONF_TEMPERATURE: living.entity_id,
+            },
+            "loft": {
+                "name": "Loft",
+                CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                CONF_TEMPERATURE: loft1.entity_id,
+                CONF_ASSIGNMENT_SINCE: "2026-08-01",
+            },
+        },
+    }
+    entry = MockConfigEntry(domain="thermal_efficiency", data=initial_config, version=2)
+    entry.add_to_hass(hass)
+
+    start_time = datetime(2026, 8, 15, 10, tzinfo=UTC).timestamp()
+    manager = RoomHistoryManager(hass, entry, initial_config)
+    manager._now = lambda: start_time
+    await manager.async_initialize()
+
+    # Manually simulate an earlier closed visit in loft from 2026-07-01 to 2026-08-01
+    t_jul1 = datetime(2026, 7, 1, tzinfo=UTC).timestamp()
+    t_aug1 = datetime(2026, 8, 1, tzinfo=UTC).timestamp()
+    manager.data["rooms"]["loft"]["visits"].insert(0, {
+        "id": "prior_loft_visit",
+        "stream": None,
+        "role": CONF_TEMPERATURE,
+        "start": t_jul1,
+        "end": t_aug1,
+        "cause": "legacy",
+        "legacy": True,
+        "expected": True,
+    })
+    validate_visits(manager.data)
+    await manager._save()
+    await manager.async_shutdown()
+
+    # Now edit assignment_since to 2026-07-15 which overlaps with [2026-07-01, 2026-08-01]
+    overlapping_config = deepcopy(initial_config)
+    overlapping_config[CONF_ROOMS]["loft"][CONF_ASSIGNMENT_SINCE] = "2026-07-15"
+    hass.config_entries.async_update_entry(entry, data=overlapping_config)
+
+    manager_overlap = RoomHistoryManager(hass, entry, overlapping_config)
+    manager_overlap._now = lambda: start_time + 100
+    with pytest.raises(ValueError, match="Assignments overlap"):
+        await manager_overlap.async_initialize()
+
+    # Verify that options flow also catches the overlap
+    options_flow = ThermalEfficiencyOptionsFlow()
+    options_flow.hass = hass
+    options_flow.handler = entry.entry_id
+    from custom_components.thermal_efficiency import ThermalRuntime
+    entry.runtime_data = ThermalRuntime(None, manager)
+
+    res_init = await options_flow.async_step_init()
+    res_settings = await options_flow.async_step_settings({"outdoor": "sensor.outdoor"})
+    res_room1 = await options_flow.async_step_room({
+        "name": "Living",
+        CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+        CONF_TEMPERATURE: living.entity_id,
+    })
+    res_loft = await options_flow.async_step_room({
+        "name": "Loft",
+        CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+        CONF_TEMPERATURE: loft1.entity_id,
+        CONF_ASSIGNMENT_SINCE: "2026-07-15",
+    })
+    assert res_loft["type"] is FlowResultType.FORM
+    assert res_loft["errors"] == {CONF_ASSIGNMENT_SINCE: "overlapping_visit"}
+
+
+async def test_config_flow_rejects_duplicate_source_across_rooms(hass):
+    flow = ThermalEfficiencyConfigFlow()
+    flow.hass = hass
+    await flow.async_step_user({"outdoor": "sensor.outdoor"})
+    await flow.async_step_room({CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED})
+    res_room1 = await flow.async_step_room_details({
+        "name": "Living",
+        CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+        CONF_TEMPERATURE: "sensor.shared_temp",
+        "add_another": True,
+    })
+    assert res_room1["type"] is FlowResultType.FORM
+
+    # Try to add Bed room with the same temperature sensor
+    await flow.async_step_room({CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED})
+    res_room2 = await flow.async_step_room_details({
+        "name": "Bed",
+        CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+        CONF_TEMPERATURE: "sensor.shared_temp",
+        "add_another": False,
+    })
+    assert res_room2["type"] is FlowResultType.FORM
+    assert res_room2["errors"] == {CONF_TEMPERATURE: "duplicate_source"}
+
+    # Also test intra-room collision: heating_power same as temperature
+    res_intra = await flow.async_step_room_details({
+        "name": "Bed",
+        CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+        CONF_TEMPERATURE: "sensor.bed_temp",
+        CONF_HEATING_POWER: "sensor.bed_temp",
+        "add_another": False,
+    })
+    assert res_intra["type"] is FlowResultType.FORM
+    assert res_intra["errors"] == {CONF_HEATING_POWER: "duplicate_source"}
+
+
+def test_validate_rooms_rejects_duplicate_sources():
+    from custom_components.thermal_efficiency import _validate_rooms
+    valid_rooms = {
+        "room1": {
+            CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+            CONF_TEMPERATURE: "sensor.temp1",
+            CONF_HEATING_POWER: "sensor.power1",
+        },
+        "room2": {
+            CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+            CONF_TEMPERATURE: "sensor.temp2",
+            CONF_HEATING_POWER: "sensor.power2",
+        },
+    }
+    assert _validate_rooms(valid_rooms) == valid_rooms
+
+    duplicate_rooms = {
+        "room1": {
+            CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+            CONF_TEMPERATURE: "sensor.temp1",
+        },
+        "room2": {
+            CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+            CONF_TEMPERATURE: "sensor.temp1",
+        },
+    }
+    with pytest.raises(vol.Invalid, match="Source sensor.temp1 cannot be assigned to multiple rooms"):
+        _validate_rooms(duplicate_rooms)
+
 
 

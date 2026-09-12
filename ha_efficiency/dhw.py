@@ -21,6 +21,7 @@ MIN_DAILY_HEATING_HOURS = 18
 DHW_WATER_MIN_DAYS = 10
 DHW_RATE_MIN_WH_PER_L_PER_K = 0.05
 DHW_RATE_MAX_WH_PER_L_PER_K = 1.5
+DHW_RATE_MAX_IQR_WH_PER_L_PER_K = 0.4
 CURRENT_BASELINE_DAYS = 30
 WATER_USAGE_MIN_DAYS = 5
 WATER_OUTLIER_MEDIAN_MULTIPLIER = 3.0
@@ -183,7 +184,15 @@ def fit_dhw_water_rate(
     rate = float(rates.median())
     if not DHW_RATE_MIN_WH_PER_L_PER_K <= rate <= DHW_RATE_MAX_WH_PER_L_PER_K:
         return None
-    return {"wh_per_litre_per_k": rate, "days_used": len(rates)}
+    ordered = sorted(rates)
+    iqr = float(ordered[(3 * len(ordered)) // 4] - ordered[len(ordered) // 4])
+    if iqr > DHW_RATE_MAX_IQR_WH_PER_L_PER_K:
+        return None
+    return {
+        "wh_per_litre_per_k": rate,
+        "days_used": len(rates),
+        "iqr_wh_per_litre_per_k": iqr,
+    }
 
 
 def dhw_kwh_from_water(litres: float, outdoor_c: float, water_rate: dict) -> float:
