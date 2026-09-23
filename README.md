@@ -102,9 +102,12 @@ installed on the development Home Assistant instance:
   fastest to slowest cooling, with fit counts and observation windows.
 
 It requires `apexcharts-card` and `lovelace-plotly-graph-card`. Paste the YAML
-into a dashboard's raw configuration editor. The example entity IDs match the
-development instance; edit the `metahome_` variants if Home Assistant assigned
-different IDs on your installation. The evidence panel intentionally does not
+into a dashboard's raw configuration editor. The example entity IDs in
+[`lovelace/thermal_efficiency_dashboard.yaml`](lovelace/thermal_efficiency_dashboard.yaml) and
+[`lovelace/thermal_efficiency_live.yaml`](lovelace/thermal_efficiency_live.yaml) match the
+development instance where Home Assistant's entity registry mapped integration unique IDs to local
+entity IDs (e.g. `metahome_` prefixes); see [`lovelace/README.md`](lovelace/README.md) for how to
+map entities by unique ID before reuse. The evidence panel intentionally does not
 fabricate a regression scatter plot from summary attributes; daily points
 remain a future diagnostics-data enhancement.
 

@@ -310,13 +310,14 @@ class RoomHistoryManager:
                         validate_visits(staged)
                         self.data["rooms"] = staged["rooms"]
                         self.data["streams"] = staged["streams"]
+                        room = self.data["rooms"][rid]
                     continue
                 if current:
                     if self._is_owned_entity(current):
                         continue
                     source = self._source(current, role)
                     if any(v.get("end") is None and self.data["streams"].get(v.get("stream"), {}).get("source_id") == source["id"]
-                           for v in room["visits"]):
+                           for v in self.data["rooms"][rid]["visits"]):
                         continue
                     if is_loft:
                         is_migrated_source = current in self.data.get("migration", {}).get("sources", {})
@@ -341,7 +342,7 @@ class RoomHistoryManager:
 
                         if should_bridge:
                             active = next(
-                                v for v in room["visits"]
+                                v for v in self.data["rooms"][rid]["visits"]
                                 if v.get("end") is None and v.get("stream")
                                 and self.data["streams"][v["stream"]]["source_id"] == source["id"]
                             )
