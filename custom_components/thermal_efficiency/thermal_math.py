@@ -1390,8 +1390,11 @@ def compute_all(
     # Ventilation/fabric split: air-change rate from CO2 decay curves, times
     # the flat's volume, gives ventilation W/K; the rest of the delivered
     # space-heating HLC is fabric (walls/windows/roof).
+    result["air_change_rate"] = None
     result["losses"] = None
-    if conf.get("co2") and conf.get("floor_area_m2") and conf.get("ceiling_height_m") and result["hlc"]:
+    result["losses_status"] = None
+    ach_fit = None
+    if conf.get("co2"):
         configured_co2 = conf["co2"]
         co2_ids = [configured_co2] if isinstance(configured_co2, str) else configured_co2
         outdoor_baseline = conf.get("outdoor_co2_ppm")
@@ -1425,27 +1428,48 @@ def compute_all(
                 if conf.get("outdoor_co2_ppm") is not None
                 else "indoor low-percentile fallback"
             )
-            volume = conf["floor_area_m2"] * conf["ceiling_height_m"]
-            ventilation_w_per_k = AIR_HEAT_CAPACITY * ach_fit["ach"] * volume
-            hlc_delivered = result["hlc"]["delivered_hlc_w_per_k"]
-            if 0 <= ventilation_w_per_k <= hlc_delivered:
-                fabric_w_per_k = hlc_delivered - ventilation_w_per_k
-                result["losses"] = {
-                    "ach": ach_fit["ach"],
-                    "windows": ach_fit["windows"],
-                    "baseline_ppm": ach_fit["baseline_ppm"],
-                    "co2_sensors_used": ach_fit["sensor_count"],
-                    "co2_baseline_source": ach_fit["baseline_source"],
-                    "ventilation_w_per_k": ventilation_w_per_k,
-                    "fabric_w_per_k": fabric_w_per_k,
-                    "hlc_delivered_w_per_k": hlc_delivered,
-                    "ventilation_share_pct": ventilation_w_per_k / hlc_delivered * 100,
-                    "boiler_efficiency_used": result["hlc"]["boiler_efficiency_used"],
-                    "scope": (
-                        f"median of {ach_fit['sensor_count']} room-derived ACH proxies "
-                        "scaled to configured home volume"
-                    ),
-                }
+            ach_fit["co2_sensors_used"] = ach_fit["sensor_count"]
+            ach_fit["co2_baseline_source"] = ach_fit["baseline_source"]
+            ach_fit["scope"] = (
+                f"median of {ach_fit['sensor_count']} room-derived ACH proxies "
+                "scaled to configured home volume"
+            ) if conf.get("floor_area_m2") and conf.get("ceiling_height_m") else (
+                f"median of {ach_fit['sensor_count']} room-derived ACH proxies"
+            )
+            result["air_change_rate"] = ach_fit
+
+    if ach_fit and conf.get("floor_area_m2") and conf.get("ceiling_height_m") and result["hlc"]:
+        volume = conf["floor_area_m2"] * conf["ceiling_height_m"]
+        ventilation_w_per_k = AIR_HEAT_CAPACITY * ach_fit["ach"] * volume
+        hlc_delivered = result["hlc"]["delivered_hlc_w_per_k"]
+        if 0 <= ventilation_w_per_k <= hlc_delivered:
+            fabric_w_per_k = hlc_delivered - ventilation_w_per_k
+            result["losses"] = {
+                "ach": ach_fit["ach"],
+                "windows": ach_fit["windows"],
+                "baseline_ppm": ach_fit["baseline_ppm"],
+                "co2_sensors_used": ach_fit["sensor_count"],
+                "co2_baseline_source": ach_fit["baseline_source"],
+                "ventilation_w_per_k": ventilation_w_per_k,
+                "fabric_w_per_k": fabric_w_per_k,
+                "hlc_delivered_w_per_k": hlc_delivered,
+                "ventilation_share_pct": ventilation_w_per_k / hlc_delivered * 100,
+                "boiler_efficiency_used": result["hlc"]["boiler_efficiency_used"],
+                "scope": ach_fit["scope"],
+            }
+            result["losses_status"] = "consistent"
+        else:
+            result["losses"] = None
+            result["losses_status"] = {
+                "status": "inconsistent",
+                "calculated_ventilation_w_per_k": ventilation_w_per_k,
+                "hlc_delivered_w_per_k": hlc_delivered,
+                "diagnostic_note": (
+                    "physically inconsistent ventilation/fabric split: "
+                    f"calculated ventilation loss ({ventilation_w_per_k:.1f} W/K) "
+                    f"exceeds delivered HLC ({hlc_delivered:.1f} W/K)"
+                ),
+            }
 
     for name, temps in room_temp.items():
         result["rooms"][name] = None

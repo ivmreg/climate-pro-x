@@ -205,21 +205,21 @@ class AirChangeRateSensor(ThermalSensor):
 
     @property
     def native_value(self) -> float | None:
-        losses = self.coordinator.data.get("losses")
-        return round(losses["ach"], 3) if losses else None
+        ach = self.coordinator.data.get("air_change_rate") or self.coordinator.data.get("losses")
+        return round(ach["ach"], 3) if ach and "ach" in ach else None
 
     @property
     def extra_state_attributes(self) -> dict:
-        losses = self.coordinator.data.get("losses")
-        if not losses:
+        ach = self.coordinator.data.get("air_change_rate") or self.coordinator.data.get("losses")
+        if not ach or "ach" not in ach:
             return {"note": "not enough clean CO2 decay windows yet - "
                              "configure a CO2 sensor, floor area and ceiling height"}
         return {
-            "decay_windows_used": losses["windows"],
-            "outdoor_co2_baseline_ppm": round(losses["baseline_ppm"], 0),
-            "co2_sensors_used": losses.get("co2_sensors_used", 1),
-            "co2_baseline_source": losses.get("co2_baseline_source"),
-            "scope": losses.get("scope"),
+            "decay_windows_used": ach["windows"],
+            "outdoor_co2_baseline_ppm": round(ach["baseline_ppm"], 0),
+            "co2_sensors_used": ach.get("co2_sensors_used", 1),
+            "co2_baseline_source": ach.get("co2_baseline_source"),
+            "scope": ach.get("scope"),
         }
 
 
@@ -233,12 +233,17 @@ class VentilationLossSensor(ThermalSensor):
     @property
     def native_value(self) -> float | None:
         losses = self.coordinator.data.get("losses")
-        return round(losses["ventilation_w_per_k"], 1) if losses else None
+        return round(losses["ventilation_w_per_k"], 1) if losses and losses.get("ventilation_w_per_k") is not None else None
 
     @property
     def extra_state_attributes(self) -> dict:
         losses = self.coordinator.data.get("losses")
-        if not losses:
+        if not losses or losses.get("ventilation_w_per_k") is None:
+            status_data = self.coordinator.data.get("losses_status")
+            if isinstance(status_data, dict) and status_data.get("diagnostic_note"):
+                return {"note": status_data["diagnostic_note"]}
+            if isinstance(losses, dict) and losses.get("diagnostic_note"):
+                return {"note": losses["diagnostic_note"]}
             return {"note": "not enough data yet"}
         return {
             "share_of_delivered_hlc_pct": (
@@ -260,12 +265,17 @@ class FabricLossSensor(ThermalSensor):
     @property
     def native_value(self) -> float | None:
         losses = self.coordinator.data.get("losses")
-        return round(losses["fabric_w_per_k"], 1) if losses else None
+        return round(losses["fabric_w_per_k"], 1) if losses and losses.get("fabric_w_per_k") is not None else None
 
     @property
     def extra_state_attributes(self) -> dict:
         losses = self.coordinator.data.get("losses")
-        if not losses:
+        if not losses or losses.get("fabric_w_per_k") is None:
+            status_data = self.coordinator.data.get("losses_status")
+            if isinstance(status_data, dict) and status_data.get("diagnostic_note"):
+                return {"note": status_data["diagnostic_note"]}
+            if isinstance(losses, dict) and losses.get("diagnostic_note"):
+                return {"note": losses["diagnostic_note"]}
             return {"note": "not enough data yet"}
         return {
             "hlc_delivered_w_per_k": round(losses["hlc_delivered_w_per_k"], 1),

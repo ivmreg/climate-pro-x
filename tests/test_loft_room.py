@@ -1009,4 +1009,139 @@ def test_validate_rooms_rejects_duplicate_sources():
         _validate_rooms(duplicate_rooms)
 
 
+async def test_loft_assignment_since_change_with_humidity_edit(hass):
+    loft_area = ar.async_get(hass).async_create("Loft")
+    living_area = ar.async_get(hass).async_create("Living")
+    living = _create_sensor(hass, "living_temp_comb", living_area.id)
+    loft_temp = _create_sensor(hass, "loft_temp_comb", loft_area.id)
+    loft_hum1 = _create_sensor(hass, "loft_hum_comb_1", loft_area.id)
+    loft_hum2 = _create_sensor(hass, "loft_hum_comb_2", loft_area.id)
 
+    initial_config = {
+        "outdoor": "sensor.outdoor",
+        CONF_ROOMS: {
+            "living": {
+                "name": "Living",
+                CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                CONF_TEMPERATURE: living.entity_id,
+            },
+            "loft": {
+                "name": "Loft",
+                CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                CONF_TEMPERATURE: loft_temp.entity_id,
+                CONF_HUMIDITY: loft_hum1.entity_id,
+                CONF_ASSIGNMENT_SINCE: "2026-08-01",
+            },
+        },
+    }
+    entry = MockConfigEntry(domain="thermal_efficiency", data=initial_config, version=2)
+    entry.add_to_hass(hass)
+
+    t0 = datetime(2026, 8, 15, 10, tzinfo=UTC).timestamp()
+    manager = RoomHistoryManager(hass, entry, initial_config)
+    manager._now = lambda: t0
+    await manager.async_initialize()
+    await manager.async_shutdown()
+
+    # Verify initial visits for loft
+    loft_visits_0 = manager.data["rooms"]["loft"]["visits"]
+    temp_visit_0 = next(v for v in loft_visits_0 if v["role"] == CONF_TEMPERATURE and v["end"] is None)
+    hum_visit_0 = next(v for v in loft_visits_0 if v["role"] == CONF_HUMIDITY and v["end"] is None)
+    t_aug1 = assignment_timestamp("2026-08-01")
+    assert temp_visit_0["start"] == t_aug1
+    assert hum_visit_0["start"] == t_aug1
+
+    # Exact combined edit: change assignment_since AND replace humidity source together
+    # Temperature source remains unchanged.
+    t_aug10 = assignment_timestamp("2026-08-10")
+    t1 = datetime(2026, 8, 20, 10, tzinfo=UTC).timestamp()
+    updated_config = deepcopy(initial_config)
+    updated_config[CONF_ROOMS]["loft"][CONF_ASSIGNMENT_SINCE] = "2026-08-10"
+    updated_config[CONF_ROOMS]["loft"][CONF_HUMIDITY] = loft_hum2.entity_id
+    hass.config_entries.async_update_entry(entry, data=updated_config)
+
+    manager2 = RoomHistoryManager(hass, entry, updated_config)
+    manager2._now = lambda: t1
+    # Must not raise StopIteration
+    await manager2.async_initialize()
+
+    # Verify valid visit chronology and that visits were not lost
+    loft_visits_1 = manager2.data["rooms"]["loft"]["visits"]
+    active_temp = next(v for v in loft_visits_1 if v["role"] == CONF_TEMPERATURE and v["end"] is None)
+    active_hum = next(v for v in loft_visits_1 if v["role"] == CONF_HUMIDITY and v["end"] is None)
+    closed_hum = next(v for v in loft_visits_1 if v["role"] == CONF_HUMIDITY and v["end"] is not None)
+
+    # Temperature visit was updated to the new assignment_since
+    assert active_temp["start"] == t_aug10
+    assert active_temp["end"] is None
+
+    # Prior humidity visit was closed at the new assignment_since, not lost
+    assert closed_hum["start"] == t_aug1
+    assert closed_hum["end"] == t_aug10
+    stream_old = manager2.data["streams"][closed_hum["stream"]]
+    assert stream_old["source_id"] == manager2._source(loft_hum1.entity_id, CONF_HUMIDITY)["id"]
+
+    # New humidity visit is active from t_aug10
+    assert active_hum["start"] == t_aug10
+    assert active_hum["end"] is None
+    stream_new = manager2.data["streams"][active_hum["stream"]]
+    assert stream_new["source_id"] == manager2._source(loft_hum2.entity_id, CONF_HUMIDITY)["id"]
+
+    # Verify visit chronology and overlaps
+    validate_visits(manager2.data)
+    await manager2.async_shutdown()
+
+
+async def test_loft_assignment_since_change_with_humidity_added(hass):
+    loft_area = ar.async_get(hass).async_create("LoftAdd")
+    living_area = ar.async_get(hass).async_create("LivingAdd")
+    living = _create_sensor(hass, "living_temp_add", living_area.id)
+    loft_temp = _create_sensor(hass, "loft_temp_add", loft_area.id)
+    loft_hum = _create_sensor(hass, "loft_hum_add", loft_area.id)
+
+    initial_config = {
+        "outdoor": "sensor.outdoor",
+        CONF_ROOMS: {
+            "living": {
+                "name": "Living",
+                CONF_ROOM_TYPE: ROOM_TYPE_CONDITIONED,
+                CONF_TEMPERATURE: living.entity_id,
+            },
+            "loft": {
+                "name": "Loft",
+                CONF_ROOM_TYPE: ROOM_TYPE_LOFT,
+                CONF_TEMPERATURE: loft_temp.entity_id,
+                CONF_ASSIGNMENT_SINCE: "2026-08-01",
+            },
+        },
+    }
+    entry = MockConfigEntry(domain="thermal_efficiency", data=initial_config, version=2)
+    entry.add_to_hass(hass)
+
+    t0 = datetime(2026, 8, 15, 10, tzinfo=UTC).timestamp()
+    manager = RoomHistoryManager(hass, entry, initial_config)
+    manager._now = lambda: t0
+    await manager.async_initialize()
+    await manager.async_shutdown()
+
+    # Exact combined edit: change assignment_since AND add humidity source together
+    t_aug10 = assignment_timestamp("2026-08-10")
+    t1 = datetime(2026, 8, 20, 10, tzinfo=UTC).timestamp()
+    updated_config = deepcopy(initial_config)
+    updated_config[CONF_ROOMS]["loft"][CONF_ASSIGNMENT_SINCE] = "2026-08-10"
+    updated_config[CONF_ROOMS]["loft"][CONF_HUMIDITY] = loft_hum.entity_id
+    hass.config_entries.async_update_entry(entry, data=updated_config)
+
+    manager2 = RoomHistoryManager(hass, entry, updated_config)
+    manager2._now = lambda: t1
+    # Must not raise StopIteration
+    await manager2.async_initialize()
+
+    loft_visits = manager2.data["rooms"]["loft"]["visits"]
+    active_temp = next(v for v in loft_visits if v["role"] == CONF_TEMPERATURE and v["end"] is None)
+    active_hum = next(v for v in loft_visits if v["role"] == CONF_HUMIDITY and v["end"] is None)
+
+    assert active_temp["start"] == t_aug10
+    assert active_hum["start"] == t_aug10
+    validate_visits(manager2.data)
+    await manager2.async_shutdown()

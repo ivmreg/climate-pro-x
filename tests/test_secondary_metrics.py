@@ -181,3 +181,136 @@ def test_offline_water_fit_rejects_low_quality_positive_correlation():
     )
 
     assert dhw.fit_water_gas(gas, water) is None
+
+
+def test_compute_all_separates_ach_from_inconsistent_loss_split(thermal_math):
+    start_ts = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+    co2_rows = []
+    # 12 windows, each 5 hours long, starting at 12:00 every day
+    # C(t) = 400 + 400 * exp(-0.5 * t)
+    for day in range(15):
+        day_base = start_ts + day * 86400 + 12 * 3600
+        for h in range(5):
+            val = 400.0 + 400.0 * (2.718281828459045 ** (-0.5 * h))
+            co2_rows.append({"start": day_base + h * 3600, "mean": val})
+
+    # Prepare gas and indoor/outdoor temp that yield a small delivered HLC, e.g. 20 W/K
+    # Vary outdoor temp between 2C (dT=18) and 8C (dT=12) so dT spread >= 3.0
+    # Volume: 200 m2 * 3.0 m = 600 m3
+    # ACH ~ 0.5 -> ventilation = 0.335 * 0.5 * 600 = 100.5 W/K
+    # Since 100.5 W/K > 20 W/K, this is physically inconsistent!
+    outdoor_rows = []
+    temp_rows = []
+    gas_rows = []
+    cum_gas = 0.0
+    for day in range(40):
+        ts = start_ts + day * 86400
+        t_out = 2.0 if (day % 2 == 0) else 8.0
+        dt = 20.0 - t_out  # 18 or 12
+        day_gas = 20.0 * dt * 24.0 / 1000.0 / 0.88
+        for h in range(24):
+            hour_ts = ts + h * 3600
+            outdoor_rows.append({"start": hour_ts, "mean": t_out})
+            temp_rows.append({"start": hour_ts, "mean": 20.0})
+            cum_gas += day_gas / 24.0
+            gas_rows.append({"start": hour_ts, "sum": cum_gas})
+
+    stats = {
+        "sensor.co2": co2_rows,
+        "sensor.outdoor": outdoor_rows,
+        "sensor.temp": temp_rows,
+        "sensor.gas": gas_rows,
+    }
+    conf = {
+        "rooms": {
+            "living": {"temperature": "sensor.temp"}
+        },
+        "outdoor": "sensor.outdoor",
+        "gas_meter": "sensor.gas",
+        "co2": "sensor.co2",
+        "outdoor_co2_ppm": 400.0,
+        "floor_area_m2": 200.0,
+        "ceiling_height_m": 3.0,
+        "boiler_efficiency": 0.88,
+    }
+    tz = ZoneInfo("Europe/London")
+    now = datetime(2026, 2, 15, tzinfo=timezone.utc)
+    res = thermal_math.compute_all(stats, conf, tz, now, (30, 60))
+
+    assert res["air_change_rate"] is not None
+    assert res["air_change_rate"]["ach"] == pytest.approx(0.5, abs=0.05)
+    assert res["air_change_rate"]["windows"] >= 10
+
+    # Losses split must be None because ventilation exceeds delivered HLC
+    assert res["losses"] is None
+    assert res["losses_status"] is not None
+    assert res["losses_status"]["status"] == "inconsistent"
+    assert "exceeds delivered HLC" in res["losses_status"]["diagnostic_note"]
+
+
+def test_loss_sensors_handle_inconsistent_split_vs_insufficient_co2():
+    from custom_components.thermal_efficiency.sensor import (
+        AirChangeRateSensor,
+        VentilationLossSensor,
+        FabricLossSensor,
+    )
+    from unittest.mock import MagicMock
+
+    # Case 1: Inconsistent split (ACH valid, but ventilation > HLC)
+    coordinator = MagicMock()
+    coordinator.data = {
+        "air_change_rate": {
+            "ach": 0.456,
+            "windows": 14,
+            "baseline_ppm": 415.0,
+            "co2_sensors_used": 1,
+            "co2_baseline_source": "outdoor sensor",
+            "scope": "home volume",
+        },
+        "losses": None,
+        "losses_status": {
+            "status": "inconsistent",
+            "calculated_ventilation_w_per_k": 85.0,
+            "hlc_delivered_w_per_k": 60.0,
+            "diagnostic_note": (
+                "physically inconsistent ventilation/fabric split: "
+                "calculated ventilation loss (85.0 W/K) exceeds delivered HLC (60.0 W/K)"
+            ),
+        },
+    }
+
+    ach_sensor = AirChangeRateSensor(coordinator)
+    vent_sensor = VentilationLossSensor(coordinator)
+    fabric_sensor = FabricLossSensor(coordinator)
+
+    # Air change rate sensor retains true ACH and evidence
+    assert ach_sensor.native_value == 0.456
+    attrs = ach_sensor.extra_state_attributes
+    assert attrs["decay_windows_used"] == 14
+    assert attrs["outdoor_co2_baseline_ppm"] == 415.0
+    assert attrs["co2_sensors_used"] == 1
+
+    # Ventilation and fabric sensors are unavailable
+    assert vent_sensor.native_value is None
+    assert fabric_sensor.native_value is None
+
+    # Diagnostic note distinguishes physical inconsistency
+    vent_note = vent_sensor.extra_state_attributes["note"]
+    fabric_note = fabric_sensor.extra_state_attributes["note"]
+    assert "exceeds delivered HLC" in vent_note
+    assert "physically inconsistent" in vent_note
+    assert "exceeds delivered HLC" in fabric_note
+    assert "physically inconsistent" in fabric_note
+
+    # Case 2: Insufficient CO2 decay windows (no ACH)
+    coordinator.data = {
+        "air_change_rate": None,
+        "losses": None,
+        "losses_status": None,
+    }
+    assert ach_sensor.native_value is None
+    assert "not enough clean CO2 decay windows yet" in ach_sensor.extra_state_attributes["note"]
+    assert vent_sensor.native_value is None
+    assert vent_sensor.extra_state_attributes["note"] == "not enough data yet"
+    assert fabric_sensor.native_value is None
+    assert fabric_sensor.extra_state_attributes["note"] == "not enough data yet"

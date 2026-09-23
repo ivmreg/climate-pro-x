@@ -104,9 +104,14 @@ views:
         rows: 3
     - type: conditional
       conditions:
-      - condition: state
-        entity: sensor.thermal_efficiency_heat_loss_coefficient
-        state: unknown
+      - condition: or
+        conditions:
+        - condition: state
+          entity: sensor.thermal_efficiency_heat_loss_coefficient
+          state: unknown
+        - condition: state
+          entity: sensor.thermal_efficiency_heat_loss_coefficient
+          state: unavailable
       card:
         type: tile
         entity: sensor.thermal_efficiency_heat_loss_coefficient
@@ -146,9 +151,14 @@ views:
         rows: 3
     - type: conditional
       conditions:
-      - condition: state
-        entity: sensor.metahome_thermal_efficiency_air_change_rate
-        state: unknown
+      - condition: or
+        conditions:
+        - condition: state
+          entity: sensor.metahome_thermal_efficiency_air_change_rate
+          state: unknown
+        - condition: state
+          entity: sensor.metahome_thermal_efficiency_air_change_rate
+          state: unavailable
       card:
         type: tile
         entity: sensor.metahome_thermal_efficiency_air_change_rate
@@ -190,9 +200,14 @@ views:
         rows: 3
     - type: conditional
       conditions:
-      - condition: state
-        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
-        state: unknown
+      - condition: or
+        conditions:
+        - condition: state
+          entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+          state: unknown
+        - condition: state
+          entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+          state: unavailable
       card:
         type: tile
         entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
@@ -203,22 +218,51 @@ views:
       grid_options:
         columns: 6
         rows: 3
-    - type: gauge
-      entity: sensor.thermal_efficiency_loft_ratio
-      name: Loft Coupling
-      min: 0
-      max: 1
-      needle: true
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.thermal_efficiency_loft_ratio
+        state_not: unknown
+      - condition: state
+        entity: sensor.thermal_efficiency_loft_ratio
+        state_not: unavailable
+      card:
+        type: gauge
+        entity: sensor.thermal_efficiency_loft_ratio
+        name: Loft Coupling
+        min: 0
+        max: 1
+        needle: true
+        segments:
+        - from: 0
+          color: '#2e7d32'
+        - from: 0.2
+          color: '#f9a825'
+        - from: 0.45
+          color: '#c62828'
       grid_options:
         columns: 6
         rows: 3
-      segments:
-      - from: 0
-        color: '#2e7d32'
-      - from: 0.2
-        color: '#f9a825'
-      - from: 0.45
-        color: '#c62828'
+    - type: conditional
+      conditions:
+      - condition: or
+        conditions:
+        - condition: state
+          entity: sensor.thermal_efficiency_loft_ratio
+          state: unknown
+        - condition: state
+          entity: sensor.thermal_efficiency_loft_ratio
+          state: unavailable
+      card:
+        type: tile
+        entity: sensor.thermal_efficiency_loft_ratio
+        name: Loft Coupling
+        icon: mdi:home-roof
+        color: amber
+        vertical: true
+      grid_options:
+        columns: 6
+        rows: 3
     column_span: 1
     type: grid
   - cards:
