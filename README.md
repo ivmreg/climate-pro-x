@@ -107,7 +107,7 @@ into a dashboard's raw configuration editor. The example entity IDs in
 [`lovelace/thermal_efficiency_live.yaml`](lovelace/thermal_efficiency_live.yaml) match the
 development instance where Home Assistant's entity registry mapped integration unique IDs to local
 entity IDs (e.g. `metahome_` prefixes); see [`lovelace/README.md`](lovelace/README.md) for how to
-map entities by unique ID or default name before reuse. The evidence panel intentionally does not
+map entities by unique ID before reuse. The evidence panel intentionally does not
 fabricate a regression scatter plot from summary attributes; daily points
 remain a future diagnostics-data enhancement.
 

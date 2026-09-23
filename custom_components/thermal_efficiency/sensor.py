@@ -212,8 +212,12 @@ class AirChangeRateSensor(ThermalSensor):
     def extra_state_attributes(self) -> dict:
         ach = self.coordinator.data.get("air_change_rate") or self.coordinator.data.get("losses")
         if not ach or "ach" not in ach:
-            return {"note": "not enough clean CO2 decay windows yet - "
-                             "configure a CO2 sensor, floor area and ceiling height"}
+            return {
+                "note": (
+                    "not enough clean CO2 decay windows yet - configure a CO2 sensor "
+                    "(floor area and ceiling height are only required for the ventilation/fabric loss split)"
+                )
+            }
         return {
             "decay_windows_used": ach["windows"],
             "outdoor_co2_baseline_ppm": round(ach["baseline_ppm"], 0),
