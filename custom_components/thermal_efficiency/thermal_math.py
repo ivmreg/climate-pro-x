@@ -1148,18 +1148,32 @@ def compute_all(
             for d, dhw in dhw_by_day.items()
             if d in q_by_day
         }
+        dhw_latest_day = max(dhw_by_day) if dhw_by_day else None
+        space_latest_day = max(space_by_day) if space_by_day else None
         usage = {
-            "dhw_kwh_per_day_7d": recent_daily_mean(
-                dhw_by_day, yesterday, 7, RECENT_7D_MIN_DAYS
+            "dhw_kwh_per_day_7d": (
+                recent_daily_mean(dhw_by_day, dhw_latest_day, 7, RECENT_7D_MIN_DAYS)
+                if dhw_latest_day
+                else None
             ),
-            "dhw_kwh_per_day_30d": recent_daily_mean(
-                dhw_by_day, yesterday, 30, RECENT_30D_MIN_DAYS
+            "dhw_kwh_per_day_30d": (
+                recent_daily_mean(dhw_by_day, dhw_latest_day, 30, RECENT_30D_MIN_DAYS)
+                if dhw_latest_day
+                else None
             ),
-            "space_heating_kwh_per_day_7d": recent_daily_mean(
-                space_by_day, yesterday, 7, RECENT_7D_MIN_DAYS
+            "space_heating_kwh_per_day_7d": (
+                recent_daily_mean(
+                    space_by_day, space_latest_day, 7, RECENT_7D_MIN_DAYS
+                )
+                if space_latest_day
+                else None
             ),
-            "space_heating_kwh_per_day_30d": recent_daily_mean(
-                space_by_day, yesterday, 30, RECENT_30D_MIN_DAYS
+            "space_heating_kwh_per_day_30d": (
+                recent_daily_mean(
+                    space_by_day, space_latest_day, 30, RECENT_30D_MIN_DAYS
+                )
+                if space_latest_day
+                else None
             ),
             "heating_off_days": sum(1 for d in dhw_by_day if d in heating_off),
             "modelled_days": sum(1 for d in dhw_by_day if d not in heating_off),
@@ -1169,6 +1183,9 @@ def compute_all(
             **dhw_quality,
             "latest_complete_gas_day": max(q_by_day) if q_by_day else None,
             "latest_complete_water_day": water_latest_day,
+            "source_lag_days": (
+                (yesterday - dhw_latest_day).days if dhw_latest_day else None
+            ),
         }
         gas_rate = conf.get("gas_unit_rate")
         if gas_rate:
