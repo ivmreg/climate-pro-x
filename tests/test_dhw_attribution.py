@@ -429,3 +429,81 @@ def test_hlc_is_unchanged_as_non_heating_season_accumulates(thermal_math):
     assert early_summer["hlc"]["model_data_through"] == late_summer["hlc"][
         "model_data_through"
     ]
+
+
+def test_gas_rolling_window_anchors_to_latest_attributed_day(thermal_math):
+    """Delayed gas/attribution days anchor rolling averages to the latest
+    available attributed day instead of yesterday, preserving minimum-day guards
+    and reporting source_lag_days without blindly trusting max(q_by_day)."""
+    start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    stats = {key: [] for key in ("room", "outdoor", "heat", "gas", "water")}
+    gas_total = 1000.0
+    water_total = 5000.0
+
+    # 40 summer days of data (heating off, flat 10 kWh/day DHW gas)
+    for hour in range(40 * 24):
+        day = hour // 24
+        ts = int(start.timestamp()) + hour * 3600
+        daily_gas = 10.0
+        gas_total += daily_gas / 24
+        water_total += 400.0 / 24
+        stats["room"].append({"start": ts, "mean": 21.0})
+        stats["outdoor"].append({"start": ts, "mean": 19.0})
+        stats["heat"].append({"start": ts, "mean": 0.0})
+        stats["gas"].append({"start": ts, "sum": gas_total})
+        stats["water"].append({"start": ts, "sum": water_total})
+
+    conf = {
+        "rooms": {"room": {"temperature": "room", "heating_power": "heat"}},
+        "outdoor": "outdoor",
+        "gas_meter": "gas",
+        "water": "water",
+        "boiler_efficiency": 0.9,
+    }
+
+    # 1. Delayed meter: gas stops at day 30 while now is day 35 (5 days lag).
+    # With anchor at yesterday (day 34), the 7-day window ending day 34 has only
+    # 3 days of gas (days 28-30), which is < 5 and would have produced None.
+    # Anchoring to the latest attributed day (day 29 complete) yields a valid 7-day mean.
+    cutoff_ts = int(start.timestamp()) + 30 * 24 * 3600
+    delayed = {
+        "room": stats["room"][: 35 * 24],
+        "outdoor": stats["outdoor"][: 35 * 24],
+        "heat": stats["heat"][: 35 * 24],
+        "gas": [row for row in stats["gas"] if row["start"] < cutoff_ts],
+        "water": stats["water"][: 35 * 24],
+    }
+    now = start + timedelta(days=35)
+    res = thermal_math.compute_all(delayed, conf, TZ, now, (30, 60))
+    usage = res["usage"]
+    assert usage is not None
+    assert usage["dhw_kwh_per_day_7d"] == pytest.approx(10.0, rel=0.05)
+    assert usage["space_heating_kwh_per_day_7d"] == pytest.approx(0.0, abs=0.01)
+    assert usage["source_lag_days"] == (date(2026, 7, 5) - usage["latest_complete_gas_day"]).days
+
+    # 2. Minimum-day guard: if there are only 4 days in the 7-day window ending at
+    # the latest attributed day, the 7-day mean must return None.
+    # Provide 14 days of gas for the initial baseline (days 0-13), then a 15-day gap,
+    # then only 4 days of gas (days 29-32).
+    sparse_gas_rows = [
+        row for row in stats["gas"]
+        if row["start"] < int(start.timestamp()) + 14 * 24 * 3600
+        or (int(start.timestamp()) + 29 * 24 * 3600 <= row["start"] < int(start.timestamp()) + 33 * 24 * 3600)
+    ]
+    sparse = {
+        "room": stats["room"][: 35 * 24],
+        "outdoor": stats["outdoor"][: 35 * 24],
+        "heat": stats["heat"][: 35 * 24],
+        "gas": sparse_gas_rows,
+        "water": stats["water"][: 35 * 24],
+    }
+    sparse_res = thermal_math.compute_all(sparse, conf, TZ, now, (30, 60))
+    sparse_usage = sparse_res["usage"]
+    assert sparse_usage is not None
+    # Latest attributed day has only 4 days in [day 26 .. day 32] -> len < 5 -> None
+    assert sparse_usage["dhw_kwh_per_day_7d"] is None
+    assert sparse_usage["space_heating_kwh_per_day_7d"] is None
+    # 30-day window ending at day 32 has 14 days total -> len < 20 -> None
+    assert sparse_usage["dhw_kwh_per_day_30d"] is None
+    assert sparse_usage["space_heating_kwh_per_day_30d"] is None
+
