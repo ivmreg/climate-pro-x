@@ -127,12 +127,12 @@ def test_f1_pipeline_completes_with_gas_positive_water_zero_threshold_zero():
     elec_cum = 50.0
     for h in range(hours):
         ts = int(start.timestamp()) + h * 3600
-        # Cold winter with heating on
-        outdoor = 4.0 + (h // 24) / 8.0
-        daily_gas = 3.0 + 7.2 * (20.0 - outdoor)
+        # Heating-off gas triggers DHW rate fitting despite zero water.
+        outdoor = 18.0
+        daily_gas = 8.0
         stats["sensor.temp"].append(_row(ts, "mean", 20.0))
         stats["sensor.out"].append(_row(ts, "mean", outdoor))
-        stats["sensor.heat"].append(_row(ts, "mean", 40.0))
+        stats["sensor.heat"].append(_row(ts, "mean", 0.0))
         gas_cum += daily_gas / 24
         stats["sensor.gas"].append(_row(ts, "sum", gas_cum))
         # Total water meter stays flat at 0.0
@@ -152,13 +152,13 @@ def test_f1_pipeline_completes_with_gas_positive_water_zero_threshold_zero():
     now = datetime.fromtimestamp(int(start.timestamp()) + (hours - 1) * 3600, TZ)
     res = thermal_math.compute_all(stats, conf, TZ, now, (30,))
 
-    # Electricity and HLC should succeed independently
+    # Independent metered electricity survives; heating-off gas cannot be HLC.
     assert res["electricity"] is not None
     assert res["electricity"]["kwh_per_day"] == pytest.approx(0.3 * 24, rel=0.05)
-    assert res["hlc"] is not None
-    assert res["hlc"]["delivered_hlc_w_per_k"] > 0
+    assert res["hlc"] is None
     # DHW rate cannot fit with 0 water, but baseline / pipeline must not crash
-    assert res["dhw"] is None or res["dhw"].get("water_rate_days_used", 0) == 0
+    assert res["dhw"] is not None
+    assert res["dhw"].get("water_rate_days_used", 0) == 0
 
 
 # ==============================================================================
@@ -186,9 +186,6 @@ def test_f2_missing_hours_rejected_does_not_return_distorted_hlc():
         hourly_kwh = daily_kwh / 24.0
 
         for h in range(24):
-            # Drop 10:00 and 11:00
-            if h in (10, 11):
-                continue
             ts = int(start.timestamp()) + (d * 24 + h) * 3600
             gas_cum += hourly_kwh
             stats["sensor.temp"].append(_row(ts, "mean", 20.0))
@@ -203,6 +200,14 @@ def test_f2_missing_hours_rejected_does_not_return_distorted_hlc():
         "boiler_efficiency": 1.0,
     }
     now = datetime.fromtimestamp(int(start.timestamp()) + (days_count * 24 - 1) * 3600, TZ)
+    complete = thermal_math.compute_all(stats, conf, TZ, now, (30,))
+    assert complete["hlc"]["delivered_hlc_w_per_k"] == pytest.approx(HLC_TRUE)
+    # Consumption still occurs during missing meter observations. Temperature
+    # and heating histories remain complete, isolating the meter defect.
+    stats["sensor.gas"] = [
+        row for row in stats["sensor.gas"]
+        if datetime.fromtimestamp(row["start"], TZ).hour not in (10, 11)
+    ]
     res = thermal_math.compute_all(stats, conf, TZ, now, (30,))
 
     # Incomplete days must be rejected! No valid 262.5 W/K should be returned.
