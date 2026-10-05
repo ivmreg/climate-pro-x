@@ -4,6 +4,8 @@ import voluptuous as vol
 
 from custom_components.thermal_efficiency import CONFIG_SCHEMA
 from custom_components.thermal_efficiency.validation import validate_global_sources
+from custom_components.thermal_efficiency.validation import validate_source_metadata_and_state
+from types import SimpleNamespace
 
 
 @pytest.mark.parametrize("field", [
@@ -35,3 +37,10 @@ def test_zero_occupancy_threshold_and_finite_physical_boundaries_are_accepted():
         "floor_area_m2": 1, "ceiling_height_m": 1.8,
         "outdoor_co2_ppm": 350, "max_window_days": 730,
     }, {}) == {}
+
+
+def test_external_water_with_verified_sum_needs_no_live_entity():
+    hass = SimpleNamespace(states=SimpleNamespace(get=lambda _: None))
+    assert validate_source_metadata_and_state(hass, "utility:water", "water", {
+        "unit_of_measurement": "m³", "has_sum": True, "source": "utility",
+    }) == (None, None)

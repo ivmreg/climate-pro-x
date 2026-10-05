@@ -38,7 +38,7 @@ from custom_components.thermal_efficiency.validation import (
 
 
 @pytest.fixture(autouse=True)
-def _enable_custom_integrations(recorder_db_url, enable_custom_integrations):
+def _enable_custom_integrations(recorder_db_url, enable_custom_integrations, recorder_mock):
     """Allow Home Assistant to discover this repository's custom integration."""
 
 
@@ -308,8 +308,8 @@ async def test_options_flow_settings_preflight_and_experimental_toggle(hass):
 
     # Initialize options flow
     result = await flow.async_step_init()
-    assert result["type"] is FlowResultType.MENU
-    assert "settings" in result["step_id"] or result["step_id"] == "init"
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "settings"
 
     # Step into settings with invalid water sensor
     with patch(

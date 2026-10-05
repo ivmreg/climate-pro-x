@@ -46,7 +46,7 @@ from custom_components.thermal_efficiency.validation import heating_power_issue
 
 
 @pytest.fixture(autouse=True)
-def _enable_custom_integrations(recorder_db_url, enable_custom_integrations):
+def _enable_custom_integrations(recorder_db_url, enable_custom_integrations, recorder_mock):
     """Allow Home Assistant to discover this repository's custom integration."""
 
 

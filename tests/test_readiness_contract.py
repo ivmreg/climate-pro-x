@@ -152,3 +152,50 @@ def test_hourly_water_regression_rejection_diagnostics(thermal_math, mode):
     assert diag["status"] == ("rejected" if mode == "bad_fit" else "collecting")
     assert diag["reason"]
     assert diag["eligible_observations"] < 200 or mode == "bad_fit"
+
+
+@pytest.mark.parametrize("mode,expected", [("sparse", "collecting"), ("flat", "rejected"), ("negative", "rejected")])
+def test_hlc_fit_explains_rejection_at_calculation_boundary(thermal_math, mode, expected):
+    days = [DAY - timedelta(days=n) for n in range(40 if mode != "sparse" else 5)]
+    dt = {d: 10 if mode == "flat" else 5 + n % 12 for n, d in enumerate(days)}
+    q = {d: 120 - 3 * dt[d] if mode == "negative" else 5 * dt[d] for d in days}
+    diagnostic = {}
+    assert thermal_math.fit_hlc(q, dt, min(days), diagnostics=diagnostic) is None
+    assert diagnostic["status"] == expected
+    assert diagnostic["usable_days"] == len(days)
+    assert diagnostic["reason"]
+
+
+def test_reset_and_missing_room_hour_cannot_form_complete_day(thermal_math):
+    ts = int(NOW.timestamp())
+    meter = {ts - 3600: 0, **{ts + h * 3600: h + 1 for h in range(24)}}
+    meter[ts + 10 * 3600] = 0
+    assert thermal_math.daily_gas_kwh(meter, UTC) == {}
+    out = {ts + h * 3600: 5 for h in range(24)}
+    room = {ts + h * 3600: 20 for h in range(24) if h != 10}
+    assert thermal_math.daily_delta_t([room], out, UTC) == {}
+
+
+def test_empty_and_nonexponential_co2_never_publish_an_air_change_rate(thermal_math):
+    assert thermal_math.air_change_rate({}, UTC, DAY) is None
+    assert thermal_math.combine_air_change_rates([]) is None
+    start = int(NOW.timestamp())
+    # Linear decay reaches its baseline; treating it as exponential would be misleading.
+    co2 = {start + h * 3600: 1000 - (h % 24) * 25 for h in range(24 * 12)}
+    assert thermal_math.air_change_rate(co2, UTC, DAY, 420) is None
+
+
+def test_invalid_room_source_suppresses_home_fit_without_erasing_usage(thermal_math):
+    conf = {**CONF, "room_source_issues": {"bed": {"temperature": "incompatible unit"}}}
+    result = thermal_math.compute_all({}, conf, UTC, NOW, (30,))
+    assert result["hlc"] is None
+    assert result["rooms"]["bed"] is None
+    assert result["analysis_status"]["rooms"]["bed"]["status"] == "source_problem"
+    assert result["analysis_status"]["usage"]["status"] == "collecting"
+
+
+def test_invalid_heating_source_cannot_be_assumed_off(thermal_math):
+    conf = {**CONF, "invalid_heating_power_entities": {"sensor.heat": "must be percent"}}
+    result = thermal_math.compute_all({}, conf, UTC, NOW, (30,))
+    assert result["rooms"]["bed"] is None
+    assert result["analysis_status"]["rooms"]["bed"]["status"] == "source_problem"

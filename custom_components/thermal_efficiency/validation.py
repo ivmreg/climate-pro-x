@@ -219,7 +219,7 @@ def validate_source_metadata_and_state(
                     return ("incompatible_unit", f"Water source {entity_or_stat_id} has incompatible non-volume unit '{state_unit}'")
             if metadata is None and state_class not in ("total", "total_increasing"):
                 return ("missing_sum", f"Water source {entity_or_stat_id} requires a cumulative total")
-        elif is_external:
+        elif is_external and metadata is None:
             return ("incompatible_unit", f"External water source {entity_or_stat_id} has no recorder metadata")
         return (None, None)
 

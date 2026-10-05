@@ -46,6 +46,11 @@ from custom_components.thermal_efficiency.history import (
 from custom_components.thermal_efficiency import CONFIG_SCHEMA
 
 
+@pytest.fixture(autouse=True)
+def _recorder_for_metadata_preflight(recorder_mock):
+    """Use a real fixture recorder for source metadata discovery."""
+
+
 def _create_sensor(hass, unique_id: str, area_id: str):
     registry = er.async_get(hass)
     entity = registry.async_get_or_create(
