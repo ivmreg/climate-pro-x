@@ -16,7 +16,7 @@ Models (validated offline against a full heating season in this repo):
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, tzinfo
+from datetime import date, datetime, timedelta, timezone, tzinfo
 from math import exp, isfinite, log, sqrt
 from statistics import median
 
@@ -27,6 +27,7 @@ HLC_MIN_DT = 4.0
 HLC_MIN_Q = 0.5
 HLC_MIN_DAYS = 30  # for the shorter-window "recent" estimate
 HLC_FALLBACK_MIN_DAYS = 20
+HLC_SOURCE_STALE_DAYS = 14
 HLC_MIN_R2 = 0.5
 HLC_MIN_DT_SPREAD = 3.0
 # Consecutive days share a weather system, so regression residuals are serially
@@ -102,6 +103,12 @@ def series_from_stats(rows: list[dict], kind: str) -> Series:
         value = row.get(kind)
         if value is None:
             continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not isfinite(value):
+            continue
         start = row["start"]
         if isinstance(start, datetime):
             ts = start.timestamp()
@@ -109,7 +116,7 @@ def series_from_stats(rows: list[dict], kind: str) -> Series:
             ts = float(start)
             if ts > 1e12:  # milliseconds (websocket-style payloads)
                 ts /= 1000.0
-        out[int(ts)] = float(value)
+        out[int(ts)] = value
     return out
 
 
@@ -201,21 +208,53 @@ def hourly_change(cumulative: Series, max_step: float) -> Series:
 def _expected_local_day_hours(day, tz: tzinfo) -> int:
     """Number of real hours in a local day, including DST transitions."""
     start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
-    end = start + timedelta(days=1)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz)
     return round((end.timestamp() - start.timestamp()) / 3600)
 
 
 def _daily_meter_steps(cumulative: Series, tz: tzinfo, max_step: float) -> dict:
-    """Hourly deltas grouped by complete local dates."""
-    days: dict = defaultdict(list)
-    for ts, step in hourly_change(cumulative, max_step).items():
-        days[_local(ts, tz).date()].append(step)
-    return {
-        day: steps
-        for day, steps in days.items()
-        if len(steps)
-        >= (_expected_local_day_hours(day, tz) - 1) * MIN_DAILY_METER_COVERAGE
+    """Hourly deltas grouped by complete local dates on the exact 3600s grid.
+
+    HA statistics rows are timestamped at row.start (00:00, 01:00, ..., 23:00).
+    For each complete local date:
+      - Deltas are computed at current row.start 00..23: t1 in [daystart, dayend - 3600].
+      - Baseline t0 for the daystart (00:00) delta is previousday 23:00 (daystart - 3600).
+      - Exact 3600s cadence requirement: t1 - t0 == 3600.
+      - Deltas group directly under _local(t1, tz).date().
+    """
+    if not cumulative or len(cumulative) < 2:
+        return {}
+
+    dates = {
+        _local(ts, tz).date()
+        for ts in cumulative
     }
+
+    complete_days = {}
+    for day in sorted(dates):
+        daystart = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+        dayend = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+        expected_hours = round((dayend.timestamp() - daystart.timestamp()) / 3600)
+        start_ts = int(daystart.timestamp())
+
+        day_steps = []
+        is_complete = True
+        for h in range(expected_hours):
+            t1 = start_ts + h * 3600
+            t0 = t1 - 3600
+            if t0 not in cumulative or t1 not in cumulative:
+                is_complete = False
+                break
+            step = cumulative[t1] - cumulative[t0]
+            if not (0 <= step <= max_step):
+                is_complete = False
+                break
+            day_steps.append(step)
+
+        if is_complete and len(day_steps) == expected_hours:
+            complete_days[day] = day_steps
+
+    return complete_days
 
 
 def daily_gas_kwh(gas_sum: Series, tz: tzinfo) -> dict:
@@ -235,25 +274,59 @@ def daily_water_litres(water_sum: Series, tz: tzinfo) -> dict:
 
 
 def daily_delta_t(rooms: list[Series], outdoor: Series, tz: tzinfo) -> dict:
-    """Local-date mean dT with a fixed, complete room population."""
-    per_day: dict = defaultdict(list)
-    for ts, t_out in outdoor.items():
-        temps = [room[ts] for room in rooms if ts in room]
-        if rooms and len(temps) == len(rooms):
-            per_day[_local(ts, tz).date()].append(sum(temps) / len(temps) - t_out)
-    return {
-        d: sum(v) / len(v)
-        for d, v in per_day.items()
-        if len(v) >= MIN_DAILY_TEMPERATURE_HOURS
-    }
+    """Local-date mean dT with a fixed, complete room population on the exact 3600s grid."""
+    if not outdoor or not rooms:
+        return {}
+    dates = {_local(ts, tz).date() for ts in outdoor}
+    result = {}
+    for day in sorted(dates):
+        daystart = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+        dayend = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+        expected_hours = round((dayend.timestamp() - daystart.timestamp()) / 3600)
+        start_ts = int(daystart.timestamp())
+
+        day_dts = []
+        is_complete = True
+        for h in range(expected_hours):
+            ts = start_ts + h * 3600
+            if ts not in outdoor:
+                is_complete = False
+                break
+            temps = [room[ts] for room in rooms if ts in room]
+            if len(temps) != len(rooms):
+                is_complete = False
+                break
+            day_dts.append(sum(temps) / len(temps) - outdoor[ts])
+
+        if is_complete and len(day_dts) == expected_hours:
+            result[day] = sum(day_dts) / expected_hours
+    return result
 
 
 def daily_mean(series: Series, tz: tzinfo) -> dict:
-    """Local-date mean of any hourly series."""
-    per_day: dict = defaultdict(list)
-    for ts, v in series.items():
-        per_day[_local(ts, tz).date()].append(v)
-    return {d: sum(v) / len(v) for d, v in per_day.items()}
+    """Local-date mean of an hourly series over complete 23/24/25-hour days on the exact 3600s grid."""
+    if not series:
+        return {}
+    dates = {_local(ts, tz).date() for ts in series}
+    result = {}
+    for day in sorted(dates):
+        daystart = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+        dayend = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+        expected_hours = round((dayend.timestamp() - daystart.timestamp()) / 3600)
+        start_ts = int(daystart.timestamp())
+
+        vals = []
+        is_complete = True
+        for h in range(expected_hours):
+            ts = start_ts + h * 3600
+            if ts not in series:
+                is_complete = False
+                break
+            vals.append(series[ts])
+
+        if is_complete and len(vals) == expected_hours:
+            result[day] = sum(vals) / expected_hours
+    return result
 
 
 def daily_heating_pct(room_heats: list[Series], tz: tzinfo) -> dict:
@@ -296,6 +369,9 @@ def fit_hlc(
     since,
     dhw_by_day: dict | None = None,
     until=None,
+    heating_off: set | None = None,
+    diagnostics: dict | None = None,
+    tz: tzinfo | None = None,
 ) -> dict | None:
     days = sorted(
         d
@@ -304,22 +380,50 @@ def fit_hlc(
     )
     pairs = []
     for d in days:
+        if heating_off is not None and d in heating_off:
+            continue
         if dt_by_day[d] <= HLC_MIN_DT or q_by_day[d] <= HLC_MIN_Q:
             continue
         adjusted = q_by_day[d] - (dhw_by_day.get(d, 0.0) if dhw_by_day else 0.0)
         if adjusted <= 0:
             continue
-        pairs.append((d, dt_by_day[d], adjusted))
+        if tz is not None:
+            day_h = _expected_local_day_hours(d, tz)
+            adjusted_24h = adjusted * (24.0 / day_h)
+        else:
+            adjusted_24h = adjusted
+        pairs.append((d, dt_by_day[d], adjusted_24h))
+
+    if diagnostics is not None:
+        diagnostics["usable_days"] = len(pairs)
+        diagnostics["required_days"] = HLC_FALLBACK_MIN_DAYS
+
     if len(pairs) < HLC_FALLBACK_MIN_DAYS:
+        if diagnostics is not None:
+            diagnostics["status"] = "collecting"
+            diagnostics["reason"] = (
+                f"fewer than {HLC_FALLBACK_MIN_DAYS} usable heating days (have {len(pairs)})"
+            )
         return None
     fit_days = [p[0] for p in pairs]
     xs = [p[1] for p in pairs]
     ys = [p[2] for p in pairs]
-    if max(xs) - min(xs) < HLC_MIN_DT_SPREAD:
+    dt_spread = max(xs) - min(xs)
+    if diagnostics is not None:
+        diagnostics["dt_spread"] = dt_spread
+    if dt_spread < HLC_MIN_DT_SPREAD:
+        if diagnostics is not None:
+            diagnostics["status"] = "rejected"
+            diagnostics["reason"] = (
+                f"insufficient indoor-outdoor temperature spread ({dt_spread:.1f}K < {HLC_MIN_DT_SPREAD}K)"
+            )
         return None
     slope, intercept, r2 = linear_fit(xs, ys)
     hlc = slope * 1000 / 24
     if slope <= 0 or r2 < HLC_MIN_R2 or not HLC_MIN_W_PER_K <= hlc <= HLC_MAX_W_PER_K:
+        if diagnostics is not None:
+            diagnostics["status"] = "rejected"
+            diagnostics["reason"] = "HLC fit failed physical or statistical quality gates"
         return None
 
     mx = sum(xs) / len(xs)
@@ -336,6 +440,9 @@ def fit_hlc(
     lower_slope = slope - 1.96 * slope_se
     upper_slope = slope + 1.96 * slope_se
     if lower_slope <= 0:
+        if diagnostics is not None:
+            diagnostics["status"] = "rejected"
+            diagnostics["reason"] = "confidence interval lower bound is non-positive"
         return None
     baseline_days = [
         q_by_day[d] for d in q_by_day
@@ -344,7 +451,7 @@ def fit_hlc(
         and d in dt_by_day
         and dt_by_day[d] < DHW_BASELINE_MAX_DT
     ]
-    return {
+    res = {
         "hlc_w_per_k": hlc,
         "hlc_ci_low_w_per_k": lower_slope * 1000 / 24,
         "hlc_ci_high_w_per_k": upper_slope * 1000 / 24,
@@ -359,6 +466,10 @@ def fit_hlc(
             median(baseline_days) if len(baseline_days) >= DHW_BASELINE_MIN_DAYS else None
         ),
     }
+    if diagnostics is not None:
+        diagnostics["status"] = res["status"]
+        diagnostics["reason"] = "heat loss coefficient model successfully fitted"
+    return res
 
 
 def dhw_baseline(
@@ -448,6 +559,7 @@ def fit_dhw_water_rate(
     since,
     min_water_l: float = DHW_OCCUPIED_MIN_WATER_L,
     max_water_l: float | None = None,
+    diagnostics: dict | None = None,
 ) -> dict | None:
     """Daily gas-per-litre rate from days where all gas is known to be hot
     water: heating off (so no space-heating gas) and enough metered water that
@@ -464,6 +576,8 @@ def fit_dhw_water_rate(
         litres = water_by_day.get(d)
         if (
             litres is None
+            or not isfinite(litres)
+            or litres <= 0
             or litres < min_water_l
             or (max_water_l is not None and litres > max_water_l)
         ):
@@ -472,15 +586,35 @@ def fit_dhw_water_rate(
         if rise <= 0:
             continue
         samples.append(q * 1000 / litres / rise)
+    if diagnostics is not None:
+        diagnostics["usable_observations"] = len(samples)
+        diagnostics["required_observations"] = DHW_WATER_MIN_DAYS
     if len(samples) < DHW_WATER_MIN_DAYS:
+        if diagnostics is not None:
+            diagnostics.update(
+                status="collecting",
+                reason=f"fewer than {DHW_WATER_MIN_DAYS} positive-water heating-off days",
+            )
         return None
     rate = median(samples)
     if not DHW_RATE_MIN_WH_PER_L_PER_K <= rate <= DHW_RATE_MAX_WH_PER_L_PER_K:
+        if diagnostics is not None:
+            diagnostics.update(
+                status="rejected",
+                reason="water energy-per-litre estimate failed physical limits",
+            )
         return None
     ordered = sorted(samples)
     iqr = ordered[(3 * len(ordered)) // 4] - ordered[len(ordered) // 4]
     if iqr > DHW_RATE_MAX_IQR_WH_PER_L_PER_K:
+        if diagnostics is not None:
+            diagnostics.update(
+                status="rejected",
+                reason="water energy-per-litre estimates vary too widely between days",
+            )
         return None
+    if diagnostics is not None:
+        diagnostics.update(status="valid", reason="water energy-per-litre estimate fitted")
     return {
         "wh_per_litre_per_k": rate,
         "days_used": len(samples),
@@ -549,32 +683,117 @@ def fit_water_gas(
     gas_sum: Series,
     water_sum: Series,
     boiler_efficiency: float = DEFAULT_BOILER_EFFICIENCY,
+    heating_off: set | None = None,
+    tz: tzinfo | None = None,
+    since=None,
+    until=None,
+    diagnostics: dict | None = None,
 ) -> dict | None:
-    """Informational only: hourly gas-vs-water regression, giving a rough
-    Wh-per-litre rate and the implied hot fraction of metered water. Noisy
+    """Informational only: hourly gas-vs-water regression on heating-off intervals,
+    giving a rough Wh-per-litre rate and the implied hot fraction of metered water. Noisy
     (household draws are bursty and mix hot/cold) - not the basis for the
     DHW cost figure, which comes from dhw_baseline instead.
     """
     gas_hourly = hourly_change(gas_sum, GAS_MAX_STEP_KWH)
     water_hourly = hourly_change(water_sum, WATER_MAX_STEP_L)
     common = sorted(set(gas_hourly) & set(water_hourly))
-    if len(common) < DHW_REGRESSION_MIN_HOURS:
+    if not common:
+        if diagnostics is not None:
+            diagnostics.update(
+                status="collecting",
+                reason="no overlapping hourly gas and water readings",
+                eligible_observations=0,
+                required_observations=DHW_REGRESSION_MIN_HOURS,
+                rejected_heating_on_observations=0,
+                rejected_outside_window_observations=0,
+            )
+        return None
+
+    eligible = []
+    rejected_heating_on = 0
+    rejected_outside_window = 0
+    for ts in common:
+        if tz is not None and (heating_off is not None or since is not None or until is not None):
+            day = _local(ts, tz).date()
+            if since is not None and day < since:
+                rejected_outside_window += 1
+                continue
+            if until is not None and day > until:
+                rejected_outside_window += 1
+                continue
+            if heating_off is not None and day not in heating_off:
+                rejected_heating_on += 1
+                continue
+        eligible.append(ts)
+
+    if len(eligible) < DHW_REGRESSION_MIN_HOURS:
+        if diagnostics is not None:
+            diagnostics.update(
+                status="collecting",
+                reason=f"fewer than {DHW_REGRESSION_MIN_HOURS} eligible overlapping hours",
+                eligible_observations=len(eligible),
+                required_observations=DHW_REGRESSION_MIN_HOURS,
+                rejected_heating_on_observations=rejected_heating_on,
+                rejected_outside_window_observations=rejected_outside_window,
+                total_common_observations=len(common),
+            )
         return None
     slope, _, r2 = linear_fit(
-        [water_hourly[ts] for ts in common], [gas_hourly[ts] for ts in common]
+        [water_hourly[ts] for ts in eligible], [gas_hourly[ts] for ts in eligible]
     )
     if slope <= 0 or r2 < MIN_WATER_REGRESSION_R2:
+        if diagnostics is not None:
+            diagnostics.update(
+                status="rejected",
+                reason="hourly gas/water regression failed slope or fit-quality limits",
+                eligible_observations=len(eligible),
+                required_observations=DHW_REGRESSION_MIN_HOURS,
+                rejected_heating_on_observations=rejected_heating_on,
+                rejected_outside_window_observations=rejected_outside_window,
+                total_common_observations=len(common),
+            )
         return None
     wh_per_litre = slope * 1000
+    hot_fraction_pct = (
+        wh_per_litre * boiler_efficiency / DHW_THEORETICAL_WH_PER_L * 100
+    )
+    # Reject physically inconsistent hot fractions instead of clipping to 100
+    if hot_fraction_pct > 100.0 or hot_fraction_pct < 0.0:
+        if diagnostics is not None:
+            diagnostics.update(
+                status="rejected",
+                reason=(
+                    f"implied hot-water fraction {hot_fraction_pct:.1f}% is outside 0-100%"
+                ),
+                eligible_observations=len(eligible),
+                required_observations=DHW_REGRESSION_MIN_HOURS,
+                rejected_heating_on_observations=rejected_heating_on,
+                rejected_outside_window_observations=rejected_outside_window,
+                total_common_observations=len(common),
+            )
+        return None
+
+    if diagnostics is not None:
+        diagnostics.update(
+            status="valid",
+            reason="hourly gas/water regression passed physical and fit-quality checks",
+            eligible_observations=len(eligible),
+            required_observations=DHW_REGRESSION_MIN_HOURS,
+            rejected_heating_on_observations=rejected_heating_on,
+            rejected_outside_window_observations=rejected_outside_window,
+            total_common_observations=len(common),
+        )
+
     return {
         "wh_per_litre": wh_per_litre,
         "fuel_input_wh_per_litre": wh_per_litre,
-        "hot_fraction_pct": min(
-            100.0,
-            wh_per_litre * boiler_efficiency / DHW_THEORETICAL_WH_PER_L * 100,
-        ),
+        "hot_fraction_pct": hot_fraction_pct,
         "regression_r_squared": r2,
-        "regression_hours": len(common),
+        "regression_hours": len(eligible),
+        "eligible_hours": len(eligible),
+        "rejected_heating_on_hours": rejected_heating_on,
+        "rejected_outside_window_hours": rejected_outside_window,
+        "total_common_hours": len(common),
     }
 
 
@@ -965,7 +1184,10 @@ def compute_all(
     room_temp: dict[str, Series] = {}
     room_heat: dict[str, Series] = {}
     for name, spec in room_confs.items():
-        room_temp[name] = series_from_stats(stats.get(spec["temperature"], []), "mean")
+        temp_entity = spec.get("temperature")
+        room_temp[name] = series_from_stats(
+            stats.get(temp_entity, []), "mean"
+        ) if temp_entity else {}
         heating_entity = spec.get("heating_power")
         if heating_entity:
             if heating_entity in invalid_heating_power:
@@ -985,7 +1207,7 @@ def compute_all(
                     f"{invalid_points} historical observation(s) were outside "
                     "the finite 0-100% range and were ignored"
                 )
-    outdoor = series_from_stats(stats.get(conf["outdoor"], []), "mean")
+    outdoor = series_from_stats(stats.get(conf["outdoor"], []), "mean") if conf.get("outdoor") else {}
     all_rooms = list(room_temp.values())
 
     result: dict = {
@@ -1000,6 +1222,16 @@ def compute_all(
     water = series_from_stats(stats.get(conf["water"], []), "sum") if conf.get("water") else {}
     q_by_day = daily_gas_kwh(gas, tz)
     dt_by_day = daily_delta_t(all_rooms, outdoor, tz)
+    room_source_issues = conf.get("room_source_issues") or {}
+    has_room_temperature_issue = any(
+        issues.get("temperature")
+        for issues in room_source_issues.values()
+        if isinstance(issues, dict)
+    )
+    if has_room_temperature_issue:
+        # Keep the configured room population fixed. An invalid room source
+        # cannot be silently dropped to make a smaller home appear complete.
+        dt_by_day = {}
     outdoor_by_day = daily_mean(outdoor, tz)
     water_by_day = daily_water_litres(water, tz)
     heat_pct_by_day = daily_heating_pct(list(room_heat.values()), tz)
@@ -1008,26 +1240,44 @@ def compute_all(
         # A configured-but-missing radiator is not evidence of heating off.
         # Expectations are dated, so adding a radiator never invalidates years
         # before it existed. Incomplete expected days cannot enter any fallback.
-        observed = defaultdict(list)
-        expected_hours = defaultdict(int)
-        for ts in outdoor:
-            expected_rooms = [name for name, spec in room_confs.items() if any(
-                (v.get("start") is not None and ts >= v["start"])
-                and (v.get("end") is None or ts + 3600 <= v["end"])
-                for v in spec.get("heating_expected_intervals", [])
-            )]
-            if expected_rooms:
-                day = _local(ts, tz).date()
-                expected_hours[day] += 1
-                if all(ts in room_heat.get(name, {}) for name in expected_rooms):
-                    observed[day].append(max(room_heat[name][ts] for name in expected_rooms))
+        expected_dates = {
+            _local(ts, tz).date()
+            for source in (gas, outdoor, *room_temp.values())
+            for ts in source
+        }
         heat_pct_by_day = {}
-        for day, count in expected_hours.items():
-            values = observed[day]
-            if len(values) < max(18, count * 0.8):
+        for day in sorted(expected_dates):
+            day_start = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+            day_end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=tz)
+            expected_hours = round((day_end.timestamp() - day_start.timestamp()) / 3600)
+            required_slots: list[tuple[int, list[str]]] = []
+            for hour in range(expected_hours):
+                ts = int(day_start.timestamp()) + hour * 3600
+                expected_rooms = [
+                    name
+                    for name, spec in room_confs.items()
+                    if any(
+                        interval.get("start") is not None
+                        and ts >= interval["start"]
+                        and (interval.get("end") is None or ts + 3600 <= interval["end"])
+                        for interval in spec.get("heating_expected_intervals", [])
+                    )
+                ]
+                if expected_rooms:
+                    required_slots.append((ts, expected_rooms))
+            if not required_slots:
+                continue
+            observations = []
+            complete = day in q_by_day and day in dt_by_day
+            for ts, expected_rooms in required_slots:
+                if not all(ts in room_heat.get(name, {}) for name in expected_rooms):
+                    complete = False
+                    continue
+                observations.append(max(room_heat[name][ts] for name in expected_rooms))
+            if not complete or len(observations) != len(required_slots):
                 excluded_days.add(day.isoformat())
             else:
-                heat_pct_by_day[day] = sum(values) / len(values)
+                heat_pct_by_day[day] = sum(observations) / len(observations)
     for by_day in (q_by_day, dt_by_day, heat_pct_by_day):
         for day in list(by_day):
             if day.isoformat() in excluded_days:
@@ -1044,6 +1294,10 @@ def compute_all(
         by_day.pop(current_day, None)
 
     heating_off = heating_off_days(dt_by_day, heat_pct_by_day)
+    if heating_power_issues:
+        # An invalid configured demand source cannot be replaced by the dT
+        # proxy to claim heating was off.
+        heating_off.intersection_update(heat_pct_by_day)
     configured_min_water_l = conf.get("min_dhw_water_litres")
     min_water_l = (
         DHW_OCCUPIED_MIN_WATER_L
@@ -1075,6 +1329,7 @@ def compute_all(
         q_by_day, dt_by_day, outdoor_by_day, since_full,
         heating_off, water_by_day, min_water_l,
     )
+    water_rate_diagnostics: dict = {}
     water_rate = fit_dhw_water_rate(
         q_by_day,
         water_by_day,
@@ -1083,7 +1338,15 @@ def compute_all(
         since_full,
         min_water_l,
         water_limit_l,
-    )
+        diagnostics=water_rate_diagnostics,
+    ) if conf.get("water") else None
+    if not conf.get("water"):
+        water_rate_diagnostics = {
+            "status": "not_configured",
+            "reason": "water meter not configured; DHW attribution uses the gas baseline",
+            "usable_observations": 0,
+            "required_observations": DHW_WATER_MIN_DAYS,
+        }
     if baseline:
         dhw_by_day, dhw_quality = attribute_dhw_by_day(
             q_by_day,
@@ -1107,6 +1370,7 @@ def compute_all(
                 (yesterday - water_latest_day).days if water_latest_day else None
             ),
             "water_outlier_limit_litres": water_limit_l,
+            "water_rate_status": water_rate_diagnostics,
             **dhw_quality,
         }
         if "idle_gas_kwh_per_day" in baseline:
@@ -1119,25 +1383,39 @@ def compute_all(
             result["dhw"]["water_rate_iqr_wh_per_litre_per_k"] = water_rate[
                 "iqr_wh_per_litre_per_k"
             ]
+        modelled_daily = list(dhw_by_day.values())
+        annual_kwh = (
+            sum(modelled_daily) / len(modelled_daily) * 365
+            if modelled_daily
+            else baseline["kwh_per_day"] * 365
+        )
+        result["dhw"]["modelled_annual_kwh"] = annual_kwh
         gas_rate = conf.get("gas_unit_rate")
-        if gas_rate:
+        if gas_rate is not None and isfinite(gas_rate) and gas_rate >= 0:
             result["dhw"]["cost_per_day_gbp"] = baseline["kwh_per_day"] * gas_rate
-            modelled_daily = list(dhw_by_day.values())
-            annual_kwh = (
-                sum(modelled_daily) / len(modelled_daily) * 365
-                if modelled_daily
-                else baseline["kwh_per_day"] * 365
-            )
-            result["dhw"]["modelled_annual_kwh"] = annual_kwh
             result["dhw"]["cost_per_year_gbp"] = annual_kwh * gas_rate
+        regression_diagnostics: dict = {}
         if conf.get("water"):
             water_fit = fit_water_gas(
                 gas,
                 water,
                 conf.get("boiler_efficiency") or DEFAULT_BOILER_EFFICIENCY,
+                heating_off=heating_off,
+                tz=tz,
+                since=since_full,
+                until=yesterday,
+                diagnostics=regression_diagnostics,
             )
             if water_fit:
                 result["dhw"].update(water_fit)
+        else:
+            regression_diagnostics = {
+                "status": "not_configured",
+                "reason": "water meter not configured; hourly gas/water regression unavailable",
+                "eligible_observations": 0,
+                "required_observations": DHW_REGRESSION_MIN_HOURS,
+            }
+        result["dhw"]["water_gas_regression_status"] = regression_diagnostics
 
     # Rolling attributed usage: recent per-day gas split into hot water and
     # space heating, so both can be tracked over time as sensor history.
@@ -1188,7 +1466,7 @@ def compute_all(
             ),
         }
         gas_rate = conf.get("gas_unit_rate")
-        if gas_rate:
+        if gas_rate is not None and isfinite(gas_rate) and gas_rate >= 0:
             for key in ("dhw_kwh_per_day_7d", "space_heating_kwh_per_day_7d"):
                 if usage[key] is not None:
                     usage[key.replace("kwh_per_day", "cost_per_day_gbp")] = (
@@ -1252,7 +1530,7 @@ def compute_all(
                 yesterday - summary["latest_complete_day"]
             ).days
             elec_rate = conf.get("electricity_unit_rate")
-            if elec_rate:
+            if elec_rate is not None and isfinite(elec_rate) and elec_rate >= 0:
                 summary["cost_per_day_gbp"] = summary["kwh_per_day"] * elec_rate
                 summary["cost_per_year_gbp"] = summary["kwh_per_day"] * elec_rate * 365
                 if summary["last_30d_kwh_per_day"] is not None:
@@ -1319,7 +1597,32 @@ def compute_all(
                 model_day,
             )
 
-    fit = fit_hlc(q_by_day, dt_by_day, hlc_since_full, until=model_day)
+    fit = None
+    hlc_diagnostics: dict = {}
+    if model_day:
+        fit = fit_hlc(
+            q_by_day,
+            dt_by_day,
+            hlc_since_full,
+            until=model_day,
+            heating_off=locked_off,
+            diagnostics=hlc_diagnostics,
+            tz=tz,
+        )
+    else:
+        hlc_diagnostics["status"] = "collecting"
+        if not q_by_day:
+            hlc_diagnostics["reason"] = (
+                "no complete daily gas meter observations in analysis window"
+            )
+        elif not dt_by_day:
+            hlc_diagnostics["reason"] = (
+                "no complete aligned room and outdoor temperature days in analysis window"
+            )
+        else:
+            hlc_diagnostics["reason"] = (
+                "no qualifying heating days observed in analysis window"
+            )
     if fit:
         boiler_eff = conf.get("boiler_efficiency") or DEFAULT_BOILER_EFFICIENCY
         gas_side_fit = fit
@@ -1330,6 +1633,8 @@ def compute_all(
                 hlc_since_full,
                 hlc_dhw_by_day,
                 model_day,
+                heating_off=locked_off,
+                tz=tz,
             )
             if hlc_dhw_by_day
             else None
@@ -1395,6 +1700,8 @@ def compute_all(
                     since,
                     hlc_dhw_by_day if hlc_dhw_by_day else None,
                     model_day,
+                    heating_off=locked_off,
+                    tz=tz,
                 )
                 if recent and recent["days_used"] >= HLC_MIN_DAYS:
                     result["hlc"]["recent_hlc_w_per_k"] = (
@@ -1455,7 +1762,14 @@ def compute_all(
             )
             result["air_change_rate"] = ach_fit
 
-    if ach_fit and conf.get("floor_area_m2") and conf.get("ceiling_height_m") and result["hlc"]:
+    opt_in_losses = bool(conf.get("experimental_whole_home_ventilation", False))
+    if (
+        opt_in_losses
+        and ach_fit
+        and conf.get("floor_area_m2")
+        and conf.get("ceiling_height_m")
+        and result["hlc"]
+    ):
         volume = conf["floor_area_m2"] * conf["ceiling_height_m"]
         ventilation_w_per_k = AIR_HEAT_CAPACITY * ach_fit["ach"] * volume
         hlc_delivered = result["hlc"]["delivered_hlc_w_per_k"]
@@ -1472,7 +1786,15 @@ def compute_all(
                 "hlc_delivered_w_per_k": hlc_delivered,
                 "ventilation_share_pct": ventilation_w_per_k / hlc_delivered * 100,
                 "boiler_efficiency_used": result["hlc"]["boiler_efficiency_used"],
-                "scope": ach_fit["scope"],
+                "scope": (
+                    "experimental whole-home estimate assuming uniform infiltration "
+                    "scaled to configured home volume"
+                ),
+                "assumptions": (
+                    "single-zone uniform air change rate derived from room CO2 proxy; "
+                    "actual infiltration varies by room and wind conditions; "
+                    "not a categorical retrofit recommendation"
+                ),
             }
             result["losses_status"] = "consistent"
         else:
@@ -1487,9 +1809,16 @@ def compute_all(
                     f"exceeds delivered HLC ({hlc_delivered:.1f} W/K)"
                 ),
             }
+    else:
+        result["losses"] = None
+        result["losses_status"] = {"status": "experimental_disabled"} if not opt_in_losses else None
 
+    result["room_fit_counts"] = {}
     for name, temps in room_temp.items():
         result["rooms"][name] = None
+        room_issues = room_source_issues.get(name) or {}
+        if room_issues.get("temperature"):
+            continue
         room_excluded = set(room_confs[name].get("excluded_model_days") if "excluded_model_days" in room_confs[name] else excluded_days)
         for window in windows_days:
             since = (now - timedelta(days=window)).astimezone(tz).date()
@@ -1497,6 +1826,7 @@ def compute_all(
                           if _local(ts, tz).date().isoformat() not in room_excluded}
             fits = night_taus(safe_temps, outdoor, room_heat.get(name), tz, since,
                              room_confs[name].get("heating_expected_intervals"))
+            result["room_fit_counts"][name] = len(fits)
             if len(fits) >= TAU_MIN_NIGHTS:
                 taus = sorted(f["tau_hours"] for f in fits)
                 result["rooms"][name] = {
@@ -1514,7 +1844,7 @@ def compute_all(
     # not the loft, and won't necessarily flatline so drop_flatlines alone
     # can't catch it.
     result["loft"] = None
-    if conf.get("loft"):
+    if conf.get("loft") and not room_source_issues.get("loft", {}).get("temperature"):
         loft = drop_flatlines(series_from_stats(stats.get(conf["loft"], []), "mean"))
         loft_since = conf.get("loft_since")
         loft_cutoff = max(since_full, loft_since) if loft_since else since_full
@@ -1532,4 +1862,527 @@ def compute_all(
                 if humidity:
                     result["loft"]["humidity_pct"] = humidity[max(humidity)]
 
+    result["analysis_status"] = build_analysis_status(
+        result,
+        conf,
+        tz,
+        now,
+        q_by_day,
+        water_by_day,
+        model_day,
+        hlc_diagnostics,
+        since_full=since_full,
+        heating_off=heating_off,
+        dt_by_day=dt_by_day,
+    )
     return result
+
+
+def _iso_date_str(d: date | datetime | str | None) -> str | None:
+    if d is None:
+        return None
+    if isinstance(d, datetime):
+        return d.date().isoformat()
+    if isinstance(d, date):
+        return d.isoformat()
+    return str(d)
+
+
+def _check_source_issue(conf: dict, *keys: str | None) -> str | None:
+    source_issues = conf.get("source_issues") or {}
+    for k in keys:
+        if not k:
+            continue
+        if k in source_issues:
+            return str(source_issues[k])
+        entity = conf.get(k)
+        if isinstance(entity, str) and entity in source_issues:
+            return str(source_issues[entity])
+    return None
+
+
+def _room_source_issue(conf: dict, room: str, *roles: str) -> str | None:
+    issues = (conf.get("room_source_issues") or {}).get(room, {})
+    if not isinstance(issues, dict):
+        return None
+    for role in roles:
+        issue = issues.get(role)
+        if issue:
+            return str(issue)
+    return None
+
+
+def build_analysis_status(
+    result: dict,
+    conf: dict,
+    tz: tzinfo,
+    now: datetime,
+    q_by_day: dict,
+    water_by_day: dict,
+    model_day: date | None,
+    hlc_diagnostics: dict | None = None,
+    since_full: date | None = None,
+    heating_off: set | None = None,
+    dt_by_day: dict | None = None,
+) -> dict:
+    yesterday = now.astimezone(tz).date() - timedelta(days=1)
+    status: dict = {}
+
+    # --- HLC ---
+    room_temp_issue = next(
+        (
+            issue
+            for issues in (conf.get("room_source_issues") or {}).values()
+            if isinstance(issues, dict)
+            for issue in [issues.get("temperature")]
+            if issue
+        ),
+        None,
+    )
+    hlc_issue = _check_source_issue(conf, "gas_meter", conf.get("gas_meter"), "outdoor", conf.get("outdoor")) or room_temp_issue
+    latest_gas_day = max(q_by_day) if q_by_day else None
+    gas_lag = (yesterday - latest_gas_day).days if latest_gas_day else None
+    latest_temperature_day = max(dt_by_day) if dt_by_day else None
+    temperature_lag = (
+        (yesterday - latest_temperature_day).days
+        if latest_temperature_day
+        else None
+    )
+
+    if hlc_issue:
+        hlc_stat = {
+            "status": "source_problem",
+            "reason": hlc_issue,
+            "next_action": "resolve gas meter or outdoor temperature sensor issue",
+        }
+        if latest_gas_day:
+            hlc_stat["latest_source_day"] = _iso_date_str(latest_gas_day)
+            hlc_stat["source_lag_days"] = gas_lag
+    elif not (conf.get("gas_meter") and conf.get("outdoor") and conf.get("rooms")):
+        hlc_stat = {
+            "status": "not_configured",
+            "reason": "gas meter, outdoor, or room temperature sensors not configured",
+            "next_action": "configure gas meter and temperature sensors to calculate heat loss coefficient",
+        }
+    elif (
+        gas_lag is not None and gas_lag >= HLC_SOURCE_STALE_DAYS
+    ) or (
+        temperature_lag is not None
+        and temperature_lag >= HLC_SOURCE_STALE_DAYS
+    ):
+        stale_source = (
+            "gas meter"
+            if gas_lag is not None and gas_lag >= HLC_SOURCE_STALE_DAYS
+            else "room/outdoor temperature"
+        )
+        hlc_stat = {
+            "status": "source_problem",
+            "reason": (
+                f"{stale_source} history is stale; source data is at least "
+                f"{HLC_SOURCE_STALE_DAYS} days old"
+            ),
+            "next_action": f"restore recent {stale_source} history before interpreting the HLC status",
+        }
+        if latest_gas_day is not None:
+            hlc_stat["latest_source_day"] = _iso_date_str(latest_gas_day)
+            hlc_stat["source_lag_days"] = gas_lag
+        if latest_temperature_day is not None:
+            hlc_stat["latest_temperature_day"] = _iso_date_str(latest_temperature_day)
+            hlc_stat["temperature_source_lag_days"] = temperature_lag
+        if result.get("hlc") is not None:
+            hlc_stat["model_data_through"] = _iso_date_str(model_day)
+            hlc_stat["usable_observations"] = result["hlc"].get("days_used")
+            hlc_stat["required_observations"] = HLC_MIN_DAYS
+    elif model_day is None:
+        diag = hlc_diagnostics or {}
+        reason = diag.get("reason", "no qualifying heating days observed in analysis window")
+        if not q_by_day:
+            next_action = "restore complete gas meter history for full local days"
+        elif not dt_by_day:
+            next_action = "restore complete aligned room and outdoor temperature history"
+        else:
+            next_action = "wait for colder weather or measured heating activity"
+        hlc_stat = {
+            "status": "collecting",
+            "reason": reason,
+            "next_action": next_action,
+            "usable_observations": len(set(q_by_day) & set(dt_by_day or {})),
+            "required_observations": HLC_FALLBACK_MIN_DAYS,
+        }
+        if latest_gas_day:
+            hlc_stat["latest_source_day"] = _iso_date_str(latest_gas_day)
+            hlc_stat["source_lag_days"] = gas_lag
+        if latest_temperature_day:
+            hlc_stat["latest_temperature_day"] = _iso_date_str(latest_temperature_day)
+            hlc_stat["temperature_source_lag_days"] = temperature_lag
+    elif result.get("hlc") is not None:
+        hlc_res = result["hlc"]
+        held_start = yesterday - timedelta(days=HLC_SOURCE_STALE_DAYS - 1)
+        held_dates = {
+            held_start + timedelta(days=offset)
+            for offset in range(HLC_SOURCE_STALE_DAYS)
+        }
+        common_days = set(q_by_day) & set(dt_by_day or {})
+        is_held = (
+            yesterday > model_day
+            and (yesterday - model_day).days >= HLC_SOURCE_STALE_DAYS
+            and held_dates.issubset(common_days)
+            and held_dates.issubset(heating_off or set())
+        )
+        if is_held:
+            hlc_stat = {
+                "status": "historical_baseline_held",
+                "reason": (
+                    f"heating season baseline held from {_iso_date_str(model_day)}; "
+                    f"no qualifying heating observed for {(yesterday - model_day).days} days"
+                ),
+                "next_action": "model will update when a new qualifying heating day occurs",
+            }
+        else:
+            hlc_stat = {
+                "status": hlc_res["status"],
+                "reason": "heat loss coefficient model successfully fitted",
+                "next_action": "continue monitoring daily energy balance",
+            }
+        hlc_stat.update({
+            "usable_observations": hlc_res["days_used"],
+            "required_observations": HLC_MIN_DAYS,
+            "model_data_through": _iso_date_str(model_day),
+        })
+        if latest_gas_day:
+            hlc_stat["latest_source_day"] = _iso_date_str(latest_gas_day)
+            hlc_stat["source_lag_days"] = gas_lag
+        if latest_temperature_day:
+            hlc_stat["latest_temperature_day"] = _iso_date_str(latest_temperature_day)
+            hlc_stat["temperature_source_lag_days"] = temperature_lag
+    else:
+        diag = hlc_diagnostics or {}
+        reason = diag.get("reason", "HLC fit failed physical or statistical quality gates")
+        is_collecting = diag.get("status") == "collecting" or "fewer than" in reason
+        hlc_stat = {
+            "status": "collecting" if is_collecting else "rejected",
+            "reason": reason,
+            "next_action": (
+                "wait for more heating days"
+                if is_collecting
+                else "check heating and temperature sensor placement and calibration"
+            ),
+            "usable_observations": diag.get("usable_days", 0),
+            "required_observations": HLC_FALLBACK_MIN_DAYS,
+            "model_data_through": _iso_date_str(model_day),
+        }
+        if latest_gas_day:
+            hlc_stat["latest_source_day"] = _iso_date_str(latest_gas_day)
+            hlc_stat["source_lag_days"] = gas_lag
+    status["hlc"] = hlc_stat
+
+    # --- DHW ---
+    dhw_issue = _check_source_issue(conf, "gas_meter", conf.get("gas_meter")) or room_temp_issue
+    if dhw_issue:
+        dhw_stat = {
+            "status": "source_problem",
+            "reason": dhw_issue,
+            "next_action": "resolve gas meter sensor issue",
+        }
+        if latest_gas_day:
+            dhw_stat["latest_source_day"] = _iso_date_str(latest_gas_day)
+            dhw_stat["source_lag_days"] = gas_lag
+    elif not conf.get("gas_meter"):
+        dhw_stat = {
+            "status": "not_configured",
+            "reason": "gas meter not configured",
+            "next_action": "configure a gas meter sensor to calculate hot water baseline",
+        }
+    elif result.get("dhw") is not None:
+        dhw_res = result["dhw"]
+        dhw_stat = {
+            "status": dhw_res["status"],
+            "reason": f"hot water baseline established using {dhw_res['days_used']} heating-off days",
+            "next_action": "continue monitoring non-heating gas consumption",
+            "usable_observations": dhw_res["days_used"],
+            "required_observations": 14,
+        }
+        if dhw_res.get("latest_complete_gas_day"):
+            dhw_stat["latest_source_day"] = _iso_date_str(dhw_res["latest_complete_gas_day"])
+            dhw_stat["source_lag_days"] = (yesterday - dhw_res["latest_complete_gas_day"]).days
+    else:
+        since_cutoff = since_full or (yesterday - timedelta(days=365))
+        usable_dhw = sum(
+            1 for d in q_by_day
+            if d >= since_cutoff and (heating_off is None or d in heating_off)
+        )
+        dhw_stat = {
+            "status": "collecting",
+            "reason": f"fewer than {DHW_BASELINE_MIN_DAYS} heating-off days with gas data (have {usable_dhw})",
+            "next_action": "wait for warm weather or heating-off days",
+            "usable_observations": usable_dhw,
+            "required_observations": DHW_BASELINE_MIN_DAYS,
+        }
+        if latest_gas_day:
+            dhw_stat["latest_source_day"] = _iso_date_str(latest_gas_day)
+            dhw_stat["source_lag_days"] = gas_lag
+    status["dhw"] = dhw_stat
+
+    # --- USAGE ---
+    usage_issue = _check_source_issue(conf, "gas_meter", conf.get("gas_meter"))
+    if usage_issue:
+        usage_stat = {
+            "status": "source_problem",
+            "reason": usage_issue,
+            "next_action": "resolve gas meter sensor issue",
+        }
+    elif not conf.get("gas_meter"):
+        usage_stat = {
+            "status": "not_configured",
+            "reason": "gas meter not configured",
+            "next_action": "configure gas meter to calculate attributed usage",
+        }
+    elif result.get("usage") is not None:
+        u = result["usage"]
+        usage_stat = {
+            "status": "valid" if u.get("dhw_kwh_per_day_30d") is not None else "provisional",
+            "reason": "gas consumption successfully attributed between hot water and space heating",
+            "next_action": "continue tracking seasonal usage",
+            "usable_observations": u["heating_off_days"] + u["modelled_days"],
+            "required_observations": RECENT_7D_MIN_DAYS,
+        }
+        if u.get("latest_complete_gas_day"):
+            usage_stat["latest_source_day"] = _iso_date_str(u["latest_complete_gas_day"])
+            usage_stat["source_lag_days"] = u.get("source_lag_days")
+    else:
+        usage_stat = {
+            "status": "collecting",
+            "reason": "insufficient history to attribute daily usage",
+            "next_action": "accumulate more gas meter readings",
+        }
+    status["usage"] = usage_stat
+
+    # --- ELECTRICITY ---
+    elec_issue = _check_source_issue(conf, "electricity_meter", conf.get("electricity_meter"))
+    if elec_issue:
+        elec_stat = {
+            "status": "source_problem",
+            "reason": elec_issue,
+            "next_action": "resolve electricity meter sensor issue",
+        }
+    elif not conf.get("electricity_meter"):
+        elec_stat = {
+            "status": "not_configured",
+            "reason": "electricity meter not configured",
+            "next_action": "configure an electricity meter sensor to calculate baseload and usage",
+        }
+    elif result.get("electricity") is not None:
+        elec = result["electricity"]
+        elec_stat = {
+            "status": "valid" if elec["current_period_days_used"] >= ELEC_MIN_DAYS else "provisional",
+            "reason": f"electricity usage and baseload established from {elec['days_used']} days",
+            "next_action": "continue monitoring electrical baseload",
+            "usable_observations": elec["days_used"],
+            "required_observations": ELEC_MIN_DAYS,
+            "latest_source_day": _iso_date_str(elec["latest_complete_day"]),
+            "source_lag_days": elec["source_lag_days"],
+        }
+    else:
+        usable_elec = result.get("electricity_status", {}).get("usable_days", 0)
+        elec_stat = {
+            "status": "collecting",
+            "reason": f"fewer than {ELEC_MIN_DAYS} usable days of electricity meter data",
+            "next_action": "accumulate more electricity meter readings",
+            "usable_observations": usable_elec,
+            "required_observations": ELEC_MIN_DAYS,
+        }
+    status["electricity"] = elec_stat
+
+    # --- WATER USAGE ---
+    water_issue = _check_source_issue(conf, "water", conf.get("water"))
+    if water_issue:
+        wu_stat = {
+            "status": "source_problem",
+            "reason": water_issue,
+            "next_action": "resolve water meter sensor issue",
+        }
+    elif not conf.get("water"):
+        wu_stat = {
+            "status": "not_configured",
+            "reason": "water meter not configured",
+            "next_action": "configure a water meter sensor to track total water consumption",
+        }
+    elif result.get("water_usage") is not None:
+        wu = result["water_usage"]
+        wu_stat = {
+            "status": "valid",
+            "reason": f"water consumption trends established over {wu['days_used']} days",
+            "next_action": "continue monitoring water usage",
+            "usable_observations": wu["days_used"],
+            "required_observations": WATER_USAGE_MIN_DAYS,
+            "latest_source_day": _iso_date_str(wu["latest_complete_day"]),
+            "source_lag_days": wu["source_lag_days"],
+        }
+    else:
+        usable_water = result.get("water_status", {}).get("usable_days", 0)
+        wu_stat = {
+            "status": "collecting",
+            "reason": f"fewer than {WATER_USAGE_MIN_DAYS} usable days of water meter data",
+            "next_action": "accumulate more water meter readings",
+            "usable_observations": usable_water,
+            "required_observations": WATER_USAGE_MIN_DAYS,
+        }
+    status["water_usage"] = wu_stat
+
+    # --- AIR CHANGE RATE ---
+    co2_conf = conf.get("co2")
+    co2_entities = [co2_conf] if isinstance(co2_conf, str) else (co2_conf or [])
+    co2_issue = _check_source_issue(conf, "co2", *co2_entities)
+    if co2_issue:
+        ach_stat = {
+            "status": "source_problem",
+            "reason": co2_issue,
+            "next_action": "resolve CO2 sensor issue",
+        }
+    elif not conf.get("co2"):
+        ach_stat = {
+            "status": "not_configured",
+            "reason": "CO2 sensor not configured",
+            "next_action": "configure indoor CO2 sensor(s) to calculate air change rate",
+        }
+    elif result.get("air_change_rate") is not None:
+        ach = result["air_change_rate"]
+        ach_stat = {
+            "status": "valid",
+            "reason": f"air change rate established from {ach['windows']} decay windows across {ach['sensor_count']} sensor(s)",
+            "next_action": "maintain indoor air quality monitoring",
+            "usable_observations": ach["windows"],
+            "required_observations": CO2_MIN_WINDOWS,
+        }
+    else:
+        ach_stat = {
+            "status": "collecting",
+            "reason": f"insufficient clean CO2 decay windows ({CO2_MIN_WINDOWS} required)",
+            "next_action": "ensure periods of vacancy or quiet decay to observe natural CO2 relaxation",
+            "required_observations": CO2_MIN_WINDOWS,
+        }
+    status["air_change_rate"] = ach_stat
+
+    # --- LOSSES (Whole-home split) ---
+    opt_in = bool(conf.get("experimental_whole_home_ventilation", False))
+    if not opt_in:
+        losses_stat = {
+            "status": "not_configured",
+            "reason": "experimental whole-home ventilation split is not enabled",
+            "next_action": "set experimental_whole_home_ventilation to true to enable whole-home loss split",
+        }
+    elif not (conf.get("floor_area_m2") and conf.get("ceiling_height_m")):
+        losses_stat = {
+            "status": "not_configured",
+            "reason": "floor area or ceiling height not configured",
+            "next_action": "configure floor area and ceiling height",
+        }
+    elif result.get("air_change_rate") is None or result.get("hlc") is None:
+        losses_stat = {
+            "status": "collecting",
+            "reason": "waiting for valid air change rate and HLC models",
+            "next_action": "wait for CO2 decay curves and space heating models to complete",
+        }
+    elif result.get("losses") is not None:
+        losses_stat = {
+            "status": "valid",
+            "reason": "whole-home ventilation and fabric loss split successfully calculated",
+            "next_action": "review fabric and ventilation loss shares",
+            "usable_observations": result["losses"]["windows"],
+            "required_observations": CO2_MIN_WINDOWS,
+        }
+    else:
+        note = (
+            result.get("losses_status", {}).get("diagnostic_note")
+            if isinstance(result.get("losses_status"), dict)
+            else "physically inconsistent ventilation/fabric split: calculated ventilation loss exceeds delivered HLC"
+        )
+        losses_stat = {
+            "status": "rejected",
+            "reason": note,
+            "next_action": "verify building volume and CO2 sensor placement",
+            "usable_observations": result["air_change_rate"]["windows"] if result.get("air_change_rate") else 0,
+            "required_observations": CO2_MIN_WINDOWS,
+        }
+    status["losses"] = losses_stat
+
+    # --- LOFT ---
+    loft_issue = _check_source_issue(conf, "loft", conf.get("loft"))
+    if loft_issue:
+        loft_stat = {
+            "status": "source_problem",
+            "reason": loft_issue,
+            "next_action": "resolve loft temperature sensor issue",
+        }
+    elif not conf.get("loft"):
+        loft_stat = {
+            "status": "not_configured",
+            "reason": "loft temperature sensor not configured",
+            "next_action": "configure a loft temperature sensor to calculate loft resistance ratio",
+        }
+    elif result.get("loft") is not None:
+        loft_res = result["loft"]
+        loft_stat = {
+            "status": "valid",
+            "reason": f"loft resistance ratio established from {loft_res['hours_used']} cold night hours",
+            "next_action": "maintain thermal monitoring",
+            "usable_observations": loft_res["hours_used"],
+            "required_observations": LOFT_MIN_HOURS,
+        }
+    else:
+        loft_stat = {
+            "status": "collecting",
+            "reason": f"fewer than {LOFT_MIN_HOURS} cold night hours with dT > {LOFT_MIN_DT}K",
+            "next_action": "wait for colder night temperatures to observe loft resistance",
+            "required_observations": LOFT_MIN_HOURS,
+        }
+    status["loft"] = loft_stat
+
+    # --- ROOMS ---
+    rooms_status = {}
+    for name, spec in conf.get("rooms", {}).items():
+        temp_eid = spec.get("temperature")
+        heat_eid = spec.get("heating_power")
+        r_issue = (
+            _check_source_issue(conf, temp_eid, heat_eid)
+            or _room_source_issue(conf, name, "temperature", "heating_power")
+        )
+        if not r_issue and heat_eid:
+            r_issue = (result.get("heating_power_issues") or {}).get(heat_eid)
+        if r_issue:
+            rooms_status[name] = {
+                "status": "source_problem",
+                "reason": r_issue,
+                "next_action": "resolve sensor issue for room",
+            }
+        elif not temp_eid:
+            rooms_status[name] = {
+                "status": "not_configured",
+                "reason": "room temperature sensor not configured",
+                "next_action": "configure a temperature sensor for this room",
+            }
+        elif result.get("rooms", {}).get(name) is not None:
+            r_fit = result["rooms"][name]
+            rooms_status[name] = {
+                "status": "valid" if r_fit["nights_fitted"] >= 5 else "provisional",
+                "reason": f"cooling rate estimated at tau={r_fit['tau_median_h']:.1f}h from {r_fit['nights_fitted']} night fits",
+                "next_action": "continue monitoring overnight room cooling",
+                "usable_observations": r_fit["nights_fitted"],
+                "required_observations": TAU_MIN_NIGHTS,
+                "model_data_through": r_fit.get("last_night"),
+            }
+        else:
+            rooms_status[name] = {
+                "status": "collecting",
+                "reason": (
+                    "fewer than 3 clean overnight free-cooling periods with heating confirmed off"
+                    if spec.get("heating_power") else
+                    "fewer than 3 clean overnight free-cooling periods; heating-off is assumed without a heating source"
+                ),
+                "next_action": "ensure heating is off overnight with steady unheated cooling periods",
+                "usable_observations": result.get("room_fit_counts", {}).get(name, 0),
+                "required_observations": TAU_MIN_NIGHTS,
+            }
+    status["rooms"] = rooms_status
+
+    return status

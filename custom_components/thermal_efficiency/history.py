@@ -597,6 +597,13 @@ class RoomHistoryManager:
     def prepare(self, stats, conf, tz):
         return compose(stats, conf, self.data, tz)
 
+    async def async_prepare(self, stats, conf, tz):
+        """Compose an analytical history snapshot away from the event loop."""
+        snapshot = deepcopy(self.data)
+        return await self.hass.async_add_executor_job(
+            compose, stats, conf, snapshot, tz
+        )
+
     def current_rooms(self):
         rooms = deepcopy(self.config["rooms"])
         for rid, spec in rooms.items():

@@ -102,4 +102,9 @@ def split_losses(
         "ventilation_share_pct": (
             ventilation_w_per_k / hlc_delivered * 100 if hlc_delivered > 0 else None
         ),
+        "scope": "whole-home ventilation and fabric loss split",
+        "assumptions": (
+            "Assumes uniform air-change rate across total dwelling volume and steady-state "
+            "indoor temperatures. Informational split only; not a categorical retrofit recommendation."
+        ),
     }

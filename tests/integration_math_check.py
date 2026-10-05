@@ -185,6 +185,7 @@ stats_co2 = stats | {"sensor.co2": to_stats_rows(co2_series, "mean")}
 conf_co2 = conf | {
     "co2": "sensor.co2", "floor_area_m2": 105.0, "ceiling_height_m": 2.45,
     "boiler_efficiency": 1.0,
+    "experimental_whole_home_ventilation": True,
 }
 result_co2 = tm.compute_all(stats_co2, conf_co2, TZ, now, (60,))
 losses = result_co2["losses"]

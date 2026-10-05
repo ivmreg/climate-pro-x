@@ -11,6 +11,7 @@ pytest.importorskip("pytest_homeassistant_custom_component")
 
 from homeassistant.const import UnitOfEnergy
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.thermal_efficiency.config_flow import (
@@ -45,7 +46,7 @@ from custom_components.thermal_efficiency.validation import heating_power_issue
 
 
 @pytest.fixture(autouse=True)
-def _enable_custom_integrations(recorder_db_url, enable_custom_integrations):
+def _enable_custom_integrations(recorder_db_url, enable_custom_integrations, recorder_mock):
     """Allow Home Assistant to discover this repository's custom integration."""
 
 
@@ -271,8 +272,8 @@ async def test_complete_entry_setup_captures_and_unloads(recorder_mock, hass, mo
     binding = manager.bindings()[0]
     hass.states.async_set(binding.source_entity_id, "20", {"unit_of_measurement": "°C"})
     await hass.async_block_till_done()
-    assert hass.states.get(binding.entity_id).state == "20.0"
-    assert len(er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)) == 14
+    # 14 original model/room entities + 1 data readiness diagnostic sensor
+    assert len(er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)) == 15
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
     assert diagnostics["configuration_schema_version"] == 2
     assert diagnostics["history_schema_version"] == 2
@@ -295,6 +296,7 @@ async def test_complete_entry_setup_captures_and_unloads(recorder_mock, hass, mo
             recorder_mock.queue_task(StatisticsTask(beginning, False))
             await committed(hass)
     migrator = HistoryMigrator(hass, entry, manager.data, manager._save)
+    assert hass.states.get(binding.entity_id).state == "22.0"
     rows = await migrator.query(binding.entity_id, base, base + timedelta(hours=1), "hour")
     assert len(rows) == 1
     assert rows[0]["mean"] == 22
@@ -382,6 +384,34 @@ async def test_history_options_preserve_room_identity_and_reject_stale_form(hass
     assert flow._async_finish()["reason"] == "assignments_changed"
 
 
+async def test_history_async_prepare_composes_snapshot_in_executor(hass, monkeypatch):
+    """History composition runs on a worker and receives a detached snapshot."""
+    from threading import get_ident
+
+    import custom_components.thermal_efficiency.history as history_module
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    loop_thread = get_ident()
+    evidence = {}
+
+    def compose_probe(stats, conf, snapshot, tz):
+        evidence["thread"] = get_ident()
+        evidence["snapshot"] = snapshot
+        return stats, conf
+
+    monkeypatch.setattr(history_module, "compose", compose_probe)
+    result = await manager.async_prepare({}, config, dt_util.get_default_time_zone())
+
+    assert result == ({}, config)
+    assert evidence["thread"] != loop_thread
+    assert evidence["snapshot"] is not manager.data
+
+
 async def test_replacement_options_preview_before_write(recorder_mock, hass):
     from types import SimpleNamespace
     from custom_components.thermal_efficiency.history import RoomHistoryManager
@@ -402,6 +432,31 @@ async def test_replacement_options_preview_before_write(recorder_mock, hass):
     assert manager.data["revision"] == revision
     assert (await flow.async_step_confirm({}))["type"] is FlowResultType.CREATE_ENTRY
     assert manager.current_rooms()["living_room"]["temperature"] == "sensor.new"
+    await manager.async_shutdown()
+
+
+async def test_replacement_rejects_incompatible_temperature_before_preview(hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass, flow.handler = hass, entry.entry_id
+    await flow.async_step_replace()
+    revision = manager.data["revision"]
+    hass.states.async_set("sensor.wrong_temperature", "20", {"unit_of_measurement": "kWh"})
+    result = await flow.async_step_replace({
+        "room": "living_room", "role": "temperature", "source": "sensor.wrong_temperature",
+    })
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "incompatible_unit"}
+    assert manager.data["revision"] == revision
+    assert manager.current_rooms()["living_room"]["temperature"] == config[CONF_ROOMS]["living_room"][CONF_TEMPERATURE]
     await manager.async_shutdown()
 
 

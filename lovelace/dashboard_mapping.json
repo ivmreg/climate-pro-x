@@ -1,0 +1,19 @@
+{
+  "home": {
+    "data_readiness": "sensor.thermal_efficiency_data_readiness",
+    "hlc": "sensor.thermal_efficiency_heat_loss_coefficient",
+    "loft_ratio": "sensor.thermal_efficiency_loft_ratio",
+    "air_change_rate": "sensor.thermal_efficiency_air_change_rate",
+    "fabric_loss": "sensor.thermal_efficiency_fabric_heat_loss",
+    "ventilation_loss": "sensor.thermal_efficiency_ventilation_heat_loss",
+    "hot_water_gas": "sensor.thermal_efficiency_hot_water_gas",
+    "hot_water_gas_7d": "sensor.thermal_efficiency_hot_water_gas_7_day_average",
+    "space_heating_gas_7d": "sensor.thermal_efficiency_space_heating_gas_7_day_average",
+    "electricity_baseload": "sensor.thermal_efficiency_electricity_baseload",
+    "electricity_use_7d": "sensor.thermal_efficiency_electricity_use_7_day_average",
+    "water_use_7d": "sensor.thermal_efficiency_total_water_use_7_day_average",
+    "live_electricity_power": null,
+    "daily_water_meter": null
+  },
+  "rooms": []
+}

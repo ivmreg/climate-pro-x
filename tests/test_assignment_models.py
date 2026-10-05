@@ -368,6 +368,7 @@ def test_legacy_heating_expected_intervals_anchored_to_first_observation(thermal
     }
     current = base
     cum_gas = 100.0
+    stats["sensor.gas"].append({"start": (base - timedelta(hours=1)).timestamp(), "sum": cum_gas})
     for day in range(100):
         t_out = 0.0 + (day % 15)
         gas = (20.0 - t_out) * 5.0 + 10.0

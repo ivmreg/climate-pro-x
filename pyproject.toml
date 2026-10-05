@@ -10,11 +10,8 @@ branch = true
 omit = [
   "tests/*",
   "ha_efficiency/__main__.py",
-  "custom_components/thermal_efficiency/__init__.py",
-  "custom_components/thermal_efficiency/config_flow.py",
+  # const.py is purely declarative constant definitions and strings with no executable branches
   "custom_components/thermal_efficiency/const.py",
-  "custom_components/thermal_efficiency/coordinator.py",
-  "custom_components/thermal_efficiency/sensor.py",
 ]
 
 [tool.coverage.report]

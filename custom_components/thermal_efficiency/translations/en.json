@@ -18,6 +18,7 @@
           "electricity_meter": "Electricity meter, cumulative kWh (optional)",
           "electricity_unit_rate": "Electricity tariff sensor, GBP/kWh or p/kWh (optional)",
           "boiler_efficiency": "Boiler efficiency, 0-1 (optional – default 0.88)",
+          "experimental_whole_home_ventilation": "Experimental whole-home ventilation split (optional)",
           "max_window_days": "Maximum lookback window, in days"
         }
       },
@@ -51,7 +52,13 @@
       "conditioned_room_required": "Add at least one conditioned room before finishing",
       "heating_power_must_be_percent": "Choose a heating demand sensor with a percent unit and a current value between 0 and 100",
       "invalid_source": "Choose an external sensor. Integration-owned room history entities cannot be used as room sources.",
-      "duplicate_source": "This sensor is already assigned to another room"
+      "duplicate_source": "This sensor is already assigned to another room",
+      "incompatible_unit": "The selected entity or statistic has an incompatible unit of measurement",
+      "missing_sum": "The selected entity or statistic must record cumulative sum statistics (total or total_increasing)",
+      "missing_mean": "The selected entity or statistic must record mean statistics",
+      "invalid_tariff": "Tariff sensor must have a supported unit (GBP/kWh or p/kWh) and a valid non-negative rate",
+      "incompatible_statistic": "The selected statistic cannot be used for this measurement",
+      "invalid_value": "Enter a finite number within the allowed range."
     },
     "abort": {
       "single_instance_allowed": "Only one Thermal Efficiency instance is allowed"
@@ -61,17 +68,32 @@
     "step": {
       "init": {
         "title": "Thermal Efficiency",
-        "menu_options": {"settings": "Home settings", "replace": "Replace a room sensor", "history": "Room assignment history", "resolve": "Resolve a move while offline", "correct_visit": "Correct a completed visit"}
+        "menu_options": {
+          "settings": "Home settings",
+          "replace": "Replace a room sensor",
+          "history": "Room assignment history",
+          "resolve": "Resolve a move while offline",
+          "correct_visit": "Correct a completed visit"
+        }
       },
       "replace": {
         "title": "Replace a room sensor",
         "description": "Select a room, measurement and source. Re-selecting the same source explicitly starts a new hardware generation. Only new reports will be captured after confirmation.",
-        "data": {"room": "Room", "role": "Measurement", "source": "Replacement sensor"}
+        "data": {
+          "room": "Room",
+          "role": "Measurement",
+          "source": "Replacement sensor"
+        }
       },
       "correct_visit": {
         "title": "Correct a completed visit",
         "description": "Enter corrected bounds as ISO timestamps with UTC offsets. Intervals must not overlap other visits. You can exclude mistaken observations from analysis without deleting recorded history.",
-        "data": {"visit": "Completed visit", "start": "Start time", "end": "End time", "exclude": "Exclude from analysis"}
+        "data": {
+          "visit": "Completed visit",
+          "start": "Start time",
+          "end": "End time",
+          "exclude": "Exclude from analysis"
+        }
       },
       "confirm": {
         "title": "Review assignment change",
@@ -84,7 +106,11 @@
       "resolve": {
         "title": "Resolve an uncertain move",
         "description": "Choose the room and when the sensor was physically moved. Enter an ISO timestamp with a UTC offset, for example 2026-09-11T14:00:00+01:00. Unobserved readings remain gaps.",
-        "data": {"source": "Sensor", "room": "Destination room", "effective_time": "Time of move"}
+        "data": {
+          "source": "Sensor",
+          "room": "Destination room",
+          "effective_time": "Time of move"
+        }
       },
       "settings": {
         "title": "Thermal Efficiency – home settings",
@@ -102,6 +128,7 @@
           "electricity_meter": "Electricity meter, cumulative kWh (optional)",
           "electricity_unit_rate": "Electricity tariff sensor, GBP/kWh or p/kWh (optional)",
           "boiler_efficiency": "Boiler efficiency, 0-1 (optional – default 0.88)",
+          "experimental_whole_home_ventilation": "Experimental whole-home ventilation split (optional)",
           "max_window_days": "Maximum lookback window, in days"
         }
       },
@@ -150,7 +177,13 @@
       "invalid_source": "Choose an external sensor. Integration-owned room history entities cannot be used as replacement sources.",
       "duplicate_source": "This sensor is already assigned to another room",
       "overlapping_visit": "The assignment start date overlaps with an existing visit for this room or sensor",
-      "invalid_correction": "Choose a time between the last verified assignment and now. If assignments changed while this form was open, review and retry."
+      "invalid_correction": "Choose a time between the last verified assignment and now. If assignments changed while this form was open, review and retry.",
+      "incompatible_unit": "The selected entity or statistic has an incompatible unit of measurement",
+      "missing_sum": "The selected entity or statistic must record cumulative sum statistics (total or total_increasing)",
+      "missing_mean": "The selected entity or statistic must record mean statistics",
+      "invalid_tariff": "Tariff sensor must have a supported unit (GBP/kWh or p/kWh) and a valid non-negative rate",
+      "incompatible_statistic": "The selected statistic cannot be used for this measurement",
+      "invalid_value": "Enter a finite number within the allowed range."
     },
     "abort": {
       "no_pending_moves": "No uncertain moves need resolving.",
@@ -158,6 +191,12 @@
       "change_not_applied": "No change was applied. The source must have a valid reading, dates must be valid and non-overlapping, and assignments must not have changed since the preview. Reopen the form to review.",
       "assignments_changed": "Assignments changed while these settings were open. Reopen settings to review the current rooms.",
       "conditioned_room_required": "At least one conditioned room is required"
+    }
+  },
+  "issues": {
+    "incompatible_source": {
+      "title": "Incompatible sensor configured",
+      "description": "The configured {source} has an issue: {issue}. Please update your settings."
     }
   }
 }

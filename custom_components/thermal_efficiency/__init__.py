@@ -4,6 +4,7 @@ computed from the recorder's long-term statistics."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import isfinite
 import voluptuous as vol
 
 import homeassistant.helpers.config_validation as cv
@@ -19,6 +20,7 @@ from .const import (
     CONF_CO2,
     CONF_ELECTRICITY_METER,
     CONF_ELECTRICITY_UNIT_RATE,
+    CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION,
     CONF_FLOOR_AREA,
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
@@ -116,7 +118,11 @@ def _validate_rooms(rooms: dict) -> dict:
 
 def _bounded_float(minimum: float, maximum: float):
     """Coerce a numeric configuration value and enforce physical bounds."""
-    return vol.All(vol.Coerce(float), vol.Range(min=minimum, max=maximum))
+    def validate(value):
+        if not isfinite(value) or not minimum <= value <= maximum:
+            raise vol.Invalid(f"Must be finite and between {minimum} and {maximum}")
+        return value
+    return vol.All(vol.Coerce(float), validate)
 
 CONFIG_SCHEMA = vol.Schema(
     {
@@ -155,8 +161,11 @@ CONFIG_SCHEMA = vol.Schema(
                         CONF_BOILER_EFFICIENCY, default=DEFAULT_BOILER_EFFICIENCY
                     ): _bounded_float(0.5, 1.0),
                     vol.Optional(
+                        CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION, default=False
+                    ): cv.boolean,
+                    vol.Optional(
                         CONF_MAX_WINDOW_DAYS, default=DEFAULT_MAX_WINDOW_DAYS
-                    ): vol.All(cv.positive_int, vol.Range(min=30, max=730)),
+                    ): vol.All(_bounded_float(30, 730), cv.positive_int),
                 }
             ),
             _validate_loft_exclusivity,

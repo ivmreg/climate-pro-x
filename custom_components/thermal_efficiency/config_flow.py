@@ -28,6 +28,7 @@ from .const import (
     CONF_CO2,
     CONF_ELECTRICITY_METER,
     CONF_ELECTRICITY_UNIT_RATE,
+    CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION,
     CONF_FLOOR_AREA,
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
@@ -49,7 +50,13 @@ from .const import (
     ROOM_TYPE_CONDITIONED,
     ROOM_TYPE_LOFT,
 )
-from .validation import heating_power_issue, _loft_since
+from .validation import (
+    heating_power_issue,
+    _loft_since,
+    validate_global_sources,
+    async_fetch_recorder_metadata,
+    validate_source_metadata_and_state,
+)
 from .assignments import room_roles, timestamp
 from .config_migration import migrate_legacy_loft_config
 
@@ -169,6 +176,10 @@ def _global_schema(defaults: dict | None = None) -> vol.Schema:
                 )
             ),
             vol.Optional(
+                CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION,
+                default=defaults.get(CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION, False),
+            ): selector.BooleanSelector(),
+            vol.Optional(
                 CONF_MAX_WINDOW_DAYS,
                 default=defaults.get(CONF_MAX_WINDOW_DAYS, DEFAULT_MAX_WINDOW_DAYS),
             ): selector.NumberSelector(
@@ -194,6 +205,12 @@ def _normalize_global(user_input: dict) -> dict:
         data[CONF_OUTDOOR_CO2] = float(data[CONF_OUTDOOR_CO2])
     if CONF_MIN_DHW_WATER_L in data:
         data[CONF_MIN_DHW_WATER_L] = float(data[CONF_MIN_DHW_WATER_L])
+    if CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION in data:
+        data[CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION] = bool(
+            data[CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION]
+        )
+    else:
+        data[CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION] = False
     return data
 
 
@@ -402,15 +419,25 @@ def _validate_room_input(
     user_input: dict,
     taken: set[str] | dict,
     other_sources: set[str] | None = None,
+    metadata_map: dict[str, Any] | None | object = ...,
 ) -> tuple[str | None, dict[str, str]]:
     slug, errors = _validate_room_name(user_input["name"], taken)
     temp_sensor = user_input.get(CONF_TEMPERATURE)
     other_sources = other_sources or set()
+    if metadata_map is None:
+        errors["base"] = "recorder_unavailable"
     if temp_sensor:
         if _is_owned_entity(hass, temp_sensor):
             errors[CONF_TEMPERATURE] = "invalid_source"
         elif temp_sensor in other_sources:
             errors[CONF_TEMPERATURE] = "duplicate_source"
+        else:
+            err_key, _ = validate_source_metadata_and_state(
+                hass, temp_sensor, "temperature",
+                metadata_map.get(temp_sensor) if isinstance(metadata_map, dict) else None,
+            )
+            if err_key:
+                errors[CONF_TEMPERATURE] = err_key
     heating_power = user_input.get(CONF_HEATING_POWER)
     room_type = user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED)
     if room_type not in (ROOM_TYPE_CONDITIONED, ROOM_TYPE_LOFT):
@@ -426,6 +453,13 @@ def _validate_room_input(
             errors[CONF_HEATING_POWER] = "duplicate_source"
         elif heating_power_issue(hass, heating_power):
             errors[CONF_HEATING_POWER] = "heating_power_must_be_percent"
+        else:
+            err_key, _ = validate_source_metadata_and_state(
+                hass, heating_power, "heating_power",
+                metadata_map.get(heating_power) if isinstance(metadata_map, dict) else None,
+            )
+            if err_key:
+                errors[CONF_HEATING_POWER] = err_key
     humidity = user_input.get(CONF_HUMIDITY)
     if humidity:
         if room_type != ROOM_TYPE_LOFT:
@@ -436,6 +470,13 @@ def _validate_room_input(
             errors[CONF_HUMIDITY] = "duplicate_source"
         elif temp_sensor and humidity == temp_sensor:
             errors[CONF_HUMIDITY] = "duplicate_source"
+        else:
+            err_key, _ = validate_source_metadata_and_state(
+                hass, humidity, "humidity",
+                metadata_map.get(humidity) if isinstance(metadata_map, dict) else None,
+            )
+            if err_key:
+                errors[CONF_HUMIDITY] = err_key
     assignment_since = user_input.get(CONF_ASSIGNMENT_SINCE)
     if assignment_since:
         if room_type != ROOM_TYPE_LOFT:
@@ -446,6 +487,15 @@ def _validate_room_input(
             except vol.Invalid:
                 errors[CONF_ASSIGNMENT_SINCE] = "invalid_date"
     return slug, errors
+
+
+async def _fetch_room_metadata(hass: HomeAssistant, user_input: dict) -> dict | None:
+    statistic_ids = {
+        source_id
+        for key in (CONF_TEMPERATURE, CONF_HEATING_POWER, CONF_HUMIDITY)
+        if isinstance((source_id := user_input.get(key)), str) and source_id
+    }
+    return await async_fetch_recorder_metadata(hass, statistic_ids)
 
 
 def _has_loft(rooms: dict, current_id: str | None = None) -> bool:
@@ -480,10 +530,45 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
+        errors: dict[str, str] = {}
         if user_input is not None:
-            self._global = _normalize_global(user_input)
-            return await self.async_step_room()
-        return self.async_show_form(step_id="user", data_schema=_global_schema())
+            stat_ids: set[str] = set()
+            for key in (
+                CONF_OUTDOOR,
+                CONF_GAS_METER,
+                CONF_WATER,
+                CONF_ELECTRICITY_METER,
+                CONF_OUTDOOR_CO2_SENSOR,
+                CONF_GAS_UNIT_RATE,
+                CONF_ELECTRICITY_UNIT_RATE,
+            ):
+                val = user_input.get(key)
+                if isinstance(val, str) and val:
+                    stat_ids.add(val)
+            co2 = user_input.get(CONF_CO2)
+            if isinstance(co2, str):
+                stat_ids.add(co2)
+            elif isinstance(co2, list):
+                stat_ids.update(s for s in co2 if isinstance(s, str))
+
+            metadata = await async_fetch_recorder_metadata(self.hass, stat_ids)
+            errors = validate_global_sources(self.hass, user_input, metadata)
+            for k, val in user_input.items():
+                if isinstance(val, str) and _is_owned_entity(self.hass, val):
+                    errors[k] = "invalid_source"
+                elif isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, str) and _is_owned_entity(self.hass, item):
+                            errors[k] = "invalid_source"
+
+            if not errors:
+                self._global = _normalize_global(user_input)
+                return await self.async_step_room()
+        return self.async_show_form(
+            step_id="user",
+            data_schema=_global_schema(user_input or self._global),
+            errors=errors,
+        )
 
     async def async_step_room(
         self, user_input: dict[str, Any] | None = None
@@ -501,8 +586,9 @@ class ThermalEfficiencyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         errors: dict[str, str] = {}
         if user_input is not None:
+            room_metadata = await _fetch_room_metadata(self.hass, user_input)
             slug, errors = _validate_room_input(
-                self.hass, user_input, self._rooms, _assigned_sources(self._rooms)
+                self.hass, user_input, self._rooms, _assigned_sources(self._rooms), room_metadata
             )
             if (
                 user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
@@ -584,16 +670,49 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         return await self.async_step_settings(user_input)
 
     async def async_step_settings(self, user_input=None):
+        errors: dict[str, str] = {}
         if user_input is not None:
-            self._global = _normalize_global(user_input)
-            history = self._history()
-            self._revision = history.data["revision"] if history else None
-            self._pending_rooms = list(
-                (history.current_rooms() if history else self.config_entry.data.get(CONF_ROOMS, {})).items()
-            )
-            return await self._async_advance_room()
+            stat_ids: set[str] = set()
+            for key in (
+                CONF_OUTDOOR,
+                CONF_GAS_METER,
+                CONF_WATER,
+                CONF_ELECTRICITY_METER,
+                CONF_OUTDOOR_CO2_SENSOR,
+                CONF_GAS_UNIT_RATE,
+                CONF_ELECTRICITY_UNIT_RATE,
+            ):
+                val = user_input.get(key)
+                if isinstance(val, str) and val:
+                    stat_ids.add(val)
+            co2 = user_input.get(CONF_CO2)
+            if isinstance(co2, str):
+                stat_ids.add(co2)
+            elif isinstance(co2, list):
+                stat_ids.update(s for s in co2 if isinstance(s, str))
+
+            metadata = await async_fetch_recorder_metadata(self.hass, stat_ids)
+            errors = validate_global_sources(self.hass, user_input, metadata)
+            for k, val in user_input.items():
+                if isinstance(val, str) and _is_owned_entity(self.hass, val):
+                    errors[k] = "invalid_source"
+                elif isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, str) and _is_owned_entity(self.hass, item):
+                            errors[k] = "invalid_source"
+
+            if not errors:
+                self._global = _normalize_global(user_input)
+                history = self._history()
+                self._revision = history.data["revision"] if history else None
+                self._pending_rooms = list(
+                    (history.current_rooms() if history else self.config_entry.data.get(CONF_ROOMS, {})).items()
+                )
+                return await self._async_advance_room()
         return self.async_show_form(
-            step_id="settings", data_schema=_global_schema(self.config_entry.data)
+            step_id="settings",
+            data_schema=_global_schema(user_input or self.config_entry.data),
+            errors=errors,
         )
 
     async def async_step_history(self, user_input=None):
@@ -679,8 +798,19 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
             ):
                 errors["base"] = "heating_power_must_be_percent"
             else:
-                self._change = ("async_replace", [user_input["room"], user_input["role"], user_input["source"]], self._revision)
-                return await self.async_step_confirm()
+                metadata = await async_fetch_recorder_metadata(self.hass, {user_input["source"]})
+                if metadata is None:
+                    errors["base"] = "recorder_unavailable"
+                else:
+                    error, _ = validate_source_metadata_and_state(
+                        self.hass, user_input["source"], user_input["role"],
+                        metadata.get(user_input["source"]),
+                    )
+                    if error:
+                        errors["base"] = error
+                    else:
+                        self._change = ("async_replace", [user_input["room"], user_input["role"], user_input["source"]], self._revision)
+                        return await self.async_step_confirm()
         self._revision = history.data["revision"]
         return self.async_show_form(step_id="replace", errors=errors, data_schema=vol.Schema({
             vol.Required("room"): selector.SelectSelector(selector.SelectSelectorConfig(options=[
@@ -756,8 +886,9 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
                 exclude_room_id=self._current_room[0],
                 pending_rooms=self._pending_rooms,
             )
+            room_metadata = await _fetch_room_metadata(self.hass, user_input)
             slug, errors = _validate_room_input(
-                self.hass, user_input, other_slugs, other_sources
+                self.hass, user_input, other_slugs, other_sources, room_metadata
             )
             other_rooms = dict(self._rooms)
             other_rooms.update(dict(self._pending_rooms))
@@ -847,8 +978,9 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             other_slugs = _other_room_slugs(self._rooms)
             other_sources = _assigned_sources(self._rooms)
+            room_metadata = await _fetch_room_metadata(self.hass, user_input)
             slug, errors = _validate_room_input(
-                self.hass, user_input, other_slugs, other_sources
+                self.hass, user_input, other_slugs, other_sources, room_metadata
             )
             if (
                 user_input.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT

@@ -232,6 +232,7 @@ def test_compute_all_separates_ach_from_inconsistent_loss_split(thermal_math):
         "floor_area_m2": 200.0,
         "ceiling_height_m": 3.0,
         "boiler_efficiency": 0.88,
+        "experimental_whole_home_ventilation": True,
     }
     tz = ZoneInfo("Europe/London")
     now = datetime(2026, 2, 15, tzinfo=timezone.utc)
@@ -314,3 +315,34 @@ def test_loss_sensors_handle_inconsistent_split_vs_insufficient_co2():
     assert vent_sensor.extra_state_attributes["note"] == "not enough data yet"
     assert fabric_sensor.native_value is None
     assert fabric_sensor.extra_state_attributes["note"] == "not enough data yet"
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("source_problem", "source_problem"), ("rejected", "rejected"),
+    ("provisional", "provisional"), ("valid", "ready"),
+    ("historical_baseline_held", "historical_baseline_held"),
+])
+def test_readiness_identity_state_and_privacy(status, expected):
+    from unittest.mock import MagicMock
+    from custom_components.thermal_efficiency.sensor import DataReadinessSensor
+
+    coordinator = MagicMock()
+    coordinator.conf = {"rooms": {"bed": {"name": "Private Bedroom", "temperature": "sensor.private_temperature"}}}
+    coordinator.data = {
+        "analysis_status": {
+            "hlc": {"status": status, "reason": "sensor.private_temperature in Private Bedroom", "next_action": "check sensor.private_temperature", "usable_observations": 21},
+            "rooms": {"bed": {"status": status, "reason": "Private Bedroom source failed", "required_observations": 3}},
+        },
+        "source_issues": {"external:private_water": "external:private_water has missing unit"},
+    }
+    sensor = DataReadinessSensor(coordinator)
+    assert sensor.unique_id == "thermal_efficiency_data_readiness"
+    assert sensor.state_class is None
+    assert sensor.native_unit_of_measurement is None
+    assert sensor.native_value == expected
+    attrs = sensor.extra_state_attributes
+    assert attrs["metrics"]["hlc"]["usable_observations"] == 21
+    assert attrs["metrics"]["rooms"]["room_1"]["required_observations"] == 3
+    assert "private_temperature" not in str(attrs)
+    assert "Private Bedroom" not in str(attrs)
+    assert "private_water" not in str(attrs)

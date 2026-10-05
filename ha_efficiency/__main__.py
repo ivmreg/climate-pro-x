@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -136,7 +137,12 @@ def cmd_hlc(args) -> None:
         q_daily = hlc.daily_heat_input_from_tado(heating, cfg["boiler_output_kw"])
         source = f"Tado heating power x {cfg['boiler_output_kw']} kW boiler"
 
-    result = hlc.fit_hlc(q_daily, dt_daily)
+    dhw_context = _dhw_context(cfg, dt_daily) if gas_entity else None
+    result = hlc.fit_hlc(
+        q_daily,
+        dt_daily,
+        heating_off=dhw_context["heating_off"] if dhw_context else None,
+    )
     print(f"\nHeat input source: {source}")
     print(f"Usable heating days: {result['days']}")
     if "note" in result:
@@ -146,7 +152,6 @@ def cmd_hlc(args) -> None:
     efficiency = 1.0
     if gas_entity:
         outdoor_daily = outdoor.resample("1D").mean()
-        dhw_context = _dhw_context(cfg, dt_daily)
         corrected = dhw.corrected_hlc(
             q_daily, dt_daily, outdoor_daily, **dhw_context
         )
@@ -290,7 +295,9 @@ def cmd_ventilation(args) -> None:
         space_heating_hlc = corrected["hlc_w_per_k"]
         print(f"Using DHW-corrected space-heating HLC: {space_heating_hlc:.0f} W/K")
     else:
-        raw = hlc.fit_hlc(q_daily, dt_daily)
+        raw = hlc.fit_hlc(
+            q_daily, dt_daily, heating_off=dhw_context["heating_off"]
+        )
         if "note" in raw:
             sys.exit(raw["note"])
         space_heating_hlc = raw["hlc_w_per_k"]
@@ -344,7 +351,7 @@ def cmd_dhw(args) -> None:
                 rate = float(state["state"])
         except Exception:
             rate = None
-        if rate:
+        if rate is not None and math.isfinite(rate) and rate >= 0:
             state_unit = (state.get("attributes") or {}).get("unit_of_measurement", "")
             normalized_unit = str(state_unit).casefold().replace(" ", "")
             if normalized_unit in {"p/kwh", "pence/kwh"}:
@@ -353,7 +360,7 @@ def cmd_dhw(args) -> None:
                 rate /= 1000
             elif normalized_unit not in {"gbp/kwh", "£/kwh"}:
                 rate = None
-        if rate:
+        if rate is not None and math.isfinite(rate) and rate >= 0:
             per_day = baseline["kwh_per_day"] * rate
             modelled = outdoor_daily.dropna().apply(
                 lambda value: dhw.dhw_daily_kwh(value, baseline)

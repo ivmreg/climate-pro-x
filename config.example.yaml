@@ -1,12 +1,11 @@
 # Map your HA entities here. `discover` generates a draft of this file.
 
-# Worcester Bosch rated output in kW (model plate / manual). Used to convert
-# Tado heating-power % into an absolute heat input. If you later add a real
-# gas meter entity, set `gas_kwh_entity` instead and this is ignored.
-boiler_output_kw: 28
+# Boiler rated output in kW (use the value from your appliance documentation).
+# Used only by the optional CLI estimate when no gas meter is mapped.
+boiler_output_kw: null
 
-# Optional: cumulative or daily gas energy sensor (kWh), e.g. from a smart
-# meter integration. Leave null to estimate input from Tado heating power.
+# Optional: cumulative gas energy sensor (kWh), selected from your HA entity
+# registry. Leave null until you have verified a compatible source.
 gas_kwh_entity: null
 
 # Optional: GBP/kWh gas tariff sensor and your combi's efficiency (0-1) —
@@ -29,8 +28,7 @@ floor_area_m2: null
 ceiling_height_m: null
 
 # Optional: an external statistic id (not a sensor.* entity — check HA's
-# Developer Tools > Statistics) with genuine hourly water usage, e.g. from a
-# water-utility integration. It excludes low-water away days from the DHW
+# Developer Tools > Statistics) with genuine hourly water usage. It excludes low-water away days from the DHW
 # baseline, models heating-day DHW from actual usage, and also enables the
 # informational hot-water-fraction regression. A recorder-tracked sensor.*
 # meter that only updates once/day will NOT work here — diffing it gives one
@@ -39,9 +37,9 @@ water_stat: null
 # Set 0 to disable away-day filtering while retaining water-based attribution.
 min_dhw_water_litres: 50
 
-outdoor_entity: sensor.outdoor_temperature
-loft_entity: sensor.loft_temperature
-weather_entity: weather.home   # used later for wind/solar corrections
+outdoor_entity: null  # replace with a verified outdoor temperature entity
+loft_entity: null     # replace with a verified loft temperature entity
+weather_entity: null  # optional; used for wind/solar corrections
 
 # The HA integration (custom_components/thermal_efficiency) additionally
 # supports loft_since (ignore a relocated loft sensor's pre-move history)
@@ -55,11 +53,8 @@ night_end: "06:30"
 
 rooms:
   living_room:
-    temperature: sensor.living_room_temperature
-    # Tado exposes per-zone heating power as sensor.<zone>_heating (0-100 %).
-    # Optional but recommended: lets us verify heating was truly off during
-    # cooling windows and drives the HLC heat-input estimate.
-    heating_power: sensor.living_room_heating
+    temperature: null  # replace with a verified room temperature entity
+    heating_power: null  # optional verified 0-100% heating demand entity
   bedroom:
-    temperature: sensor.bedroom_temperature
-    heating_power: sensor.bedroom_heating
+    temperature: null
+    heating_power: null

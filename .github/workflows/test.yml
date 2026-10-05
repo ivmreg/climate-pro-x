@@ -31,9 +31,15 @@ jobs:
           python -m pip install -r requirements-dev.txt
           python -m pip install homeassistant==${{ matrix.ha-version }}
       - name: Run tests
-        run: python -m pytest
-      - name: Enforce live core branch coverage
-        run: >-
-          python -m coverage report
-          --include='custom_components/thermal_efficiency/thermal_math.py'
-          --fail-under=90
+        run: python -m pytest --cov-report=json:coverage.json --junitxml=pytest.xml
+      - name: Enforce live core branch and combined coverage gate
+        run: python scripts/check_coverage.py --report coverage.json
+      - name: Save test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-python-${{ matrix.python-version }}
+          path: |
+            coverage.json
+            pytest.xml
+          if-no-files-found: warn
