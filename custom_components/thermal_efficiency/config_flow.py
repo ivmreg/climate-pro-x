@@ -798,8 +798,19 @@ class ThermalEfficiencyOptionsFlow(config_entries.OptionsFlow):
             ):
                 errors["base"] = "heating_power_must_be_percent"
             else:
-                self._change = ("async_replace", [user_input["room"], user_input["role"], user_input["source"]], self._revision)
-                return await self.async_step_confirm()
+                metadata = await async_fetch_recorder_metadata(self.hass, {user_input["source"]})
+                if metadata is None:
+                    errors["base"] = "recorder_unavailable"
+                else:
+                    error, _ = validate_source_metadata_and_state(
+                        self.hass, user_input["source"], user_input["role"],
+                        metadata.get(user_input["source"]),
+                    )
+                    if error:
+                        errors["base"] = error
+                    else:
+                        self._change = ("async_replace", [user_input["room"], user_input["role"], user_input["source"]], self._revision)
+                        return await self.async_step_confirm()
         self._revision = history.data["revision"]
         return self.async_show_form(step_id="replace", errors=errors, data_schema=vol.Schema({
             vol.Required("room"): selector.SelectSelector(selector.SelectSelectorConfig(options=[

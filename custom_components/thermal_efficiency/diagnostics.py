@@ -200,7 +200,7 @@ async def async_get_config_entry_diagnostics(
             "status": migration.get("status"),
             "cutoff": migration.get("cutoff"),
             "completed_at": migration.get("completed_at"),
-            "error": migration.get("error"),
+            "error": _anonymize(migration.get("error"), room_names, source_ids),
             "parity_verified": migration.get("parity_verified", False),
         },
         "rooms": len(history.get("rooms", {})),

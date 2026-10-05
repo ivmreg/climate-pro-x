@@ -176,6 +176,7 @@ def benchmark_configuration(
     now = datetime.fromtimestamp(start.timestamp() + num_days * 86400, TZ_LONDON)
     result = thermal_math.compute_all(stats, conf, TZ_LONDON, now, (num_days,))
 
+    complete_gas_days = len(thermal_math.daily_gas_kwh(synthetic["gas_sum"], TZ_LONDON))
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
     current_mem, peak_mem = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -199,7 +200,7 @@ def benchmark_configuration(
         "peak_memory_kb": round(peak_mem_kb, 1),
         "pipeline": "thermal_math.compute_all",
         "metric_status": {key: value["status"] for key, value in result["analysis_status"].items() if key != "rooms"},
-        "complete_gas_days": result["analysis_status"]["usage"].get("usable_observations"),
+        "complete_gas_days": complete_gas_days,
         "hlc_fitted": result["hlc"] is not None,
         "taus_fitted": sum(1 for fit in result["rooms"].values() if fit),
         "co2_fitted": result["air_change_rate"] is not None,

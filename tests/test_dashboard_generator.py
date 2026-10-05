@@ -120,6 +120,24 @@ def test_empty_rooms_and_missing_optional_metrics_are_supported(tmp_path: Path):
     assert "Room Cooling Fingerprints" in str(live)
 
 
+def test_readiness_cards_render_independent_metrics_and_room_evidence(tmp_path: Path):
+    mapping = _write_mapping(tmp_path, _make_valid_mapping(1))
+    storyboard, live = generate_dashboards(mapping)
+    metrics = {
+        "hlc": {"status": "historical_baseline_held", "reason": "winter model retained", "model_data_through": "2026-03-01"},
+        "water_usage": {"status": "source_problem", "reason": "water history missing", "next_action": "restore water source", "source_lag_days": 20},
+        "rooms": {"room_1": {"status": "collecting", "reason": "only two clean nights", "usable_observations": 2, "required_observations": 3}},
+    }
+    for text, title in [(storyboard, "System Data Readiness"), (live, "Data readiness and model scope")]:
+        card = _find_card(yaml.safe_load(text), title=title)
+        rendered = Environment().from_string(card["content"]).render(
+            states=lambda _: "source_problem",
+            state_attr=lambda _, key: metrics if key == "metrics" else None,
+        )
+        for expected in ["winter model retained", "2026-03-01", "water history missing", "restore water source", "20 days", "only two clean nights", "2/3"]:
+            assert expected in rendered
+
+
 def test_model_scope_readiness_and_experimental_labels(tmp_path: Path):
     mapping = _write_mapping(tmp_path, _make_valid_mapping(2))
     storyboard, live = generate_dashboards(mapping)

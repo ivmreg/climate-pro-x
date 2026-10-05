@@ -207,12 +207,17 @@ views:
               {{% if hlc_action and hlc_action != 'None' %}} · **Next Action:** {{{{ hlc_action }}}}{{% endif %}}
               {{% if summary %}} · {{{{ summary }}}}{{% endif %}}
               {{% if hlc_metrics.get('usable_observations') is not none %}} · HLC evidence: **{{{{ hlc_metrics.get('usable_observations') }}}}/{{{{ hlc_metrics.get('required_observations', '—') }}}}** usable/required observations.{{% endif %}}
-              {{% for metric, info in metrics.items() %}}
+              {{% for metric, info in metrics.items() if metric != 'rooms' %}}
 
               **{{{{ metric | replace('_', ' ') | title }}}}:** {{{{ info.get('status', 'collecting') | replace('_', ' ') }}}}. {{{{ info.get('reason', '') }}}} {{{{ info.get('next_action', '') }}}}
               {{% if info.get('usable_observations') is not none %}} Evidence: {{{{ info.get('usable_observations') }}}}/{{{{ info.get('required_observations', '—') }}}}.{{% endif %}}
               {{% if info.get('model_data_through') %}} Model through {{{{ info.get('model_data_through') }}}}.{{% endif %}}
               {{% if info.get('source_lag_days') is not none %}} Source lag: {{{{ info.get('source_lag_days') }}}} days.{{% endif %}}
+              {{% endfor %}}
+              {{% for room, info in metrics.get('rooms', {{}}).items() %}}
+
+              **{{{{ room | replace('_', ' ') | title }}}}:** {{{{ info.get('status', 'collecting') | replace('_', ' ') }}}}. {{{{ info.get('reason', '') }}}} {{{{ info.get('next_action', '') }}}}
+              {{% if info.get('usable_observations') is not none %}} Nights: {{{{ info.get('usable_observations') }}}}/{{{{ info.get('required_observations', '—') }}}}.{{% endif %}}
               {{% endfor %}}
               {{% endif %}}
 
@@ -788,12 +793,17 @@ views:
         {{% if action and action != 'None' %}} · **Next:** {{{{ action }}}}{{% endif %}}
               {{% if summary %}} · {{{{ summary }}}}{{% endif %}}
         {{% set hlc = state_attr(s, 'metrics') or {{}} %}}{{% set fit = hlc.get('hlc', {{}}) %}}
-        {{% for metric, info in hlc.items() %}}
+        {{% for metric, info in hlc.items() if metric != 'rooms' %}}
 
         **{{{{ metric | replace('_', ' ') | title }}}}:** {{{{ info.get('status', 'collecting') | replace('_', ' ') }}}}. {{{{ info.get('reason', '') }}}} {{{{ info.get('next_action', '') }}}}
         {{% if info.get('usable_observations') is not none %}} Evidence: {{{{ info.get('usable_observations') }}}}/{{{{ info.get('required_observations', '—') }}}}.{{% endif %}}
         {{% if info.get('model_data_through') %}} Model through {{{{ info.get('model_data_through') }}}}.{{% endif %}}
         {{% if info.get('source_lag_days') is not none %}} Source lag: {{{{ info.get('source_lag_days') }}}} days.{{% endif %}}
+        {{% endfor %}}
+        {{% for room, info in hlc.get('rooms', {{}}).items() %}}
+
+        **{{{{ room | replace('_', ' ') | title }}}}:** {{{{ info.get('status', 'collecting') | replace('_', ' ') }}}}. {{{{ info.get('reason', '') }}}} {{{{ info.get('next_action', '') }}}}
+        {{% if info.get('usable_observations') is not none %}} Nights: {{{{ info.get('usable_observations') }}}}/{{{{ info.get('required_observations', '—') }}}}.{{% endif %}}
         {{% endfor %}}
         {{% if fit.get('usable_observations') is not none %}} · HLC observations: **{{{{ fit.get('usable_observations') }}}}/{{{{ fit.get('required_observations', '—') }}}}** usable/required.{{% endif %}}
         {{% set through = state_attr('{hlc_id}', 'model_data_through') %}}

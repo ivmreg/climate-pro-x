@@ -94,7 +94,7 @@ def _metadata_has_mean(metadata: dict[str, Any]) -> bool | None:
             else str(value).casefold() == "arithmetic" or type(value) is int and value == 1
         )
     if "has_mean" in metadata:
-        return bool(metadata["has_mean"])
+        return metadata["has_mean"] is True
     return None
 
 
@@ -151,6 +151,11 @@ def validate_source_metadata_and_state(
     is_external = ":" in entity_or_stat_id or (
         metadata is not None and metadata.get("source") not in (None, "recorder")
     )
+    if metadata is not None and meta_unit is None and role in {
+        "outdoor", "temperature", "gas_meter", "electricity_meter", "water",
+        "co2", "outdoor_co2_sensor", "humidity", "loft_humidity", "heating_power",
+    }:
+        return ("incompatible_unit", f"Source {entity_or_stat_id} has missing recorder unit of measurement")
 
     if role in ("outdoor", "temperature"):
         if metadata is not None:
