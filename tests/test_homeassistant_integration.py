@@ -296,6 +296,7 @@ async def test_complete_entry_setup_captures_and_unloads(recorder_mock, hass, mo
             recorder_mock.queue_task(StatisticsTask(beginning, False))
             await committed(hass)
     migrator = HistoryMigrator(hass, entry, manager.data, manager._save)
+    assert hass.states.get(binding.entity_id).state == "22.0"
     rows = await migrator.query(binding.entity_id, base, base + timedelta(hours=1), "hour")
     assert len(rows) == 1
     assert rows[0]["mean"] == 22
@@ -431,6 +432,31 @@ async def test_replacement_options_preview_before_write(recorder_mock, hass):
     assert manager.data["revision"] == revision
     assert (await flow.async_step_confirm({}))["type"] is FlowResultType.CREATE_ENTRY
     assert manager.current_rooms()["living_room"]["temperature"] == "sensor.new"
+    await manager.async_shutdown()
+
+
+async def test_replacement_rejects_incompatible_temperature_before_preview(hass):
+    from types import SimpleNamespace
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    entry.runtime_data = SimpleNamespace(history=manager)
+    flow = ThermalEfficiencyOptionsFlow()
+    flow.hass, flow.handler = hass, entry.entry_id
+    await flow.async_step_replace()
+    revision = manager.data["revision"]
+    hass.states.async_set("sensor.wrong_temperature", "20", {"unit_of_measurement": "kWh"})
+    result = await flow.async_step_replace({
+        "room": "living_room", "role": "temperature", "source": "sensor.wrong_temperature",
+    })
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "incompatible_unit"}
+    assert manager.data["revision"] == revision
+    assert manager.current_rooms()["living_room"]["temperature"] == config[CONF_ROOMS]["living_room"][CONF_TEMPERATURE]
     await manager.async_shutdown()
 
 
