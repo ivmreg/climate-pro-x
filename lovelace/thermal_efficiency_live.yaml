@@ -1,5 +1,22 @@
+# Sections-view dashboard with real-time gauges, status fallback tiles, and trend charts.
+# Generated from portable mapping configuration.
+
 views:
 - badges:
+  - color: blue
+    entity: sensor.thermal_efficiency_data_readiness
+    icon: mdi:clipboard-check-outline
+    name: Readiness
+    show_icon: true
+    show_name: true
+    show_state: true
+    visibility:
+    - condition: state
+      entity: sensor.thermal_efficiency_data_readiness
+      state_not: unknown
+    - condition: state
+      entity: sensor.thermal_efficiency_data_readiness
+      state_not: unavailable
   - color: purple
     entity: sensor.thermal_efficiency_heat_loss_coefficient
     icon: mdi:home-thermometer-outline
@@ -15,7 +32,7 @@ views:
       entity: sensor.thermal_efficiency_heat_loss_coefficient
       state_not: unavailable
   - color: teal
-    entity: sensor.metahome_thermal_efficiency_air_change_rate
+    entity: sensor.thermal_efficiency_air_change_rate
     icon: mdi:weather-windy
     name: Air Changes
     show_icon: true
@@ -23,10 +40,10 @@ views:
     show_state: true
     visibility:
     - condition: state
-      entity: sensor.metahome_thermal_efficiency_air_change_rate
+      entity: sensor.thermal_efficiency_air_change_rate
       state_not: unknown
     - condition: state
-      entity: sensor.metahome_thermal_efficiency_air_change_rate
+      entity: sensor.thermal_efficiency_air_change_rate
       state_not: unavailable
   - color: amber
     entity: sensor.thermal_efficiency_loft_ratio
@@ -35,34 +52,55 @@ views:
     show_icon: true
     show_name: true
     show_state: true
+    visibility:
+    - condition: state
+      entity: sensor.thermal_efficiency_loft_ratio
+      state_not: unknown
+    - condition: state
+      entity: sensor.thermal_efficiency_loft_ratio
+      state_not: unavailable
   - color: blue
-    entity: sensor.metahome_thermal_efficiency_electricity_baseload
+    entity: sensor.thermal_efficiency_electricity_baseload
     icon: mdi:power-plug-outline
     name: Baseload
     show_icon: true
     show_name: true
     show_state: true
+    visibility:
+    - condition: state
+      entity: sensor.thermal_efficiency_electricity_baseload
+      state_not: unknown
+    - condition: state
+      entity: sensor.thermal_efficiency_electricity_baseload
+      state_not: unavailable
   - color: deep-orange
-    entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+    entity: sensor.thermal_efficiency_space_heating_gas_7_day_average
     icon: mdi:radiator
     name: Space Heating
     show_icon: true
     show_name: true
     show_state: true
+    visibility:
+    - condition: state
+      entity: sensor.thermal_efficiency_space_heating_gas_7_day_average
+      state_not: unknown
+    - condition: state
+      entity: sensor.thermal_efficiency_space_heating_gas_7_day_average
+      state_not: unavailable
   - color: light-blue
-    entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+    entity: sensor.thermal_efficiency_hot_water_gas_7_day_average
     icon: mdi:shower-head
     name: Hot Water
     show_icon: true
     show_name: true
     show_state: true
-  - color: cyan
-    entity: sensor.thames_water_sensor
-    icon: mdi:water
-    name: Daily Water
-    show_icon: true
-    show_name: true
-    show_state: true
+    visibility:
+    - condition: state
+      entity: sensor.thermal_efficiency_hot_water_gas_7_day_average
+      state_not: unknown
+    - condition: state
+      entity: sensor.thermal_efficiency_hot_water_gas_7_day_average
+      state_not: unavailable
   dense_section_placement: true
   icon: mdi:home-thermometer
   max_columns: 3
@@ -73,6 +111,33 @@ views:
       heading_style: title
       icon: mdi:home-thermometer
       type: heading
+    - type: markdown
+      title: Data readiness and model scope
+      content: >-
+        {% set s = 'sensor.thermal_efficiency_data_readiness' %}
+        {% set summary = state_attr(s, 'summary') %}
+        {% set status = state_attr(s, 'hlc_status') %}
+        {% set reason = state_attr(s, 'hlc_reason') %}
+        {% set action = state_attr(s, 'hlc_next_action') %}
+        **Readiness:** {{ states(s) | replace('_', ' ') | title }} · **HLC:** {{ status | default('collecting', true) | replace('_', ' ') | title }}
+        {% if reason %} · **Reason:** {{ reason }}{% endif %}
+        {% if action and action != 'None' %} · **Next:** {{ action }}{% endif %}
+              {% if summary %} · {{ summary }}{% endif %}
+        {% set hlc = state_attr(s, 'metrics') or {} %}{% set fit = hlc.get('hlc', {}) %}
+        {% for metric, info in hlc.items() %}
+
+        **{{ metric | replace('_', ' ') | title }}:** {{ info.get('status', 'collecting') | replace('_', ' ') }}. {{ info.get('reason', '') }} {{ info.get('next_action', '') }}
+        {% if info.get('usable_observations') is not none %} Evidence: {{ info.get('usable_observations') }}/{{ info.get('required_observations', '—') }}.{% endif %}
+        {% if info.get('model_data_through') %} Model through {{ info.get('model_data_through') }}.{% endif %}
+        {% if info.get('source_lag_days') is not none %} Source lag: {{ info.get('source_lag_days') }} days.{% endif %}
+        {% endfor %}
+        {% if fit.get('usable_observations') is not none %} · HLC observations: **{{ fit.get('usable_observations') }}/{{ fit.get('required_observations', '—') }}** usable/required.{% endif %}
+        {% set through = state_attr('sensor.thermal_efficiency_heat_loss_coefficient', 'model_data_through') %}
+        {% set lag = state_attr('sensor.thermal_efficiency_heat_loss_coefficient', 'source_lag_days') %}
+        {% set model_status = state_attr('sensor.thermal_efficiency_heat_loss_coefficient', 'status') %}
+        {% if through %} · Model data through **{{ through }}**{% if lag is not none %} (source lag {{ lag }} days){% endif %}.{% endif %}
+        {% if model_status == 'historical_baseline_held' %} Historical heating baseline held from its latest qualifying cold-season day.{% endif %}
+        · Only complete local days are used; daylight-saving days may contain 23, 24 or 25 hours, and partial days are excluded.
     - type: conditional
       conditions:
       - condition: state
@@ -125,15 +190,15 @@ views:
     - type: conditional
       conditions:
       - condition: state
-        entity: sensor.metahome_thermal_efficiency_air_change_rate
+        entity: sensor.thermal_efficiency_air_change_rate
         state_not: unknown
       - condition: state
-        entity: sensor.metahome_thermal_efficiency_air_change_rate
+        entity: sensor.thermal_efficiency_air_change_rate
         state_not: unavailable
       card:
         type: gauge
-        entity: sensor.metahome_thermal_efficiency_air_change_rate
-        name: Air Infiltration
+        entity: sensor.thermal_efficiency_air_change_rate
+        name: "[EXPERIMENTAL] Air Infiltration"
         min: 0
         max: 1.5
         needle: true
@@ -154,15 +219,15 @@ views:
       - condition: or
         conditions:
         - condition: state
-          entity: sensor.metahome_thermal_efficiency_air_change_rate
+          entity: sensor.thermal_efficiency_air_change_rate
           state: unknown
         - condition: state
-          entity: sensor.metahome_thermal_efficiency_air_change_rate
+          entity: sensor.thermal_efficiency_air_change_rate
           state: unavailable
       card:
         type: tile
-        entity: sensor.metahome_thermal_efficiency_air_change_rate
-        name: Air Infiltration
+        entity: sensor.thermal_efficiency_air_change_rate
+        name: "[EXPERIMENTAL] Air Infiltration"
         icon: mdi:weather-windy
         color: teal
         vertical: true
@@ -172,15 +237,15 @@ views:
     - type: conditional
       conditions:
       - condition: state
-        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+        entity: sensor.thermal_efficiency_fabric_heat_loss
         state_not: unknown
       - condition: state
-        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+        entity: sensor.thermal_efficiency_fabric_heat_loss
         state_not: unavailable
       card:
         type: gauge
-        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
-        name: Fabric Loss
+        entity: sensor.thermal_efficiency_fabric_heat_loss
+        name: "[EXPERIMENTAL] Fabric Loss"
         min: 0
         max: 450
         needle: true
@@ -203,15 +268,15 @@ views:
       - condition: or
         conditions:
         - condition: state
-          entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+          entity: sensor.thermal_efficiency_fabric_heat_loss
           state: unknown
         - condition: state
-          entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+          entity: sensor.thermal_efficiency_fabric_heat_loss
           state: unavailable
       card:
         type: tile
-        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
-        name: Fabric Loss
+        entity: sensor.thermal_efficiency_fabric_heat_loss
+        name: "[EXPERIMENTAL] Fabric Loss"
         icon: mdi:wall
         color: deep-orange
         vertical: true
@@ -272,18 +337,18 @@ views:
         displayModeBar: false
         responsive: true
       entities:
-      - customdata: '$ex { const getRows = () => [["Office", "sensor.thermal_efficiency_office_time_constant"], ["Living room", "sensor.thermal_efficiency_living_room_time_constant"], ["Bedroom", "sensor.thermal_efficiency_bedroom_time_constant"], ["Kids room", "sensor.thermal_efficiency_kids_room_time_constant"], ["Bathroom", "sensor.thermal_efficiency_bathroom_time_constant"], ["Kitchen", "sensor.thermal_efficiency_kitchen_time_constant"]].map(([n, id]) => ({ name: n, value: Number(hass.states[id]?.state), nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0 })).filter(r => Number.isFinite(r.value)).sort((a, b) => b.value - a.value); return getRows().map(r => r.nights); }'
-        entity: sensor.thermal_efficiency_living_room_time_constant
+      - customdata: '$ex { const rawRooms = []; const getRows = () => rawRooms.map(([n, id]) => { const raw = hass.states[id]?.state; const isValid = raw !== undefined && raw !== null && String(raw).trim() !== "" && !["unknown", "unavailable", "none"].includes(String(raw).toLowerCase()); const nRaw = hass.states[id]?.attributes?.nights_fitted; const nValid = nRaw !== undefined && nRaw !== null && String(nRaw).trim() !== ""; return { name: n, value: isValid ? Number(raw) : NaN, nights: nValid ? (Number(nRaw) || 0) : 0 }; }).filter(r => Number.isFinite(r.value) && r.value > 0).sort((a, b) => b.value - a.value); return getRows().map(r => r.nights); }'
+        entity: sensor.thermal_efficiency_heat_loss_coefficient
         hovertemplate: '<b>%{y}</b><br>Cooling time: <b>%{x:.1f} h</b><br>Fitted: %{customdata} nights<extra></extra>'
         marker:
-          color: '$ex { const getRows = () => [["Office", "sensor.thermal_efficiency_office_time_constant"], ["Living room", "sensor.thermal_efficiency_living_room_time_constant"], ["Bedroom", "sensor.thermal_efficiency_bedroom_time_constant"], ["Kids room", "sensor.thermal_efficiency_kids_room_time_constant"], ["Bathroom", "sensor.thermal_efficiency_bathroom_time_constant"], ["Kitchen", "sensor.thermal_efficiency_kitchen_time_constant"]].map(([n, id]) => ({ name: n, value: Number(hass.states[id]?.state), nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0 })).filter(r => Number.isFinite(r.value)).sort((a, b) => b.value - a.value); return getRows().map((r, i) => ["#2e7d32", "#689f38", "#fbc02d", "#f57c00", "#e64a19", "#d32f2f"][i]); }'
+          color: '$ex { const rawRooms = []; const getRows = () => rawRooms.map(([n, id]) => { const raw = hass.states[id]?.state; const isValid = raw !== undefined && raw !== null && String(raw).trim() !== "" && !["unknown", "unavailable", "none"].includes(String(raw).toLowerCase()); return { name: n, value: isValid ? Number(raw) : NaN }; }).filter(r => Number.isFinite(r.value) && r.value > 0).sort((a, b) => b.value - a.value); return getRows().map((r, i) => ["#2e7d32", "#689f38", "#fbc02d", "#f57c00", "#e64a19", "#d32f2f"][i % 6]); }'
           opacity: 0.88
         orientation: h
         textposition: auto
         texttemplate: '%{x:.1f} h'
         type: bar
-        x: '$ex { const getRows = () => [["Office", "sensor.thermal_efficiency_office_time_constant"], ["Living room", "sensor.thermal_efficiency_living_room_time_constant"], ["Bedroom", "sensor.thermal_efficiency_bedroom_time_constant"], ["Kids room", "sensor.thermal_efficiency_kids_room_time_constant"], ["Bathroom", "sensor.thermal_efficiency_bathroom_time_constant"], ["Kitchen", "sensor.thermal_efficiency_kitchen_time_constant"]].map(([n, id]) => ({ name: n, value: Number(hass.states[id]?.state), nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0 })).filter(r => Number.isFinite(r.value)).sort((a, b) => b.value - a.value); return getRows().map(r => r.value); }'
-        y: '$ex { const getRows = () => [["Office", "sensor.thermal_efficiency_office_time_constant"], ["Living room", "sensor.thermal_efficiency_living_room_time_constant"], ["Bedroom", "sensor.thermal_efficiency_bedroom_time_constant"], ["Kids room", "sensor.thermal_efficiency_kids_room_time_constant"], ["Bathroom", "sensor.thermal_efficiency_bathroom_time_constant"], ["Kitchen", "sensor.thermal_efficiency_kitchen_time_constant"]].map(([n, id]) => ({ name: n, value: Number(hass.states[id]?.state), nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0 })).filter(r => Number.isFinite(r.value)).sort((a, b) => b.value - a.value); return getRows().map(r => r.name); }'
+        x: '$ex { const rawRooms = []; const getRows = () => rawRooms.map(([n, id]) => { const raw = hass.states[id]?.state; const isValid = raw !== undefined && raw !== null && String(raw).trim() !== "" && !["unknown", "unavailable", "none"].includes(String(raw).toLowerCase()); return { name: n, value: isValid ? Number(raw) : NaN }; }).filter(r => Number.isFinite(r.value) && r.value > 0).sort((a, b) => b.value - a.value); return getRows().map(r => r.value); }'
+        y: '$ex { const rawRooms = []; const getRows = () => rawRooms.map(([n, id]) => { const raw = hass.states[id]?.state; const isValid = raw !== undefined && raw !== null && String(raw).trim() !== "" && !["unknown", "unavailable", "none"].includes(String(raw).toLowerCase()); return { name: n, value: isValid ? Number(raw) : NaN }; }).filter(r => Number.isFinite(r.value) && r.value > 0).sort((a, b) => b.value - a.value); return getRows().map(r => r.name); }'
       layout:
         bargap: 0.28
         font:
@@ -336,7 +401,7 @@ views:
         colorize_states: true
         show: true
         show_states: true
-        title: Delivered HLC & Loss Split (365 Days)
+        title: Delivered HLC & [EXPERIMENTAL] Loss Split (365 Days)
       series:
       - color: '#7e57c2'
         entity: sensor.thermal_efficiency_heat_loss_coefficient
@@ -352,11 +417,11 @@ views:
           period: week
           align: middle
       - color: '#ef5350'
-        entity: sensor.metahome_thermal_efficiency_fabric_heat_loss
+        entity: sensor.thermal_efficiency_fabric_heat_loss
         group_by:
           duration: 7d
           func: avg
-        name: Fabric Loss
+        name: Fabric Loss (Experimental)
         stroke_width: 2.5
         type: line
         statistics:
@@ -364,11 +429,11 @@ views:
           period: week
           align: middle
       - color: '#42a5f5'
-        entity: sensor.metahome_thermal_efficiency_ventilation_heat_loss
+        entity: sensor.thermal_efficiency_ventilation_heat_loss
         group_by:
           duration: 7d
           func: avg
-        name: Ventilation Loss
+        name: Ventilation Loss (Experimental)
         stroke_width: 2
         type: line
         statistics:
@@ -386,7 +451,7 @@ views:
       icon: mdi:meter-gas
       type: heading
     - color: blue
-      entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+      entity: sensor.thermal_efficiency_hot_water_gas_7_day_average
       grid_options:
         columns: 6
         rows: 2
@@ -397,7 +462,7 @@ views:
       type: tile
       vertical: true
     - color: deep-orange
-      entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+      entity: sensor.thermal_efficiency_space_heating_gas_7_day_average
       grid_options:
         columns: 6
         rows: 2
@@ -427,7 +492,7 @@ views:
         title: Attributed Gas Use (90 Days)
       series:
       - color: '#42a5f5'
-        entity: sensor.metahome_thermal_efficiency_hot_water_gas_7_day_average
+        entity: sensor.thermal_efficiency_hot_water_gas_7_day_average
         group_by:
           duration: 1d
           func: avg
@@ -439,7 +504,7 @@ views:
           type: mean
           period: day
       - color: '#ef6c00'
-        entity: sensor.metahome_thermal_efficiency_space_heating_gas_7_day_average
+        entity: sensor.thermal_efficiency_space_heating_gas_7_day_average
         group_by:
           duration: 1d
           func: avg
@@ -455,17 +520,12 @@ views:
       type: custom:apexcharts-card
     type: grid
   - cards:
-    - badges:
-      - entity: sensor.smart_meter_electricity_power
-        name: Live Demand
-        show_state: true
-        type: entity
-      heading: Electricity & Baseload
+    - heading: Electricity & Baseload
       heading_style: title
       icon: mdi:transmission-tower-import
       type: heading
     - color: amber
-      entity: sensor.metahome_thermal_efficiency_electricity_use_7_day_average
+      entity: sensor.thermal_efficiency_electricity_use_7_day_average
       grid_options:
         columns: 6
         rows: 2
@@ -476,7 +536,7 @@ views:
       type: tile
       vertical: true
     - color: blue
-      entity: sensor.metahome_thermal_efficiency_electricity_baseload
+      entity: sensor.thermal_efficiency_electricity_baseload
       grid_options:
         columns: 6
         rows: 2
@@ -504,7 +564,7 @@ views:
         title: Electricity Consumption (90 Days)
       series:
       - color: '#f9a825'
-        entity: sensor.metahome_thermal_efficiency_electricity_use_7_day_average
+        entity: sensor.thermal_efficiency_electricity_use_7_day_average
         group_by:
           duration: 1d
           func: avg
@@ -524,21 +584,10 @@ views:
       heading_style: title
       icon: mdi:water
       type: heading
-    - color: cyan
-      entity: sensor.thames_water_sensor
-      grid_options:
-        columns: 6
-        rows: 2
-      icon: mdi:water
-      name: Thames Water (Daily)
-      tap_action:
-        action: more-info
-      type: tile
-      vertical: true
     - color: teal
-      entity: sensor.metahome_thermal_efficiency_total_water_use_7_day_average
+      entity: sensor.thermal_efficiency_total_water_use_7_day_average
       grid_options:
-        columns: 6
+        columns: 12
         rows: 2
       icon: mdi:water-outline
       name: Water Avg (7d)
@@ -564,7 +613,7 @@ views:
         title: Total Water Trend (90 Days)
       series:
       - color: '#00acc1'
-        entity: sensor.metahome_thermal_efficiency_total_water_use_7_day_average
+        entity: sensor.thermal_efficiency_total_water_use_7_day_average
         group_by:
           duration: 1d
           func: avg

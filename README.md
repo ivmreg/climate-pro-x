@@ -1,8 +1,8 @@
-# climate-pro-x — thermal efficiency analysis for a solid-brick flat
+# climate-pro-x — Home Assistant thermal reliability analysis
 
-Estimates how thermally efficient your home is from data you already have in
-Home Assistant: per-room thermometers, Tado TRVs + boiler control, an outdoor
-sensor, a loft sensor and a weather integration.
+Climate Pro X summarizes heat-loss, hot-water, electricity, water, room-cooling
+and CO₂ evidence from Home Assistant. Begin with the integration setup wizard;
+the separate Python CLI is optional for offline analysis and synthetic checks.
 
 ## What it measures
 
@@ -11,7 +11,7 @@ sensor, a loft sensor and a weather integration.
 | **Effective overnight cooling time constant τ (hours), per room** | How quickly a room cooled under the observed conditions. It combines fabric, draughts, thermal mass and heat exchange with adjacent rooms. | Temperatures; heating-power coverage strongly recommended |
 | **Delivered Heat Loss Coefficient HLC (W/K), whole home** | Estimated heat delivered to replace each watt lost per degree of indoor/outdoor difference, after DHW and boiler-efficiency correction. Its window and DHW training data are anchored to the latest qualifying heating day, so accumulating summer data cannot move the heating baseline. | Temperatures + real gas kWh; the offline Tado proxy is trend-only |
 | **Loft ratio** | Directional evidence about how closely loft temperature follows indoors versus outdoors; not an insulation payback calculation. | Loft + indoor + outdoor temperatures |
-| **Ventilation vs fabric split (W/K)** | An exploratory split based on a room-derived CO2 decay proxy. A single room is not assumed to be a direct whole-home ACH measurement. | CO2 sensor, floor area, ceiling height, and valid HLC |
+| **Ventilation vs fabric split (W/K)** | Experimental whole-home extrapolation from a room-derived CO₂ decay proxy. It is disabled by default and requires explicit opt-in. | CO₂ sensor, floor area, ceiling height, valid HLC, and experimental option enabled |
 | **Non-space-heating gas baseline (kWh/day, £/day, £/yr)** | Gas on heating-off days (measured heating power where available, dT proxy otherwise). It includes hot water and any gas cooking/pilot load, and is used to de-bias HLC. With a water meter, low-water (away) days are excluded and a per-litre daily rate models DHW on heating days from actual usage. | Gas meter and enough complete low-heating days; water meter sharpens it |
 | **Hot water vs space heating usage split (kWh/day, 7/30-day)** | Rolling attributed gas: on heating-off days all gas is hot water, on heating days the water-rate model supplies the DHW share. | Gas meter + DHW baseline; water meter recommended |
 | **Electricity baseload (W) and daily use** | Current always-on floor from the latest 30 days, plus a separate trackable 7-day consumption average, variable cost and implied internal heat gains — context only, never mixed into the gas fits. | Electricity meter statistics |
@@ -29,7 +29,21 @@ days out of 163 and widening the interval by ~1.5x versus treating days as
 independent). The `residual_autocorrelation` and `effective_independent_days`
 attributes report this directly.
 
-## Setup
+## Start in Home Assistant
+
+Install the integration, open **Settings → Devices & Services → Add
+Integration → Thermal Efficiency**, and use the wizard to select sources from
+your own entity registry. Start with verified temperature and cumulative gas
+sources; add optional electricity, water, CO₂, tariff and room sources only
+when their units and recorder history are known. The data-readiness sensor and
+dashboard report source status, observation counts, reasons and next actions.
+
+Whole-home ventilation/fabric loss is experimental, disabled by default, and
+requires enabling `experimental_whole_home_ventilation` in integration
+options. Room-derived ACH remains a proxy and does not establish a retrofit
+recommendation or payback.
+
+## Optional offline CLI setup
 
 1. In Home Assistant: your profile → **Security** → **Long-lived access
    tokens** → create one.
@@ -49,11 +63,12 @@ attributes report this directly.
 
    This prints every temperature/climate/weather entity it finds and writes a
    draft `config.yaml`. Edit it: map each room to its thermometer (and
-   optionally its Tado heating-power sensor), set the outdoor and loft
-   entities, and set `boiler_output_kw` (your Worcester Bosch's rated output —
-   check the model plate; typically 24–30 kW).
+   optionally a compatible heating-power sensor), set the outdoor and loft
+   entities, and use the appliance documentation for `boiler_output_kw` if
+   using that optional CLI estimate.
 
-5. Pull history into a local cache, then analyse:
+5. Pull history into a local cache, then analyse when using the separate
+   offline workflow:
 
    ```bash
    .venv/bin/python -m ha_efficiency pull --days 10
@@ -81,8 +96,7 @@ updates once a day (diffing it gives one big daily spike, not real hourly
 usage) and a separate *external statistic* (not a `sensor.*` entity — check
 Developer Tools → Statistics) with genuine backfilled hourly readings. Use
 the external statistic for `water_stat`; the CSV filename ends up with a
-colon in it (e.g. `thames_water:thameswater_consumption.csv`), which is
-expected. Similarly, a gas/electricity *tariff* sensor is usually
+colon in it, which is expected. Similarly, a gas/electricity *tariff* sensor is usually
 `state_class: total` but isn't a real meter, so its long-term "sum"
 statistics are meaningless noise (recorder computes a running delta as if it
 were a meter) — `gas_unit_rate_entity` is read from its **live** state, not
@@ -90,9 +104,8 @@ cached history, for both the offline `dhw` command and the live integration.
 
 ## Thermal Storyboard dashboard
 
-[`lovelace/thermal_efficiency_dashboard.yaml`](lovelace/thermal_efficiency_dashboard.yaml)
-combines the integration's three main visual stories using cards already
-installed on the development Home Assistant instance:
+The portable dashboards are generated from one editable mapping file,
+[`lovelace/dashboard_mapping.json`](lovelace/dashboard_mapping.json):
 
 - HLC evidence: fit status, R², heating days, confidence interval and the
   full-versus-recent estimate.
@@ -101,13 +114,12 @@ installed on the development Home Assistant instance:
 - Room thermal fingerprints: effective cooling time constants ranked from
   fastest to slowest cooling, with fit counts and observation windows.
 
-It requires `apexcharts-card` and `lovelace-plotly-graph-card`. Paste the YAML
-into a dashboard's raw configuration editor. The example entity IDs in
-[`lovelace/thermal_efficiency_dashboard.yaml`](lovelace/thermal_efficiency_dashboard.yaml) and
-[`lovelace/thermal_efficiency_live.yaml`](lovelace/thermal_efficiency_live.yaml) match the
-development instance where Home Assistant's entity registry mapped integration unique IDs to local
-entity IDs (e.g. `metahome_` prefixes); see [`lovelace/README.md`](lovelace/README.md) for how to
-map entities by unique ID before reuse. The evidence panel intentionally does not
+Run `python scripts/generate_dashboard.py` after mapping the required home
+metrics and any room sensors from your own entity registry. Optional live power
+and daily water cards are omitted unless mapped. The generator creates both
+dashboard YAML files; paste the one you want into Home Assistant's raw
+configuration editor. The generated YAML requires `apexcharts-card` and
+`lovelace-plotly-graph-card`. The evidence panel intentionally does not
 fabricate a regression scatter plot from summary attributes; daily points
 remain a future diagnostics-data enhancement.
 
@@ -249,9 +261,9 @@ and manually deleting owned statistics removes those live records.
   low-percentile indoor fallback when possible), plus
   `sensor.thermal_efficiency_ventilation_heat_loss` and
   `..._fabric_heat_loss` (W/K) splitting the delivered space-heating HLC
-  between draughts and fabric (needs `co2`, `floor_area_m2` and
-  `ceiling_height_m`) — the number that actually decides draught-proofing
-  vs wall/window insulation.
+  between modelled ventilation and fabric components (needs `co2`,
+  `floor_area_m2`, `ceiling_height_m` and explicit experimental opt-in). It
+  describes estimated components and does not select a retrofit.
 
 ### Install
 
@@ -290,57 +302,55 @@ older version of this repo that used YAML, the `thermal_efficiency:` block
 in `configuration.yaml` still works — it's automatically imported into a
 config entry on startup, exactly as if you'd used the wizard, and can be
 removed from `configuration.yaml` afterwards. For reference, the YAML shape
-matches `config.yaml` in this repo:
+matches the integration's legacy YAML import shape. Replace every `null` with
+a verified entity or leave optional sources unset:
 
 ```yaml
 thermal_efficiency:
-  gas_meter: sensor.smart_meter_gas_import
-  outdoor: sensor.sonoff_outdoor_sensor_temperature
-  floor_area_m2: 105
-  ceiling_height_m: 2.45
-  co2:
-    - sensor.bedroom_co2
-    - sensor.living_room_co2
-  outdoor_co2_sensor: sensor.garden_co2
+  gas_meter: null
+  outdoor: null
+  floor_area_m2: null
+  ceiling_height_m: null
+  co2: []
+  outdoor_co2_sensor: null
   # Used only when no valid outdoor sensor history is available:
   outdoor_co2_ppm: 420
   # An external statistic id (not a sensor.* entity - see the gotcha above),
   # e.g. from a water-utility integration with genuine hourly usage.
-  water: thames_water:thameswater_consumption
+  water: null
   # Heating-off days with less metered water than this are treated as away
   # days (excluded from the hot-water baseline and rate fit). Default 50.
   min_dhw_water_litres: 50
-  gas_unit_rate: sensor.smart_meter_gas_import_unit_rate
-  electricity_meter: sensor.smart_meter_electricity_import
-  electricity_unit_rate: sensor.smart_meter_electricity_import_unit_rate
+  gas_unit_rate: null
+  electricity_meter: null
+  electricity_unit_rate: null
   boiler_efficiency: 0.88
   rooms:
     loft:
       name: Loft
       room_type: loft
-      temperature: sensor.portable_sensor_temperature
-      humidity: sensor.portable_sensor_humidity
-      assignment_since: "2026-07-03"  # first dated visit; earlier readings stay unassigned
+      temperature: null
+      humidity: null
     living_room:
       name: Living room
       room_type: conditioned
-      temperature: sensor.living_room_vtrv_ema_temperature
-      heating_power: sensor.living_room_heating_power
+      temperature: null
+      heating_power: null
     bedroom:
-      temperature: sensor.bedroom_vtrv_ema_temperature
-      heating_power: sensor.bedroom_heating_power
+      temperature: null
+      heating_power: null
     kids_room:
-      temperature: sensor.kids_room_vtrv_ema_temperature
-      heating_power: sensor.kids_room_heating_power
+      temperature: null
+      heating_power: null
     kitchen:
-      temperature: sensor.kitchen_vtrv_ema_temperature
-      heating_power: sensor.kitchen_heating_power
+      temperature: null
+      heating_power: null
     bathroom:
-      temperature: sensor.bathroom_vtrv_ema_temperature
-      heating_power: sensor.bathroom_heating_power
+      temperature: null
+      heating_power: null
     office:
-      temperature: sensor.office_vtrv_ema_temperature
-      heating_power: sensor.office_heating_power
+      temperature: null
+      heating_power: null
 ```
 
 ### Version 0.7 migration notes

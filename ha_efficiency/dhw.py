@@ -170,6 +170,8 @@ def fit_dhw_water_rate(
     ).dropna()
     eligible = (
         df.index.isin(list(heating_off))
+        & (df.water > 0)
+        & np.isfinite(df.water)
         & (df.water >= min_water_l)
         & (df.q > 0)
     )
@@ -306,6 +308,7 @@ def corrected_hlc(
         water_limit,
     )
     df = pd.DataFrame({"q": q_daily, "dt": dt_daily, "dhw": attributed}).dropna()
+    df = df[~df.index.isin(list(heating_off))]
     df = df[(df.dt > 4) & (df.q > 0.5)]
     if df.empty:
         return None
@@ -315,7 +318,7 @@ def corrected_hlc(
         return None
     from . import hlc
 
-    fitted = hlc.fit_hlc(q_adjusted[valid], df.loc[valid, "dt"])
+    fitted = hlc.fit_hlc(q_adjusted[valid], df.loc[valid, "dt"], heating_off=heating_off)
     if "note" in fitted:
         return None
     fitted["baseline"] = baseline
@@ -328,6 +331,10 @@ def fit_water_gas(
     gas_kwh_hourly: pd.Series,
     water_l_hourly: pd.Series,
     boiler_efficiency: float = 0.88,
+    *,
+    heating_off: set | None = None,
+    since: pd.Timestamp | None = None,
+    until: pd.Timestamp | None = None,
 ) -> dict | None:
     """Informational only: hourly gas-vs-water regression, giving a rough
     Wh-per-litre rate and the implied hot fraction of metered water. Noisy
@@ -336,7 +343,26 @@ def fit_water_gas(
     df = pd.concat(
         [gas_kwh_hourly.rename("gas"), water_l_hourly.rename("water")], axis=1
     ).dropna()
-    if len(df) < DHW_REGRESSION_MIN_HOURS or df.water.nunique() < 10:
+    total_hours = len(df)
+    rejected_outside_window = 0
+    if since is not None:
+        mask = df.index >= since
+        rejected_outside_window += int((~mask).sum())
+        df = df[mask]
+    if until is not None:
+        mask = df.index <= until
+        rejected_outside_window += int((~mask).sum())
+        df = df[mask]
+
+    rejected_heating_on = 0
+    if heating_off is not None:
+        date_set = {d.date() if hasattr(d, "date") else d for d in heating_off}
+        is_off = df.index.map(lambda t: (t.date() if hasattr(t, "date") else t) in date_set)
+        rejected_heating_on = int((~is_off).sum())
+        df = df[is_off]
+
+    eligible_hours = len(df)
+    if eligible_hours < DHW_REGRESSION_MIN_HOURS or df.water.nunique() < 10:
         return None
     slope, intercept = np.polyfit(df.water, df.gas, 1)
     if slope <= 0:
@@ -348,13 +374,16 @@ def fit_water_gas(
     if r_squared < DHW_REGRESSION_MIN_R2:
         return None
     wh_per_litre = slope * 1000
+    hot_fraction_pct = wh_per_litre * boiler_efficiency / DHW_THEORETICAL_WH_PER_L * 100
+    if hot_fraction_pct < 0 or hot_fraction_pct > 100.0:
+        return None
     return {
         "wh_per_litre": wh_per_litre,
         "fuel_input_wh_per_litre": wh_per_litre,
-        "hot_fraction_pct": min(
-            100.0,
-            wh_per_litre * boiler_efficiency / DHW_THEORETICAL_WH_PER_L * 100,
-        ),
+        "hot_fraction_pct": hot_fraction_pct,
         "regression_r_squared": r_squared,
-        "regression_hours": len(df),
+        "regression_hours": eligible_hours,
+        "eligible_hours": eligible_hours,
+        "rejected_heating_on_hours": rejected_heating_on,
+        "rejected_outside_window_hours": rejected_outside_window,
     }

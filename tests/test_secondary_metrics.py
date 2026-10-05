@@ -232,6 +232,7 @@ def test_compute_all_separates_ach_from_inconsistent_loss_split(thermal_math):
         "floor_area_m2": 200.0,
         "ceiling_height_m": 3.0,
         "boiler_efficiency": 0.88,
+        "experimental_whole_home_ventilation": True,
     }
     tz = ZoneInfo("Europe/London")
     now = datetime(2026, 2, 15, tzinfo=timezone.utc)

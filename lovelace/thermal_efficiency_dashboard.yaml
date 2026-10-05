@@ -1,9 +1,8 @@
-# Thermal Storyboard dashboard using cards already installed on this instance:
+# Thermal Storyboard dashboard
+# Generated from portable mapping configuration.
+# Required custom cards:
 #   - apexcharts-card
 #   - lovelace-plotly-graph-card
-#
-# Install: create a dashboard, open its raw configuration editor, and paste
-# this whole file. No additional JavaScript resource is required.
 
 views:
   - title: Thermal efficiency
@@ -11,7 +10,7 @@ views:
     type: sections
     max_columns: 4
     sections:
-      # Evidence: headline quality and supporting history.
+      # Evidence: readiness and headline heat loss
       - type: grid
         column_span: 4
         cards:
@@ -19,6 +18,39 @@ views:
             heading: Can I trust the heat-loss number?
             heading_style: title
             icon: mdi:chart-scatter-plot
+
+          - type: markdown
+            title: System Data Readiness
+            grid_options:
+              columns: 12
+              rows: auto
+            content: >-
+              {% set s = 'sensor.thermal_efficiency_data_readiness' %}
+              {% set state = states(s) %}
+              {% set summary = state_attr(s, 'summary') %}
+              {% set hlc_status = state_attr(s, 'hlc_status') %}
+              {% set hlc_reason = state_attr(s, 'hlc_reason') %}
+              {% set hlc_action = state_attr(s, 'hlc_next_action') %}
+              {% set metrics = state_attr(s, 'metrics') or {} %}
+              {% set hlc_metrics = metrics.get('hlc', {}) %}
+
+              {% if states(s) in ['unknown', 'unavailable'] %}
+              **Readiness source unavailable.** Check integration setup and recorder access.
+              {% else %}
+              **Readiness State:** `{{ state | replace('_', ' ') | title }}`
+              {% if hlc_status %} · HLC: **{{ hlc_status | replace('_', ' ') | title }}**{% endif %}
+              {% if hlc_reason %} · **Reason:** {{ hlc_reason }}{% endif %}
+              {% if hlc_action and hlc_action != 'None' %} · **Next Action:** {{ hlc_action }}{% endif %}
+              {% if summary %} · {{ summary }}{% endif %}
+              {% if hlc_metrics.get('usable_observations') is not none %} · HLC evidence: **{{ hlc_metrics.get('usable_observations') }}/{{ hlc_metrics.get('required_observations', '—') }}** usable/required observations.{% endif %}
+              {% for metric, info in metrics.items() %}
+
+              **{{ metric | replace('_', ' ') | title }}:** {{ info.get('status', 'collecting') | replace('_', ' ') }}. {{ info.get('reason', '') }} {{ info.get('next_action', '') }}
+              {% if info.get('usable_observations') is not none %} Evidence: {{ info.get('usable_observations') }}/{{ info.get('required_observations', '—') }}.{% endif %}
+              {% if info.get('model_data_through') %} Model through {{ info.get('model_data_through') }}.{% endif %}
+              {% if info.get('source_lag_days') is not none %} Source lag: {{ info.get('source_lag_days') }} days.{% endif %}
+              {% endfor %}
+              {% endif %}
 
           - type: markdown
             title: Delivered heat loss
@@ -37,24 +69,30 @@ views:
               {% set recent_window = state_attr(s, 'recent_window_days') | int(0) %}
               {% set intercept = state_attr(s, 'regression_intercept_kwh_per_day') | float(0) %}
               {% set effective = state_attr(s, 'effective_independent_days') | int(0) %}
+              {% set model_through = state_attr(s, 'model_data_through') %}
+              {% set lag = state_attr(s, 'source_lag_days') %}
               {% set change = ((recent - value) / value * 100) if value and recent else none %}
               {% set note = state_attr(s, 'note') %}
 
               {% if states(s) in ['unknown', 'unavailable'] or not days %}
               # Not yet available
 
-              {% if status and status != 'unknown' %}**{{ status | title }}** · {% endif %}{{ note or 'Heating season data required.' }}
+              {% if status and status != 'unknown' %}**Status: {{ status | replace('_', ' ') | title }}** · {% endif %}{{ note or 'Heating season data required.' }}
               {% else %}
               # {{ value | round(0) }} W/K
 
-              **{{ (status or 'Provisional') | title }}** · {{ days }} heating days · R² {{ r2 | round(3) }}
+              **{{ (status or 'Provisional') | replace('_', ' ') | title }}** · {{ days }} heating days · R² {{ r2 | round(3) }}
+              {% if model_through %} · Data through: **{{ model_through }}**{% if lag is not none %} (lag: {{ lag }}d){% endif %}{% endif %}
+              {% if status == 'historical_baseline_held' %} · *Heating model held from latest qualifying cold season*{% endif %}
+
+              *Scope:* {{ state_attr(s, 'window_days') or days }} complete local heating days (23, 24 or 25 hours on daylight-saving transitions); partial days are excluded. This model remains anchored to its latest qualifying heating day.
 
               Approximate 95% interval: **{{ low | round(0) }}–{{ high | round(0) }} W/K**
-              {% if effective %}(consecutive days share weather, so these {{ days }} days carry about {{ effective }} days of independent evidence){% endif %}
+              {% if effective %}(consecutive days share weather; {{ days }} days carry about {{ effective }} days of independent evidence){% endif %}
 
               {% if recent %}
               Recent {{ recent_window }}-day estimate: **{{ recent | round(0) }} W/K**
-              {% if change is not none %}({{ '%+.0f' | format(change) }}% versus the full window){% endif %}
+              {% if change is not none %}({{ '%+.0f' | format(change) }}% versus full window){% endif %}
               {% endif %}
 
               Regression intercept: **{{ intercept | round(1) }} kWh/day**.
@@ -103,7 +141,7 @@ views:
                   period: week
                   align: middle
 
-      # Diagnosis: a unit-consistent W/K Sankey and separate DHW context.
+      # Diagnosis: Sankey loss split and DHW baseline
       - type: grid
         column_span: 4
         cards:
@@ -113,7 +151,14 @@ views:
             icon: mdi:chart-sankey-variant
 
           - type: custom:plotly-graph
-            title: Delivered space-heating loss (W/K)
+            title: "[EXPERIMENTAL] Delivered space-heating loss (W/K)"
+            visibility:
+              - condition: numeric_state
+                entity: sensor.thermal_efficiency_fabric_heat_loss
+                above: 0
+              - condition: numeric_state
+                entity: sensor.thermal_efficiency_ventilation_heat_loss
+                above: 0
             grid_options:
               columns: 8
               rows: 5
@@ -156,20 +201,30 @@ views:
                     - 2
                   value: >-
                     $ex {
-                      const f = Number(hass.states['sensor.metahome_thermal_efficiency_fabric_heat_loss']?.state) || 0;
-                      const v = Number(hass.states['sensor.metahome_thermal_efficiency_ventilation_heat_loss']?.state) || 0;
-                      return (f > 0 || v > 0) ? [f, v] : [0.001, 0.001];
+                      const parseNum = (v) => {
+                        const raw = hass.states[v]?.state;
+                        return (raw !== undefined && raw !== null && String(raw).trim() !== '' && !['unknown', 'unavailable', 'none'].includes(String(raw).toLowerCase())) ? Number(raw) : NaN;
+                      };
+                      const f = parseNum('sensor.thermal_efficiency_fabric_heat_loss');
+                      const v = parseNum('sensor.thermal_efficiency_ventilation_heat_loss');
+                      const fVal = Number.isFinite(f) && f > 0 ? f : 0;
+                      const vVal = Number.isFinite(v) && v > 0 ? v : 0;
+                      return (fVal > 0 && vVal > 0) ? [fVal, vVal] : [];
                     }
                   color:
                     - rgba(239,108,0,0.58)
                     - rgba(30,136,229,0.58)
                   customdata: >-
                     $ex {
-                      const f = Number(hass.states['sensor.metahome_thermal_efficiency_fabric_heat_loss']?.state);
-                      const v = Number(hass.states['sensor.metahome_thermal_efficiency_ventilation_heat_loss']?.state);
+                      const parseNum = (v) => {
+                        const raw = hass.states[v]?.state;
+                        return (raw !== undefined && raw !== null && String(raw).trim() !== '' && !['unknown', 'unavailable', 'none'].includes(String(raw).toLowerCase())) ? Number(raw) : NaN;
+                      };
+                      const f = parseNum('sensor.thermal_efficiency_fabric_heat_loss');
+                      const v = parseNum('sensor.thermal_efficiency_ventilation_heat_loss');
                       return [
-                        Number.isFinite(f) ? `${f.toFixed(1)} W/K` : 'Not yet fitted',
-                        Number.isFinite(v) ? `${v.toFixed(1)} W/K` : 'Not yet fitted'
+                        Number.isFinite(f) && f > 0 ? `${f.toFixed(1)} W/K` : 'Not enabled / insufficient data',
+                        Number.isFinite(v) && v > 0 ? `${v.toFixed(1)} W/K` : 'Not enabled / insufficient data'
                       ];
                     }
                   hovertemplate: "%{target.label}: %{customdata}<extra></extra>"
@@ -194,8 +249,8 @@ views:
               rows: 5
             cards:
               - type: tile
-                entity: sensor.metahome_thermal_efficiency_air_change_rate
-                name: Room-derived ACH proxy
+                entity: sensor.thermal_efficiency_air_change_rate
+                name: "[EXPERIMENTAL] Air Infiltration"
                 icon: mdi:weather-windy
                 color: blue
                 vertical: false
@@ -204,7 +259,7 @@ views:
               - type: markdown
                 title: Ventilation evidence
                 content: >-
-                  {% set s = 'sensor.metahome_thermal_efficiency_air_change_rate' %}
+                  {% set s = 'sensor.thermal_efficiency_air_change_rate' %}
                   {% set note = state_attr(s, 'note') %}
                   {% set co2_sensors = state_attr(s, 'co2_sensors_used') %}
                   {% set decay_windows = state_attr(s, 'decay_windows_used') %}
@@ -224,12 +279,12 @@ views:
                   {% if source %}({{ source }}).{% endif %}
                   {% endif %}
 
-                  This is a room-derived proxy, not a compliance ventilation measurement.
+                  *Scope & experimental limits:* Room-derived ACH proxy. Whole-home loss split is experimental and requires `experimental_whole_home_ventilation: true` in integration options.
 
               - type: markdown
                 title: Non-space-heating gas
                 content: >-
-                  {% set s = 'sensor.metahome_thermal_efficiency_hot_water_gas' %}
+                  {% set s = 'sensor.thermal_efficiency_hot_water_gas' %}
                   {% if states(s) in ['unknown', 'unavailable'] %}
                   # Not yet available
 
@@ -245,7 +300,7 @@ views:
                   Kept separate from the Sankey because this is energy per day,
                   while the space-heating branches are W/K.
 
-      # Action: room ranking with fit evidence in hover text.
+      # Action: room ranking with fit evidence
       - type: grid
         column_span: 4
         cards:
@@ -262,75 +317,72 @@ views:
             raw_plotly_config: true
             refresh_interval: auto
             entities:
-              - entity: sensor.thermal_efficiency_living_room_time_constant
+              - entity: sensor.thermal_efficiency_heat_loss_coefficient
                 type: bar
                 orientation: h
                 x: >-
                   $ex {
-                    const getRows = () => [
-                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
-                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
-                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
-                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
-                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
-                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
-                    ].map(([name, id]) => ({
-                      name,
-                      value: Number(hass.states[id]?.state),
-                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
-                    })).filter(room => Number.isFinite(room.value))
+                    const rawRooms = [];
+                    const getRows = () => rawRooms.map(([name, id]) => {
+                      const raw = hass.states[id]?.state;
+                      const isValid = raw !== undefined && raw !== null && String(raw).trim() !== '' && !['unknown', 'unavailable', 'none'].includes(String(raw).toLowerCase());
+                      const nightsRaw = hass.states[id]?.attributes?.nights_fitted;
+                      const nightsValid = nightsRaw !== undefined && nightsRaw !== null && String(nightsRaw).trim() !== '';
+                      return {
+                        name,
+                        value: isValid ? Number(raw) : NaN,
+                        nights: nightsValid ? (Number(nightsRaw) || 0) : 0
+                      };
+                    }).filter(room => Number.isFinite(room.value) && room.value > 0)
                        .sort((a, b) => b.value - a.value);
                     return getRows().map(room => room.value);
                   }
                 "y": >-
                   $ex {
-                    const getRows = () => [
-                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
-                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
-                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
-                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
-                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
-                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
-                    ].map(([name, id]) => ({
-                      name,
-                      value: Number(hass.states[id]?.state),
-                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
-                    })).filter(room => Number.isFinite(room.value))
+                    const rawRooms = [];
+                    const getRows = () => rawRooms.map(([name, id]) => {
+                      const raw = hass.states[id]?.state;
+                      const isValid = raw !== undefined && raw !== null && String(raw).trim() !== '' && !['unknown', 'unavailable', 'none'].includes(String(raw).toLowerCase());
+                      const nightsRaw = hass.states[id]?.attributes?.nights_fitted;
+                      const nightsValid = nightsRaw !== undefined && nightsRaw !== null && String(nightsRaw).trim() !== '';
+                      return {
+                        name,
+                        value: isValid ? Number(raw) : NaN,
+                        nights: nightsValid ? (Number(nightsRaw) || 0) : 0
+                      };
+                    }).filter(room => Number.isFinite(room.value) && room.value > 0)
                        .sort((a, b) => b.value - a.value);
                     return getRows().map(room => room.name);
                   }
                 customdata: >-
                   $ex {
-                    const getRows = () => [
-                      ['Office', 'sensor.thermal_efficiency_office_time_constant'],
-                      ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
-                      ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
-                      ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
-                      ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
-                      ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
-                    ].map(([name, id]) => ({
-                      name,
-                      value: Number(hass.states[id]?.state),
-                      nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
-                    })).filter(room => Number.isFinite(room.value))
+                    const rawRooms = [];
+                    const getRows = () => rawRooms.map(([name, id]) => {
+                      const raw = hass.states[id]?.state;
+                      const isValid = raw !== undefined && raw !== null && String(raw).trim() !== '' && !['unknown', 'unavailable', 'none'].includes(String(raw).toLowerCase());
+                      const nightsRaw = hass.states[id]?.attributes?.nights_fitted;
+                      const nightsValid = nightsRaw !== undefined && nightsRaw !== null && String(nightsRaw).trim() !== '';
+                      return {
+                        name,
+                        value: isValid ? Number(raw) : NaN,
+                        nights: nightsValid ? (Number(nightsRaw) || 0) : 0
+                      };
+                    }).filter(room => Number.isFinite(room.value) && room.value > 0)
                        .sort((a, b) => b.value - a.value);
                     return getRows().map(room => room.nights);
                   }
                 marker:
                   color: >-
                     $ex {
-                      const getRows = () => [
-                        ['Office', 'sensor.thermal_efficiency_office_time_constant'],
-                        ['Living room', 'sensor.thermal_efficiency_living_room_time_constant'],
-                        ['Bedroom', 'sensor.thermal_efficiency_bedroom_time_constant'],
-                        ['Kids room', 'sensor.thermal_efficiency_kids_room_time_constant'],
-                        ['Bathroom', 'sensor.thermal_efficiency_bathroom_time_constant'],
-                        ['Kitchen', 'sensor.thermal_efficiency_kitchen_time_constant']
-                      ].map(([name, id]) => ({
-                        name,
-                        value: Number(hass.states[id]?.state),
-                        nights: Number(hass.states[id]?.attributes?.nights_fitted) || 0
-                      })).filter(room => Number.isFinite(room.value))
+                      const rawRooms = [];
+                      const getRows = () => rawRooms.map(([name, id]) => {
+                        const raw = hass.states[id]?.state;
+                        const isValid = raw !== undefined && raw !== null && String(raw).trim() !== '' && !['unknown', 'unavailable', 'none'].includes(String(raw).toLowerCase());
+                        return {
+                          name,
+                          value: isValid ? Number(raw) : NaN
+                        };
+                      }).filter(room => Number.isFinite(room.value) && room.value > 0)
                          .sort((a, b) => b.value - a.value);
                       return getRows().map((room, index) =>
                         ['#2e7d32', '#7cb342', '#f9a825', '#ef6c00', '#d84315', '#c62828'][index % 6]
@@ -367,36 +419,5 @@ views:
               columns: 12
               rows: 3
             content: >-
-              {% set hlc = states('sensor.thermal_efficiency_heat_loss_coefficient') | float(0) %}
-              {% set fabric = states('sensor.metahome_thermal_efficiency_fabric_heat_loss') | float(0) %}
-              {% set vent = states('sensor.metahome_thermal_efficiency_ventilation_heat_loss') | float(0) %}
-              {% set co2_count = state_attr('sensor.metahome_thermal_efficiency_air_change_rate', 'co2_sensors_used') | int(0) %}
-              {% set status = state_attr('sensor.thermal_efficiency_heat_loss_coefficient', 'status') %}
-              {% set valid_rooms = [
-                ('Office', states('sensor.thermal_efficiency_office_time_constant') | float(0)),
-                ('Living room', states('sensor.thermal_efficiency_living_room_time_constant') | float(0)),
-                ('Bedroom', states('sensor.thermal_efficiency_bedroom_time_constant') | float(0)),
-                ('Kids room', states('sensor.thermal_efficiency_kids_room_time_constant') | float(0)),
-                ('Bathroom', states('sensor.thermal_efficiency_bathroom_time_constant') | float(0)),
-                ('Kitchen', states('sensor.thermal_efficiency_kitchen_time_constant') | float(0))
-              ] | selectattr(1, 'gt', 0) | sort(attribute=1) | list %}
-
-              {% if fabric and vent and fabric > vent * 2 %}
-              **The strongest signal is fabric loss**, not ventilation.
-              {% if valid_rooms | length >= 2 %}
-              Start investigation with **{{ valid_rooms[0][0] }}** and **{{ valid_rooms[1][0] }}**, the fastest-cooling rooms in the current fits.
-              {% elif valid_rooms | length == 1 %}
-              Start investigation with **{{ valid_rooms[0][0] }}**, the fastest-cooling room in the current fits.
-              {% endif %}
-              Check glazing seals, penetrations, external walls, and sensor placement before drawing retrofit conclusions.
-              {% elif fabric and vent %}
-              Ventilation is a material part of the observed loss. Investigate controlled
-              ventilation and draught paths alongside room fabric.
-              {% else %}
-              A physically consistent fabric/ventilation split is not currently available.
-              {% endif %}
-
-              Evidence status: **{{ status | default('not available', true) }}**{% if co2_count %}; ventilation uses
-              {{ co2_count }} room-derived CO₂ proxies{% endif %}. Effective τ combines
-              fabric, draughts, thermal mass, and heat exchange with adjacent rooms—it does
-              not identify a defect by itself.
+              **No conditioned rooms configured.**
+              Add at least one conditioned room in `dashboard_mapping.json` to enable room cooling time constant (τ) analysis.

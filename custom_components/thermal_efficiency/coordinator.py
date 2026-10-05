@@ -13,6 +13,7 @@ from homeassistant.const import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
@@ -24,10 +25,12 @@ from .const import (
     CONF_CO2,
     CONF_ELECTRICITY_METER,
     CONF_ELECTRICITY_UNIT_RATE,
+    CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION,
     CONF_FLOOR_AREA,
     CONF_GAS_METER,
     CONF_GAS_UNIT_RATE,
     CONF_HEATING_POWER,
+    CONF_HUMIDITY,
     CONF_LOFT,
     CONF_LOFT_HUMIDITY,
     CONF_LOFT_SINCE,
@@ -44,7 +47,11 @@ from .const import (
     HLC_STATISTICS_LOOKBACK_MULTIPLIER,
     UPDATE_INTERVAL_HOURS,
 )
-from .validation import heating_power_issue
+from .validation import (
+    async_fetch_recorder_metadata,
+    heating_power_issue,
+    validate_source_metadata_and_state,
+)
 from .history import RoomHistoryManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -114,9 +121,10 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             return None
         try:
             value = float(state.state)
-        except ValueError:
+        except (ValueError, TypeError):
             return None
-        if value < 0:
+        from math import isfinite
+        if not isfinite(value) or value < 0.0:
             return None
 
         unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
@@ -151,6 +159,145 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             + (max_days,)
         )
         now = dt_util.utcnow()
+        all_statistic_ids = self._statistic_ids()
+
+        metadata = await async_fetch_recorder_metadata(self.hass, all_statistic_ids)
+        source_issues: dict[str, str] = {}
+        source_health: dict[str, str] = {}
+        unsuitable_ids: set[str] = set()
+        room_source_issues: dict[str, dict[str, str]] = {}
+        invalid_heating_power: dict[str, str] = {}
+        source_roles: dict[str, list[tuple[str, str | None]]] = {}
+
+        def register(source_id: str | None, role: str, room_id: str | None = None) -> None:
+            if source_id:
+                source_roles.setdefault(source_id, []).append((role, room_id))
+
+        register(self.conf.get(CONF_OUTDOOR), "outdoor")
+        register(self.conf.get(CONF_GAS_METER), "gas_meter")
+        register(self.conf.get(CONF_ELECTRICITY_METER), "electricity_meter")
+        register(self.conf.get(CONF_WATER), "water")
+        register(self.conf.get(CONF_OUTDOOR_CO2_SENSOR), "outdoor_co2_sensor")
+        for source_id in (
+            self.conf.get(CONF_CO2)
+            if isinstance(self.conf.get(CONF_CO2), list)
+            else [self.conf.get(CONF_CO2)]
+        ):
+            register(source_id, "co2")
+        for room_id, room in self.conf.get(CONF_ROOMS, {}).items():
+            register(room.get(CONF_TEMPERATURE), "temperature", room_id)
+            register(room.get(CONF_HEATING_POWER), "heating_power", room_id)
+            register(room.get(CONF_HUMIDITY), "humidity", room_id)
+        register(self.conf.get(CONF_LOFT), "loft_temperature")
+        register(self.conf.get(CONF_LOFT_HUMIDITY), "loft_humidity")
+
+        global_issue_role = {
+            "outdoor": "outdoor",
+            "gas_meter": "gas_meter",
+            "electricity_meter": "electricity_meter",
+            "water": "water",
+            "outdoor_co2_sensor": "outdoor_co2_sensor",
+            "loft_temperature": "loft",
+            "loft_humidity": "loft_humidity",
+        }
+        for source_id, refs in source_roles.items():
+            for role_key, room_id in refs:
+                role = "temperature" if role_key == "loft_temperature" else role_key
+                status_role = role_key
+                if room_id and self.conf.get(CONF_ROOMS, {}).get(room_id, {}).get("room_type") == "loft":
+                    status_role = "loft_humidity" if role == "humidity" else "loft_temperature"
+                if metadata is None:
+                    error_key = "recorder_unavailable"
+                    issue = "Recorder metadata could not be read; retry after recorder access is restored"
+                else:
+                    error_key, issue = validate_source_metadata_and_state(
+                        self.hass, source_id, role, metadata.get(source_id)
+                    )
+                if not issue:
+                    health_key = status_role if status_role in global_issue_role else role
+                    source_health[health_key] = (
+                        "valid" if metadata is not None and metadata.get(source_id) else "pending"
+                    )
+                    if room_id:
+                        source_health[f"room:{room_id}:{role}"] = source_health[health_key]
+                    continue
+                source_issues[source_id] = issue
+                if status_role in global_issue_role:
+                    source_issues.setdefault(global_issue_role[status_role], issue)
+                    source_health[global_issue_role[status_role]] = "source_problem"
+                elif role == "co2":
+                    source_issues.setdefault(source_id, issue)
+                if room_id:
+                    room_source_issues.setdefault(room_id, {})[role] = issue
+                    source_health[f"room:{room_id}:{role}"] = "source_problem"
+                if role == "heating_power":
+                    invalid_heating_power[source_id] = issue
+                # Unsupported or unverifiable sources are removed before the
+                # recorder converter sees the complete statistics request.
+                unsuitable_ids.add(source_id)
+
+        valid_co2 = [
+            source_id for source_id in (
+                self.conf.get(CONF_CO2)
+                if isinstance(self.conf.get(CONF_CO2), list)
+                else [self.conf.get(CONF_CO2)]
+            ) if source_id and source_id not in unsuitable_ids
+        ]
+        configured_co2 = self.conf.get(CONF_CO2)
+        configured_co2 = configured_co2 if isinstance(configured_co2, list) else [configured_co2]
+        if any(configured_co2) and not valid_co2:
+            bad_co2 = next((source_issues.get(source_id) for source_id in configured_co2 if source_issues.get(source_id)), None)
+            if bad_co2:
+                source_issues["co2"] = bad_co2
+                source_health["co2"] = "source_problem"
+
+        # Tariffs use live state, not recorder statistics.
+        gas_rate_id = self.conf.get(CONF_GAS_UNIT_RATE)
+        if gas_rate_id:
+            _, issue = validate_source_metadata_and_state(
+                self.hass, gas_rate_id, "gas_unit_rate"
+            )
+            if issue:
+                source_issues["gas_unit_rate"] = issue
+                source_health["gas_unit_rate"] = "source_problem"
+            else:
+                source_health["gas_unit_rate"] = "valid"
+
+        elec_rate_id = self.conf.get(CONF_ELECTRICITY_UNIT_RATE)
+        if elec_rate_id:
+            _, issue = validate_source_metadata_and_state(
+                self.hass, elec_rate_id, "electricity_unit_rate"
+            )
+            if issue:
+                source_issues["electricity_unit_rate"] = issue
+                source_health["electricity_unit_rate"] = "source_problem"
+            else:
+                source_health["electricity_unit_rate"] = "valid"
+
+        # Issue Repairs for user-fixable source problems
+        entry_id = self.config_entry.entry_id if self.config_entry else "default"
+        for role in ("gas_meter", "water", "electricity_meter", "gas_unit_rate", "electricity_unit_rate"):
+            issue_id = f"source_issue_{entry_id}_{role}"
+            if role in source_issues:
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    issue_id,
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING,
+                    translation_key="incompatible_source",
+                    translation_placeholders={
+                        "source": role.replace("_", " "),
+                        "issue": source_issues[role],
+                    },
+                )
+            else:
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+
+        # Query only sources that passed role-specific validation. This protects
+        # the shared recorder converter from one malformed optional source.
+        valid_statistic_ids = all_statistic_ids - unsuitable_ids
+
         stats = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
@@ -158,7 +305,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             # that day remains inside the configured lookback.
             now - timedelta(days=max_days * HLC_STATISTICS_LOOKBACK_MULTIPLIER),
             now,
-            self._statistic_ids(),
+            valid_statistic_ids,
             "hour",
             {
                 "energy": UnitOfEnergy.KILO_WATT_HOUR,
@@ -171,7 +318,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         # statistics, so it must not run on the event loop. Tariffs are read
         computation_stats = stats
         if self.history:
-            computation_stats, prepared = self.history.prepare(
+            computation_stats, prepared = await self.history.async_prepare(
                 stats, self.conf, dt_util.get_default_time_zone()
             )
             room_conf = prepared[CONF_ROOMS]
@@ -179,29 +326,35 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             prepared = analysis_configuration(self.conf)
             room_conf = prepared[CONF_ROOMS]
 
-        invalid_heating_power: dict[str, str] = {}
-        for room in ([] if self.history else room_conf.values()):
-            entity_id = room.get(CONF_HEATING_POWER)
-            if not entity_id:
-                continue
-            issue = heating_power_issue(
-                self.hass,
-                entity_id,
-                allow_missing=True,
+        # history.prepare composes archived and synthetic aliases after the
+        # recorder query. Remove aliases for invalid sources again here so an
+        # old stream cannot reintroduce a rejected source into the model.
+        for room_id, role_issues in room_source_issues.items():
+            spec = room_conf.get(room_id, {})
+            for role, issue in role_issues.items():
+                alias = spec.get(role)
+                if alias:
+                    computation_stats.pop(alias, None)
+                if role == "heating_power":
+                    if alias:
+                        invalid_heating_power[alias] = issue
+        if "loft" in source_issues:
+            computation_stats.pop(prepared.get(CONF_LOFT, self.conf.get(CONF_LOFT)), None)
+        if "loft_humidity" in source_issues:
+            computation_stats.pop(
+                prepared.get(CONF_LOFT_HUMIDITY, self.conf.get(CONF_LOFT_HUMIDITY)),
+                None,
             )
-            if issue:
-                invalid_heating_power[entity_id] = issue
-                _LOGGER.warning(
-                    "Ignoring invalid heating-power source %s: %s",
-                    entity_id,
-                    issue,
-                )
+
+        for entity_id in list(invalid_heating_power):
+            issue = invalid_heating_power[entity_id]
+            _LOGGER.warning("Ignoring invalid heating-power source: %s", issue)
         conf = {
             "rooms": room_conf,
             "excluded_model_days": prepared.get("excluded_model_days", []),
             "outdoor": self.conf[CONF_OUTDOOR],
-            "gas_meter": self.conf.get(CONF_GAS_METER),
-            "loft": prepared.get(CONF_LOFT, self.conf.get(CONF_LOFT)),
+            "gas_meter": self.conf.get(CONF_GAS_METER) if "gas_meter" not in source_issues else None,
+            "loft": prepared.get(CONF_LOFT, self.conf.get(CONF_LOFT)) if "loft" not in source_issues else None,
             "loft_since": (
                 prepared.get(CONF_LOFT_SINCE)
                 if CONF_LOFT_SINCE in prepared
@@ -211,23 +364,28 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             ),
             "loft_humidity": prepared.get(
                 CONF_LOFT_HUMIDITY, self.conf.get(CONF_LOFT_HUMIDITY)
-            ),
+            ) if "loft_humidity" not in source_issues else None,
             "floor_area_m2": self.conf.get(CONF_FLOOR_AREA),
-            "co2": self.conf.get(CONF_CO2),
+            "co2": valid_co2 if valid_co2 else None,
             "outdoor_co2_ppm": self.conf.get(CONF_OUTDOOR_CO2),
-            "outdoor_co2_sensor": self.conf.get(CONF_OUTDOOR_CO2_SENSOR),
+            "outdoor_co2_sensor": self.conf.get(CONF_OUTDOOR_CO2_SENSOR) if "outdoor_co2_sensor" not in source_issues else None,
             "ceiling_height_m": self.conf.get(CONF_CEILING_HEIGHT),
-            "water": self.conf.get(CONF_WATER),
+            "water": self.conf.get(CONF_WATER) if "water" not in source_issues else None,
             "min_dhw_water_litres": self.conf.get(CONF_MIN_DHW_WATER_L),
-            "gas_unit_rate": self._unit_rate(CONF_GAS_UNIT_RATE, "Gas"),
+            "gas_unit_rate": self._unit_rate(CONF_GAS_UNIT_RATE, "Gas") if "gas_unit_rate" not in source_issues else None,
             "boiler_efficiency": self.conf.get(CONF_BOILER_EFFICIENCY),
-            "electricity_meter": self.conf.get(CONF_ELECTRICITY_METER),
+            "electricity_meter": self.conf.get(CONF_ELECTRICITY_METER) if "electricity_meter" not in source_issues else None,
             "electricity_unit_rate": self._unit_rate(
                 CONF_ELECTRICITY_UNIT_RATE, "Electricity"
+            ) if "electricity_unit_rate" not in source_issues else None,
+            "experimental_whole_home_ventilation": self.conf.get(
+                CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION, False
             ),
             "invalid_heating_power_entities": invalid_heating_power,
+            "room_source_issues": room_source_issues,
+            "source_issues": source_issues,
         }
-        return await self.hass.async_add_executor_job(
+        result = await self.hass.async_add_executor_job(
             thermal_math.compute_all,
             computation_stats,
             conf,
@@ -235,3 +393,8 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             now,
             windows,
         )
+
+        result["source_issues"] = source_issues
+        result["source_health"] = source_health
+
+        return result

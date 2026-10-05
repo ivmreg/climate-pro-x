@@ -79,9 +79,7 @@ def test_compute_all_full_year_multi_sensor_pipeline(thermal_math):
         stats["sensor.electricity"].append(_row(timestamp, "sum", electricity_total))
 
     now = datetime.fromtimestamp(int(start.timestamp()) + (hours - 1) * 3600, tz)
-    result = thermal_math.compute_all(
-        stats,
-        {
+    conf = {
             "rooms": {
                 "room": {
                     "temperature": "sensor.room",
@@ -102,7 +100,11 @@ def test_compute_all_full_year_multi_sensor_pipeline(thermal_math):
             "boiler_efficiency": 0.9,
             "electricity_meter": "sensor.electricity",
             "electricity_unit_rate": 0.18,
-        },
+            "experimental_whole_home_ventilation": True,
+        }
+    result = thermal_math.compute_all(
+        stats,
+        conf,
         tz,
         now,
         (60, 120, 365),
@@ -143,6 +145,19 @@ def test_compute_all_full_year_multi_sensor_pipeline(thermal_math):
     assert electricity["baseload_cost_per_year_gbp"] == pytest.approx(
         0.1 * 24 * 0.18 * 365, rel=0.05
     )
+
+    zero_rate_result = thermal_math.compute_all(
+        stats,
+        {**conf, "gas_unit_rate": 0.0, "electricity_unit_rate": 0.0},
+        tz,
+        now,
+        (60, 120, 365),
+    )
+    assert zero_rate_result["dhw"]["cost_per_day_gbp"] == 0.0
+    assert zero_rate_result["dhw"]["cost_per_year_gbp"] == 0.0
+    assert zero_rate_result["usage"]["dhw_cost_per_day_gbp_7d"] == 0.0
+    assert zero_rate_result["electricity"]["cost_per_day_gbp"] == 0.0
+    assert zero_rate_result["electricity"]["cost_per_year_gbp"] == 0.0
     assert electricity["implied_internal_gains_w"] == pytest.approx(
         electricity["kwh_per_day"] * 1000 / 24, rel=0.01
     )

@@ -57,6 +57,8 @@ def _expected_day_hours(day: pd.Timestamp) -> int:
     """Return the real number of hours in a local day, including DST."""
     start = day.normalize()
     end = start + pd.DateOffset(days=1)
+    if start.tzinfo is None:
+        return 24
     return round((end.tz_convert("UTC") - start.tz_convert("UTC")).total_seconds() / 3600)
 
 
@@ -78,48 +80,122 @@ def daily_heat_input_from_meter(
     (statistics-baseline offsets when LTS and recorder data interleave; a
     domestic boiler can't burn more than ~max_step_kwh between readings)
     are treated as artifacts, not consumption.
+    Requires complete 23/24/25-hour local dates with consecutive aligned observations.
     """
     gas_kwh = gas_kwh.sort_index()
+    if len(gas_kwh) < 2:
+        return pd.Series(dtype=float, name=gas_kwh.name)
     diffs = gas_kwh.diff()
-    gaps = gas_kwh.index.to_series().diff()
+    starts = gas_kwh.index.to_series().shift(1)
+    ends = gas_kwh.index.to_series()
+    gaps = ends - starts
     valid = (
         (gaps > pd.Timedelta(0))
         & (gaps <= MAX_METER_GAP)
         & (diffs >= 0)
         & (diffs <= max_step_kwh)
     )
-    diffs = diffs.where(valid)
-    totals = diffs.resample("1D").agg(["sum", "count"])
-    complete = [
-        count >= (_expected_day_hours(day) - 1) * MIN_DAILY_COVERAGE
-        for day, count in totals["count"].items()
-    ]
-    result = totals.loc[complete, "sum"]
-    result.name = gas_kwh.name
+    valid_df = pd.DataFrame({"diff": diffs[valid], "end": ends[valid]}).dropna()
+
+    by_day = {}
+    # HA groups long-term-statistic sums by row.start. The delta at 00:00
+    # belongs to that day and uses the prior day's 23:00 value as baseline.
+    for day_start, group in valid_df.groupby(valid_df["end"].dt.normalize()):
+        expected = _expected_day_hours(day_start)
+        if len(group) != expected:
+            continue
+        day_end = day_start + pd.DateOffset(days=1)
+        group_sorted = group.sort_values("end")
+        expected_ends = pd.date_range(
+            start=day_start, end=day_end - pd.Timedelta(hours=1), freq="1h"
+        )
+        if not group_sorted["end"].reset_index(drop=True).equals(
+            pd.Series(expected_ends, name="end")
+        ):
+            continue
+        by_day[day_start] = float(group_sorted["diff"].sum())
+
+    if not by_day:
+        result = pd.Series(dtype=float, name=gas_kwh.name)
+        result.index = pd.DatetimeIndex([], dtype="datetime64[ns, UTC]" if gas_kwh.index.tz is not None else "datetime64[ns]")
+        return result
+
+    result = pd.Series(by_day, dtype=float, name=gas_kwh.name)
+    result.index = pd.DatetimeIndex(result.index)
     return result
 
 
 def daily_delta_t(
     indoor_by_room: dict[str, pd.Series], outdoor: pd.Series
 ) -> pd.Series:
+    """Mean daily indoor-outdoor temperature difference over complete local dates."""
     if not indoor_by_room:
         return pd.Series(dtype=float)
     rooms = pd.DataFrame(indoor_by_room).dropna(how="any")
     indoor_mean = rooms.mean(axis=1)
-    aligned_outdoor = outdoor.reindex(indoor_mean.index).interpolate(limit=1)
+    # Do not fill a missing outdoor observation: that would fabricate a
+    # temperature pair and can turn a shifted/sparse day into a fit sample.
+    aligned_outdoor = outdoor.reindex(indoor_mean.index)
     dt = (indoor_mean - aligned_outdoor).dropna()
-    daily = dt.resample("1D").agg(["mean", "count"])
+    if dt.empty:
+        return pd.Series(dtype=float)
     gaps = dt.index.to_series().diff().dropna()
-    cadence = gaps[gaps > pd.Timedelta(0)].median() if not gaps.empty else pd.Timedelta("1h")
-    complete = [
-        count >= _expected_day_hours(day) * pd.Timedelta("1h") / cadence * MIN_DAILY_COVERAGE
-        for day, count in daily["count"].items()
+    positive_seconds = [
+        int(gap.total_seconds()) for gap in gaps if gap > pd.Timedelta(0)
     ]
-    return daily.loc[complete, "mean"]
+    if not positive_seconds:
+        return pd.Series(dtype=float)
+    cadence_seconds = min(positive_seconds)
+    if 3600 % cadence_seconds or any(
+        seconds % cadence_seconds for seconds in positive_seconds
+    ):
+        return pd.Series(dtype=float)
+    cadence = pd.Timedelta(seconds=cadence_seconds)
+    by_day = {}
+    for day_start, group in dt.groupby(dt.index.to_series().dt.normalize()):
+        expected = round(
+            _expected_day_hours(day_start) * pd.Timedelta("1h") / cadence
+        )
+        if len(group) != expected:
+            continue
+        expected_index = pd.date_range(
+            start=day_start,
+            end=day_start + pd.DateOffset(days=1) - cadence,
+            freq=cadence,
+        )
+        if not group.index.equals(expected_index):
+            continue
+        by_day[day_start] = float(group.mean())
+
+    if not by_day:
+        result = pd.Series(dtype=float)
+        result.index = pd.DatetimeIndex([], dtype="datetime64[ns, UTC]" if dt.index.tz is not None else "datetime64[ns]")
+        return result
+
+    result = pd.Series(by_day, dtype=float)
+    result.index = pd.DatetimeIndex(result.index)
+    return result
 
 
-def fit_hlc(q_daily: pd.Series, dt_daily: pd.Series) -> dict:
-    df = pd.DataFrame({"q": q_daily, "dt": dt_daily}).dropna()
+def fit_hlc(
+    q_daily: pd.Series,
+    dt_daily: pd.Series,
+    *,
+    heating_off: set | None = None,
+) -> dict:
+    normalized_q = q_daily.copy()
+    if normalized_q.index.tz is not None:
+        normalized_q = pd.Series(
+            [
+                value * 24.0 / _expected_day_hours(day)
+                for day, value in normalized_q.items()
+            ],
+            index=normalized_q.index,
+            name=normalized_q.name,
+        )
+    df = pd.DataFrame({"q": normalized_q, "dt": dt_daily}).dropna()
+    if heating_off is not None:
+        df = df[~df.index.isin(list(heating_off))]
     # Heating-season days only: meaningful dT and some heat actually delivered
     df = df[(df.dt > 4) & (df.q > 0.5)]
     if len(df) < MIN_HLC_DAYS:

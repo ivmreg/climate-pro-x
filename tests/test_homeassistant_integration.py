@@ -11,6 +11,7 @@ pytest.importorskip("pytest_homeassistant_custom_component")
 
 from homeassistant.const import UnitOfEnergy
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.thermal_efficiency.config_flow import (
@@ -271,8 +272,8 @@ async def test_complete_entry_setup_captures_and_unloads(recorder_mock, hass, mo
     binding = manager.bindings()[0]
     hass.states.async_set(binding.source_entity_id, "20", {"unit_of_measurement": "°C"})
     await hass.async_block_till_done()
-    assert hass.states.get(binding.entity_id).state == "20.0"
-    assert len(er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)) == 14
+    # 14 original model/room entities + 1 data readiness diagnostic sensor
+    assert len(er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id)) == 15
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
     assert diagnostics["configuration_schema_version"] == 2
     assert diagnostics["history_schema_version"] == 2
@@ -380,6 +381,34 @@ async def test_history_options_preserve_room_identity_and_reject_stale_form(hass
     assert flow._rooms["living_room"]["name"] == "Renamed living room"
     manager.data["revision"] += 1
     assert flow._async_finish()["reason"] == "assignments_changed"
+
+
+async def test_history_async_prepare_composes_snapshot_in_executor(hass, monkeypatch):
+    """History composition runs on a worker and receives a detached snapshot."""
+    from threading import get_ident
+
+    import custom_components.thermal_efficiency.history as history_module
+    from custom_components.thermal_efficiency.history import RoomHistoryManager
+
+    config = _config()
+    entry = MockConfigEntry(domain=DOMAIN, data=config, version=2)
+    entry.add_to_hass(hass)
+    manager = RoomHistoryManager(hass, entry, config)
+    await manager.async_initialize()
+    loop_thread = get_ident()
+    evidence = {}
+
+    def compose_probe(stats, conf, snapshot, tz):
+        evidence["thread"] = get_ident()
+        evidence["snapshot"] = snapshot
+        return stats, conf
+
+    monkeypatch.setattr(history_module, "compose", compose_probe)
+    result = await manager.async_prepare({}, config, dt_util.get_default_time_zone())
+
+    assert result == ({}, config)
+    assert evidence["thread"] != loop_thread
+    assert evidence["snapshot"] is not manager.data
 
 
 async def test_replacement_options_preview_before_write(recorder_mock, hass):

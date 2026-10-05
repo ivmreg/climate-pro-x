@@ -28,6 +28,53 @@ def test_hlc_recovers_known_positive_slope(thermal_math, forty_days):
     assert result["days_used"] == len(forty_days)
 
 
+def test_hlc_normalizes_23_and_25_hour_energy_to_24_hours():
+    import pandas as pd
+
+    from ha_efficiency import hlc
+
+    index = pd.date_range("2026-02-20", periods=50, freq="1D", tz="Europe/London")
+    delta_t = [5.0 + (i % 12) for i in range(len(index))]
+    hours = [hlc._expected_day_hours(day) for day in index]
+    slope = 240.0 * 24 / 1000
+    q = [
+        (2.0 + slope * dt) * day_hours / 24
+        for dt, day_hours in zip(delta_t, hours)
+    ]
+
+    result = hlc.fit_hlc(pd.Series(q, index=index), pd.Series(delta_t, index=index))
+
+    assert result["hlc_w_per_k"] == pytest.approx(240.0, rel=1e-9)
+
+
+def test_cli_hlc_applies_measured_heating_off_days(monkeypatch):
+    import pandas as pd
+
+    import ha_efficiency.__main__ as cli
+
+    expected_off_days = {pd.Timestamp("2026-01-01")}
+    monkeypatch.setattr(cli, "load_config", lambda: {
+        "outdoor_entity": "sensor.outdoor",
+        "gas_kwh_entity": "sensor.gas",
+    })
+    monkeypatch.setattr(cli.store, "load_resampled", lambda _entity: pd.Series(dtype=float))
+    monkeypatch.setattr(cli.store, "load", lambda _entity: pd.Series(dtype=float))
+    monkeypatch.setattr(cli, "_room_series", lambda _cfg, _role: {"room": pd.Series(dtype=float)})
+    monkeypatch.setattr(cli.hlc, "daily_delta_t", lambda _rooms, _outdoor: pd.Series(dtype=float))
+    monkeypatch.setattr(cli.hlc, "daily_heat_input_from_meter", lambda _gas: pd.Series(dtype=float))
+    monkeypatch.setattr(cli, "_dhw_context", lambda _cfg, _dt: {"heating_off": expected_off_days})
+    seen = {}
+
+    def fit(_q, _dt, *, heating_off=None):
+        seen["heating_off"] = heating_off
+        return {"days": 0, "note": "insufficient data"}
+
+    monkeypatch.setattr(cli.hlc, "fit_hlc", fit)
+    cli.cmd_hlc(None)
+
+    assert seen["heating_off"] == expected_off_days
+
+
 def test_hlc_rejects_negative_slope(thermal_math, forty_days):
     delta_t = [5.0 + offset % 10 for offset in range(len(forty_days))]
     energy = [80.0 - 2.0 * dt for dt in delta_t]

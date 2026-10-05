@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import re
+
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION,
     CONF_HEATING_POWER,
     CONF_ROOMS,
     CONF_ROOM_TYPE,
@@ -47,6 +51,7 @@ async def async_setup_entry(
         ElectricityBaseloadSensor(coordinator),
         ElectricityUsageSensor(coordinator),
         WaterUsageSensor(coordinator),
+        DataReadinessSensor(coordinator),
     ]
     entities += [
         RoomTauSensor(coordinator, room)
@@ -87,15 +92,24 @@ class HlcSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         fit = self.coordinator.data.get("hlc")
+        status_info = self.coordinator.data.get("analysis_status", {}).get("hlc", {})
         if not fit:
             return {
-                "note": "not enough qualifying heating days; the fit needs complete "
-                "gas and indoor/outdoor temperature data with sustained temperature "
-                "difference and a positive, credible regression",
+                "scope": "whole_home",
+                "status": status_info.get("status", "collecting"),
+                "note": status_info.get("reason") or (
+                    "not enough qualifying heating days; the fit needs complete "
+                    "gas and indoor/outdoor temperature data with sustained temperature "
+                    "difference and a positive, credible regression"
+                ),
+                "next_action": status_info.get("next_action"),
             }
         return {
+            "scope": "whole_home",
             "rating": "not benchmarked; building type and floor area context required",
-            "status": fit.get("status", "provisional"),
+            "status": status_info.get("status") or fit.get("status", "provisional"),
+            "latest_source_day": status_info.get("latest_source_day"),
+            "source_lag_days": status_info.get("source_lag_days"),
             "r_squared": round(fit["r_squared"], 3),
             "days_used": fit["days_used"],
             "window_days": fit["window_days"],
@@ -211,20 +225,28 @@ class AirChangeRateSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         ach = self.coordinator.data.get("air_change_rate") or self.coordinator.data.get("losses")
+        status_info = self.coordinator.data.get("analysis_status", {}).get("air_change_rate", {})
         if not ach or "ach" not in ach:
             return {
-                "note": (
+                "scope": "room",
+                "status": status_info.get("status", "collecting"),
+                "note": status_info.get("reason") or (
                     "not enough clean CO2 decay windows yet - configure a CO2 sensor "
                     "(floor area and ceiling height are only required for the ventilation/fabric loss split)"
-                )
+                ),
+                "next_action": status_info.get("next_action"),
             }
-        return {
+        attrs = {
+            "scope": ach.get("scope", "room"),
+            "status": status_info.get("status", "valid"),
             "decay_windows_used": ach["windows"],
             "outdoor_co2_baseline_ppm": round(ach["baseline_ppm"], 0),
             "co2_sensors_used": ach.get("co2_sensors_used", 1),
             "co2_baseline_source": ach.get("co2_baseline_source"),
-            "scope": ach.get("scope"),
         }
+        if status_info.get("latest_source_day"):
+            attrs["latest_source_day"] = status_info["latest_source_day"]
+        return attrs
 
 
 class VentilationLossSensor(ThermalSensor):
@@ -236,26 +258,50 @@ class VentilationLossSensor(ThermalSensor):
 
     @property
     def native_value(self) -> float | None:
+        if not self.coordinator.conf.get(CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION, False):
+            return None
         losses = self.coordinator.data.get("losses")
         return round(losses["ventilation_w_per_k"], 1) if losses and losses.get("ventilation_w_per_k") is not None else None
 
     @property
     def extra_state_attributes(self) -> dict:
+        opt_in = self.coordinator.conf.get(CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION, False)
+        status_info = self.coordinator.data.get("analysis_status", {}).get("losses", {})
+        base_attrs = {
+            "scope": "whole_home",
+            "experimental": True,
+            "experimental_assumptions": "Assumes measured room air change rate applies uniformly across whole-home volume",
+        }
+        if not opt_in:
+            return {
+                **base_attrs,
+                "status": "not_configured",
+                "note": "Whole-home ventilation and fabric loss estimates require enabling experimental whole-home ventilation in settings",
+                "next_action": "Enable experimental whole-home ventilation in integration settings",
+            }
         losses = self.coordinator.data.get("losses")
         if not losses or losses.get("ventilation_w_per_k") is None:
             status_data = self.coordinator.data.get("losses_status")
+            diagnostic_note = status_info.get("reason") or "not enough data yet"
             if isinstance(status_data, dict) and status_data.get("diagnostic_note"):
-                return {"note": status_data["diagnostic_note"]}
-            if isinstance(losses, dict) and losses.get("diagnostic_note"):
-                return {"note": losses["diagnostic_note"]}
-            return {"note": "not enough data yet"}
+                diagnostic_note = status_data["diagnostic_note"]
+            elif isinstance(losses, dict) and losses.get("diagnostic_note"):
+                diagnostic_note = losses["diagnostic_note"]
+            return {
+                **base_attrs,
+                "status": status_info.get("status", "collecting"),
+                "note": diagnostic_note,
+                "next_action": status_info.get("next_action"),
+            }
         return {
+            **base_attrs,
+            "status": status_info.get("status", "valid"),
             "share_of_delivered_hlc_pct": (
                 round(losses["ventilation_share_pct"], 1)
-                if losses["ventilation_share_pct"] is not None
+                if losses.get("ventilation_share_pct") is not None
                 else None
             ),
-            "air_change_rate": round(losses["ach"], 3),
+            "air_change_rate": round(losses["ach"], 3) if losses.get("ach") is not None else None,
         }
 
 
@@ -268,22 +314,46 @@ class FabricLossSensor(ThermalSensor):
 
     @property
     def native_value(self) -> float | None:
+        if not self.coordinator.conf.get(CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION, False):
+            return None
         losses = self.coordinator.data.get("losses")
         return round(losses["fabric_w_per_k"], 1) if losses and losses.get("fabric_w_per_k") is not None else None
 
     @property
     def extra_state_attributes(self) -> dict:
+        opt_in = self.coordinator.conf.get(CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION, False)
+        status_info = self.coordinator.data.get("analysis_status", {}).get("losses", {})
+        base_attrs = {
+            "scope": "whole_home",
+            "experimental": True,
+            "experimental_assumptions": "Assumes measured room air change rate applies uniformly across whole-home volume",
+        }
+        if not opt_in:
+            return {
+                **base_attrs,
+                "status": "not_configured",
+                "note": "Whole-home ventilation and fabric loss estimates require enabling experimental whole-home ventilation in settings",
+                "next_action": "Enable experimental whole-home ventilation in integration settings",
+            }
         losses = self.coordinator.data.get("losses")
         if not losses or losses.get("fabric_w_per_k") is None:
             status_data = self.coordinator.data.get("losses_status")
+            diagnostic_note = status_info.get("reason") or "not enough data yet"
             if isinstance(status_data, dict) and status_data.get("diagnostic_note"):
-                return {"note": status_data["diagnostic_note"]}
-            if isinstance(losses, dict) and losses.get("diagnostic_note"):
-                return {"note": losses["diagnostic_note"]}
-            return {"note": "not enough data yet"}
+                diagnostic_note = status_data["diagnostic_note"]
+            elif isinstance(losses, dict) and losses.get("diagnostic_note"):
+                diagnostic_note = losses["diagnostic_note"]
+            return {
+                **base_attrs,
+                "status": status_info.get("status", "collecting"),
+                "note": diagnostic_note,
+                "next_action": status_info.get("next_action"),
+            }
         return {
-            "hlc_delivered_w_per_k": round(losses["hlc_delivered_w_per_k"], 1),
-            "boiler_efficiency_used": losses["boiler_efficiency_used"],
+            **base_attrs,
+            "status": status_info.get("status", "valid"),
+            "hlc_delivered_w_per_k": round(losses["hlc_delivered_w_per_k"], 1) if losses.get("hlc_delivered_w_per_k") is not None else None,
+            "boiler_efficiency_used": losses.get("boiler_efficiency_used"),
         }
 
 
@@ -654,6 +724,11 @@ class RoomTauSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         fit = self.coordinator.data["rooms"].get(self._room)
+        status_info = (
+            self.coordinator.data.get("analysis_status", {})
+            .get("rooms", {})
+            .get(self._room, {})
+        )
         if not fit:
             room_conf = self.coordinator.conf.get(CONF_ROOMS, {}).get(
                 self._room, {}
@@ -664,20 +739,157 @@ class RoomTauSensor(ThermalSensor):
             ).get(heating_entity)
             if heating_issue:
                 return {
+                    "scope": "room",
+                    "status": status_info.get("status", "source_problem"),
                     "note": "configured heating-demand source is invalid, so cooling "
                     "fits are suppressed until it reports 0-100%",
                     "source_issue": heating_issue,
                     "required_nights": TAU_MIN_NIGHTS,
+                    "next_action": status_info.get("next_action"),
                 }
             return {
-                "note": (
+                "scope": "room",
+                "status": status_info.get("status", "collecting"),
+                "note": status_info.get("reason") or (
                     f"fewer than {TAU_MIN_NIGHTS} usable unheated cooling nights "
                     "passed the coverage, temperature-drop and fit-quality checks"
                 ),
                 "required_nights": TAU_MIN_NIGHTS,
+                "next_action": status_info.get("next_action"),
             }
-        return {
+        attrs = {
+            "scope": "room",
+            "status": status_info.get("status", "valid"),
             "nights_fitted": fit["nights_fitted"],
             "last_night": fit["last_night"],
             "window_days": fit["window_days"],
         }
+        if status_info.get("latest_source_day"):
+            attrs["latest_source_day"] = status_info["latest_source_day"]
+        return attrs
+
+
+class DataReadinessSensor(CoordinatorEntity[ThermalCoordinator], SensorEntity):
+    _attr_has_entity_name = True
+    _attr_unique_id = f"{DOMAIN}_data_readiness"
+    _attr_name = "Data readiness"
+    _attr_icon = "mdi:clipboard-check-outline"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_state_class = None
+    _attr_native_unit_of_measurement = None
+
+    def __init__(self, coordinator: ThermalCoordinator) -> None:
+        super().__init__(coordinator)
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, "home")},
+            name="Thermal Efficiency",
+            manufacturer="climate-pro-x",
+        )
+
+    @property
+    def native_value(self) -> str:
+        status_map = self.coordinator.data.get("analysis_status", {})
+        if not status_map:
+            return "not_configured"
+        statuses = []
+        for k, v in status_map.items():
+            if k == "rooms" and isinstance(v, dict):
+                statuses.extend(r.get("status") for r in v.values() if isinstance(r, dict))
+            elif isinstance(v, dict):
+                statuses.append(v.get("status"))
+
+        if "source_problem" in statuses:
+            return "source_problem"
+        if "rejected" in statuses:
+            return "rejected"
+        if "collecting" in statuses:
+            return "collecting"
+        if "provisional" in statuses:
+            return "provisional"
+        if "valid" in statuses:
+            return "ready"
+        if "historical_baseline_held" in statuses:
+            return "historical_baseline_held"
+        return "not_configured"
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        status_map = self.coordinator.data.get("analysis_status", {})
+        source_issues = self.coordinator.data.get("source_issues", {})
+        room_names = {}
+        rooms = self.coordinator.conf.get(CONF_ROOMS, {})
+        for index, (room_id, room) in enumerate(sorted(rooms.items()), 1):
+            room_names[room.get("name") or room_id] = f"room_{index}"
+            room_names[room_id] = f"room_{index}"
+
+        def sanitize(value):
+            text = str(value) if value is not None else None
+            if text is None:
+                return None
+            for room_name, alias in sorted(room_names.items(), key=lambda item: len(item[0]), reverse=True):
+                text = re.sub(
+                    rf"(?<![\w]){re.escape(room_name)}(?![\w])",
+                    alias,
+                    text,
+                    flags=re.IGNORECASE,
+                )
+            text = re.sub(r"\b[a-z_]+(?:\.[a-z0-9_-]+)+\b", "<source>", text, flags=re.IGNORECASE)
+            text = re.sub(r"(?<![\w])[a-z0-9_.-]+:[a-z0-9_.:-]+", "<source>", text, flags=re.IGNORECASE)
+            return text
+
+        sanitized_issues = {
+            role if role in {"outdoor", "gas_meter", "water", "electricity_meter", "co2", "outdoor_co2_sensor", "gas_unit_rate", "electricity_unit_rate"} else "room_source": sanitize(msg)
+            for role, msg in source_issues.items()
+        }
+        summary_parts = []
+        sanitized_status = {}
+        for metric, info in status_map.items():
+            if metric == "rooms":
+                if isinstance(info, dict):
+                    sanitized_status[metric] = {
+                        f"room_{index}": {
+                            "status": room.get("status"),
+                            "reason": sanitize(room.get("reason")),
+                            "next_action": sanitize(room.get("next_action")),
+                            **{
+                                key: room[key]
+                                for key in ("usable_observations", "required_observations", "latest_source_day", "source_lag_days", "model_data_through")
+                                if key in room
+                            },
+                        }
+                        for index, (_, room) in enumerate(sorted(info.items()), 1)
+                        if isinstance(room, dict)
+                    }
+                    states = sorted({room.get("status") for room in info.values() if isinstance(room, dict) and room.get("status")})
+                    if states:
+                        summary_parts.append(f"rooms: {', '.join(states)}")
+                continue
+            if not isinstance(info, dict):
+                continue
+            st = info.get("status")
+            sanitized_status[metric] = {
+                "status": st,
+                "reason": sanitize(info.get("reason")),
+                "next_action": sanitize(info.get("next_action")),
+                **{
+                    key: info[key]
+                    for key in ("usable_observations", "required_observations", "latest_source_day", "source_lag_days", "model_data_through")
+                    if key in info
+                },
+            }
+            if st:
+                detail = sanitize(info.get("reason"))
+                summary_parts.append(f"{metric}: {st}" + (f" — {detail}" if detail else ""))
+        summary = "; ".join(summary_parts) if summary_parts else "No metrics active"
+
+        attrs = {
+            "summary": summary,
+            "metrics": sanitized_status,
+            "source_issues": sanitized_issues,
+        }
+        for metric, info in sanitized_status.items():
+            if metric != "rooms" and isinstance(info, dict):
+                attrs[f"{metric}_status"] = info.get("status")
+                attrs[f"{metric}_reason"] = info.get("reason")
+                attrs[f"{metric}_next_action"] = info.get("next_action")
+        return attrs

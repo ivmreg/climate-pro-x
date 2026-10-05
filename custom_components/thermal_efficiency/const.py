@@ -23,6 +23,15 @@ CONF_GAS_UNIT_RATE = "gas_unit_rate"
 CONF_BOILER_EFFICIENCY = "boiler_efficiency"
 CONF_ELECTRICITY_METER = "electricity_meter"
 CONF_ELECTRICITY_UNIT_RATE = "electricity_unit_rate"
+CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION = "experimental_whole_home_ventilation"
+
+STATUS_NOT_CONFIGURED = "not_configured"
+STATUS_COLLECTING = "collecting"
+STATUS_VALID = "valid"
+STATUS_PROVISIONAL = "provisional"
+STATUS_REJECTED = "rejected"
+STATUS_SOURCE_PROBLEM = "source_problem"
+STATUS_HISTORICAL_BASELINE_HELD = "historical_baseline_held"
 
 DEFAULT_MAX_WINDOW_DAYS = 365
 DEFAULT_BOILER_EFFICIENCY = 0.88

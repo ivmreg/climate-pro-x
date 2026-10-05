@@ -8,7 +8,7 @@ coverage, and an explicit quality assessment.
 
 ## Implementation status
 
-Implemented in version 0.4:
+Implemented through version 0.8.0 (current release candidate):
 
 - P0 trust gates, delivered-HLC semantics, confidence intervals, complete-day
   filtering, gap-aware meter deltas, and source-separated caches;
@@ -23,7 +23,16 @@ Implemented in version 0.4:
   CO2 sensors, and a measured outdoor CO2 entity with scalar fallback;
 - an immutable rounded and de-identified heating-season fixture, 80% enforced
   coverage across trust-sensitive modules, and 90% enforced branch coverage
-  for the dependency-free live calculation core.
+  for the dependency-free live calculation core;
+- end-to-end local-day coverage for 23/24/25-hour DST days, source-readiness
+  diagnostics, and an explicit heating-model data anchor;
+- mapping-driven Lovelace dashboards with room-name serialization, readiness
+  scope, optional external source cards, and explicit experimental labeling.
+
+Version 0.8.0 retains configuration schema 2 and existing entity unique IDs.
+It tightens result suppression when source metadata, complete-day coverage,
+fit quality or physical bounds fail. See [release notes](docs/release-0.8.0.md)
+and [reliability and rollback](docs/reliability.md) for user-facing behavior.
 
 CO2 occupancy is not guessed without occupancy evidence. Instead, the decay
 classifier rejects rising/fresh-source periods, discontinuous windows, poor
