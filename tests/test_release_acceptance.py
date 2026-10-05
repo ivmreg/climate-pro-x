@@ -6,7 +6,7 @@ Covers:
 3. Meter resets, gaps, and anomalous jumps (no invented deltas).
 4. Physical bounds and reconciliation (finite positive HLC, fabric + ventilation <= HLC, water fraction 0-100%).
 5. Boundary conditions for thermal models (insufficient dT spread, unconstrained slope confidence intervals, water rise limits).
-6. Backup / restore fixture check and unique ID stability (thermal_efficiency_data_readiness).
+6. Configuration and sensor identity are validated separately by HA fixture tests.
 """
 
 from __future__ import annotations
@@ -50,30 +50,6 @@ from custom_components.thermal_efficiency.thermal_math import (
 # ---------------------------------------------------------------------------
 # 1. Unit conversions and scaling
 # ---------------------------------------------------------------------------
-
-def test_unit_conversions_and_tariff_normalization():
-    """Verify tariff and energy unit math conversions reconcile numerically."""
-    # Gas cost calculation: 50 kWh @ 0.065 GBP/kWh = 3.25 GBP
-    kwh = 50.0
-    tariff_gbp_per_kwh = 0.065
-    cost_gbp = kwh * tariff_gbp_per_kwh
-    assert math.isclose(cost_gbp, 3.25)
-
-    # If tariff is given in pence (6.5p), normalizing to GBP must yield 0.065 GBP
-    tariff_pence = 6.5
-    normalized_tariff = tariff_pence / 100.0
-    assert math.isclose(normalized_tariff, 0.065)
-
-    # Power to energy: 1000 W continuous over 24 h = 24 kWh
-    power_w = 1000.0
-    energy_kwh = (power_w * 24.0) / 1000.0
-    assert math.isclose(energy_kwh, 24.0)
-
-    # Water volume: 1 m^3 = 1000 Litres
-    m3 = 0.15
-    litres = m3 * 1000.0
-    assert math.isclose(litres, 150.0)
-
 
 # ---------------------------------------------------------------------------
 # 2. DST transitions and strict complete local-day coverage
@@ -273,8 +249,8 @@ def test_hlc_lower_slope_confidence_crosses_zero():
     assert result is None
 
 
-def test_fit_dhw_water_rate_high_temp_rise_boundary():
-    """fit_dhw_water_rate skips days where outdoor temperature makes rise <= 0."""
+def test_fit_dhw_water_rate_rejects_excessive_energy_per_litre():
+    """Very high outdoor values are clamped by the mains model; excessive energy rates are rejected."""
     start = date(2026, 7, 1)
     q_by_day = {}
     outdoor_by_day = {}
@@ -283,7 +259,7 @@ def test_fit_dhw_water_rate_high_temp_rise_boundary():
     for i in range(25):
         d = start + timedelta(days=i)
         q_by_day[d] = 8.0
-        # If outdoor temp is 60 C, mains_temp_c will exceed MAINS_TANK_TEMP_C (55 C)
+        # The mains model clamps to 16 C; 8 kWh/120 L exceeds its physical rate bound.
         outdoor_by_day[d] = 60.0
         water_by_day[d] = 120.0
 
@@ -294,7 +270,7 @@ def test_fit_dhw_water_rate_high_temp_rise_boundary():
         heating_off=set(q_by_day.keys()),
         since=start,
     )
-    assert rate is None, "Days with non-positive temperature rise must be excluded."
+    assert rate is None, "Excessive energy per litre must be rejected."
 
 
 def test_recent_daily_windows():
@@ -344,10 +320,3 @@ def test_attribution_with_until_and_outlier_filtering():
 # ---------------------------------------------------------------------------
 # 6. Stability and Readiness Sensor Coordination
 # ---------------------------------------------------------------------------
-
-def test_readiness_sensor_unique_id_convention():
-    """Verify standard readiness sensor unique ID convention coordinated across tasks."""
-    expected_readiness_unique_id = "thermal_efficiency_data_readiness"
-    assert expected_readiness_unique_id == "thermal_efficiency_data_readiness"
-    # Ensure domain is stable
-    assert DOMAIN == "thermal_efficiency"

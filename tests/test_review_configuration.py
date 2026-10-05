@@ -32,9 +32,6 @@ from custom_components.thermal_efficiency.const import (
 )
 from custom_components.thermal_efficiency.coordinator import ThermalCoordinator
 from custom_components.thermal_efficiency.validation import (
-    is_energy_unit,
-    is_temperature_unit,
-    is_volume_unit,
     validate_global_sources,
     validate_source_metadata_and_state,
 )

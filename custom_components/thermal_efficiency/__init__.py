@@ -165,7 +165,7 @@ CONFIG_SCHEMA = vol.Schema(
                     ): cv.boolean,
                     vol.Optional(
                         CONF_MAX_WINDOW_DAYS, default=DEFAULT_MAX_WINDOW_DAYS
-                    ): vol.All(cv.positive_int, vol.Range(min=30, max=730)),
+                    ): vol.All(_bounded_float(30, 730), cv.positive_int),
                 }
             ),
             _validate_loft_exclusivity,
