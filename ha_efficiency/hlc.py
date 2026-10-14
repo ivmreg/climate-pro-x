@@ -17,6 +17,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .quality import clean_numeric, is_valid_percentage, is_valid_temperature
+
 MIN_HLC_DAYS = 20
 MIN_HLC_R2 = 0.5
 MIN_DT_SPREAD = 3.0
@@ -66,9 +68,15 @@ def daily_heat_input_from_tado(
     heating_by_room: dict[str, pd.Series], boiler_output_kw: float
 ) -> pd.Series:
     """kWh/day estimated from mean Tado heating power across zones."""
-    df = pd.DataFrame(heating_by_room)
-    mean_pct = df.mean(axis=1)  # simple mean across zones
-    return (mean_pct / 100.0 * boiler_output_kw).resample("1D").mean() * 24
+    df = pd.DataFrame({
+        name: clean_numeric(values, is_valid_percentage)
+        for name, values in heating_by_room.items()
+    })
+    # Keep the configured population fixed. A missing zone is not zero demand.
+    mean_pct = df.mean(axis=1).where(df.notna().all(axis=1))
+    daily = mean_pct.resample("1D").mean()
+    complete = mean_pct.notna().resample("1D").min()
+    return (daily.where(complete) / 100.0 * boiler_output_kw) * 24
 
 
 def daily_heat_input_from_meter(
@@ -82,7 +90,7 @@ def daily_heat_input_from_meter(
     are treated as artifacts, not consumption.
     Requires complete 23/24/25-hour local dates with consecutive aligned observations.
     """
-    gas_kwh = gas_kwh.sort_index()
+    gas_kwh = clean_numeric(gas_kwh).sort_index()
     if len(gas_kwh) < 2:
         return pd.Series(dtype=float, name=gas_kwh.name)
     diffs = gas_kwh.diff()
@@ -131,11 +139,15 @@ def daily_delta_t(
     """Mean daily indoor-outdoor temperature difference over complete local dates."""
     if not indoor_by_room:
         return pd.Series(dtype=float)
-    rooms = pd.DataFrame(indoor_by_room).dropna(how="any")
+    rooms = pd.DataFrame({
+        name: clean_numeric(values, is_valid_temperature)
+        for name, values in indoor_by_room.items()
+    })
     indoor_mean = rooms.mean(axis=1)
+    indoor_mean = indoor_mean.where(rooms.notna().all(axis=1))
     # Do not fill a missing outdoor observation: that would fabricate a
     # temperature pair and can turn a shifted/sparse day into a fit sample.
-    aligned_outdoor = outdoor.reindex(indoor_mean.index)
+    aligned_outdoor = clean_numeric(outdoor, is_valid_temperature).reindex(indoor_mean.index)
     dt = (indoor_mean - aligned_outdoor).dropna()
     if dt.empty:
         return pd.Series(dtype=float)

@@ -50,6 +50,7 @@ from .const import (
 from .validation import (
     async_fetch_recorder_metadata,
     heating_power_issue,
+    normalized_tariff_rate,
     validate_source_metadata_and_state,
 )
 from .history import RoomHistoryManager
@@ -119,38 +120,9 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         state = self.hass.states.get(entity_id)
         if state is None or state.state in ("unknown", "unavailable"):
             return None
-        try:
-            value = float(state.state)
-        except (ValueError, TypeError):
-            return None
-        from math import isfinite
-        if not isfinite(value) or value < 0.0:
-            return None
-
-        unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
-        if not isinstance(unit, str):
-            _LOGGER.warning(
-                "%s tariff %s has no unit; expected GBP/kWh or p/kWh",
-                fuel,
-                entity_id,
-            )
-            return None
-
-        normalized = unit.casefold().replace(" ", "")
-        if normalized in {"gbp/kwh", "£/kwh"}:
-            return value
-        if normalized in {"p/kwh", "pence/kwh"}:
-            return value / 100.0
-        if normalized in {"gbp/mwh", "£/mwh"}:
-            return value / 1000.0
-
-        _LOGGER.warning(
-            "%s tariff %s uses unsupported unit %s; expected GBP/kWh or p/kWh",
-            fuel,
-            entity_id,
-            unit,
+        return normalized_tariff_rate(
+            state.state, state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
         )
-        return None
 
     async def _async_update_data(self) -> dict:
         max_days = self.conf[CONF_MAX_WINDOW_DAYS]
@@ -312,7 +284,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
                 "temperature": UnitOfTemperature.CELSIUS,
                 "volume": UnitOfVolume.LITERS,
             },
-            {"mean", "sum"},
+            {"mean", "sum", "min", "max"},
         )
         # compute_all is pure CPU and takes ~1s on a full season of hourly
         # statistics, so it must not run on the event loop. Tariffs are read
@@ -394,7 +366,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             windows,
         )
 
-        result["source_issues"] = source_issues
+        result["source_issues"] = {**result.get("source_issues", {}), **source_issues}
         result["source_health"] = source_health
 
         return result

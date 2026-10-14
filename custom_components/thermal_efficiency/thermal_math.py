@@ -16,6 +16,7 @@ Models (validated offline against a full heating season in this repo):
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from math import exp, isfinite, log, sqrt
 from statistics import median
@@ -54,9 +55,19 @@ LOFT_NIGHT_HOURS = range(1, 6)
 LOFT_MIN_DT = 6.0
 LOFT_MIN_HOURS = 12
 WATER_MAX_STEP_L = 1000.0  # bigger hourly steps are meter/statistics artifacts
+# Broad CO2 analysis acceptance bounds (analytics suitability policy, not universal physical/safety limits)
+CO2_MIN_PPM = 300.0
+CO2_MAX_PPM = 10000.0
 CO2_MIN_WINDOW_H = 4.0
 CO2_MIN_DROP_PPM = 120.0
 CO2_MIN_R2 = 0.9
+# Role-aware historical input sanitization bounds
+TEMP_MIN_C = -90.0
+TEMP_MAX_C = 80.0
+PERCENT_MIN = 0.0
+PERCENT_MAX = 100.0
+TARIFF_MIN_GBP_PER_KWH = 0.0
+TARIFF_MAX_GBP_PER_KWH = 10.0
 CO2_BASELINE_PCT = 0.02  # outdoor CO2 estimated as this low percentile of the series
 CO2_MIN_WINDOWS = 10
 CO2_MAX_GAP_S = 5400  # 1.5h; bigger gaps break the exponential-decay assumption
@@ -118,6 +129,149 @@ def series_from_stats(rows: list[dict], kind: str) -> Series:
                 ts /= 1000.0
         out[int(ts)] = value
     return out
+
+
+def is_valid_numeric_value(val: object, min_val: float, max_val: float) -> bool:
+    """Validate that val is a finite numeric float within [min_val, max_val] inclusive.
+
+    Rejects None, non-numeric strings, NaN, Inf, and out-of-bounds values.
+    """
+    if val is None:
+        return False
+    try:
+        v = float(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return isfinite(v) and min_val <= v <= max_val
+
+
+def is_valid_temperature_value(val: object) -> bool:
+    """Accept broad physical/analytics temperature bounds -90..80 °C inclusive."""
+    return is_valid_numeric_value(val, TEMP_MIN_C, TEMP_MAX_C)
+
+
+def is_valid_humidity_value(val: object) -> bool:
+    """Accept relative humidity bounds 0..100 % inclusive."""
+    return is_valid_numeric_value(val, PERCENT_MIN, PERCENT_MAX)
+
+
+def is_valid_heating_demand_value(val: object) -> bool:
+    """Accept heating power/demand bounds 0..100 % inclusive."""
+    return is_valid_numeric_value(val, PERCENT_MIN, PERCENT_MAX)
+
+
+def is_valid_co2_value(val: object) -> bool:
+    """Accept broad analytics suitability bounds 300..10000 ppm inclusive.
+
+    Analytics suitability policy, NOT universal physical or safety limits.
+    Rejects non-finite, NaN, Inf, negative, zero, and out-of-bounds sentinels.
+    """
+    return is_valid_numeric_value(val, CO2_MIN_PPM, CO2_MAX_PPM)
+
+
+def coerce_tariff_rate(val: object) -> float | None:
+    """Safely coerce and validate a tariff rate in normalized GBP/kWh (0..10 inclusive).
+
+    Accepts normalized GBP/kWh 0..10 inclusive (broad analytics policy).
+    Rejects nonfinite, malformed, negative, or excessive values rather than crash.
+    Zero is valid. Returns float or None.
+    """
+    if val is None:
+        return None
+    try:
+        v = float(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if isfinite(v) and TARIFF_MIN_GBP_PER_KWH <= v <= TARIFF_MAX_GBP_PER_KWH:
+        return v
+    return None
+
+
+def clean_series_from_stats(
+    rows: list[dict],
+    validator: Callable[[object], bool],
+    kind: str = "mean",
+) -> tuple[Series, int]:
+    """Convert recorder statistics rows to {epoch_seconds: value}.
+
+    Validates target kind (default 'mean') AND any supplied extrema (min, max)
+    against validator. Rejects the entire hourly bucket if target value or any
+    supplied extrema are outside bounds or non-finite.
+    Missing extrema are handled compatibly for legacy/synthetic/mean-only data.
+
+    Returns:
+        tuple of (Series, excluded_bucket_count)
+    """
+    out: Series = {}
+    excluded_count = 0
+    for row in rows:
+        target_val = row.get(kind)
+        min_val = row.get("min")
+        max_val = row.get("max")
+
+        if target_val is None and min_val is None and max_val is None:
+            continue
+
+        if not validator(target_val):
+            excluded_count += 1
+            continue
+
+        if min_val is not None and not validator(min_val):
+            excluded_count += 1
+            continue
+
+        if max_val is not None and not validator(max_val):
+            excluded_count += 1
+            continue
+
+        start = row.get("start")
+        if start is None:
+            excluded_count += 1
+            continue
+        if isinstance(start, datetime):
+            ts = start.timestamp()
+        else:
+            try:
+                ts = float(start)
+            except (TypeError, ValueError, OverflowError):
+                excluded_count += 1
+                continue
+            if not isfinite(ts):
+                excluded_count += 1
+                continue
+            if ts > 1e12:  # milliseconds (websocket-style payloads)
+                ts /= 1000.0
+        out[int(ts)] = float(target_val)
+    return out, excluded_count
+
+
+def co2_series_from_stats(rows: list[dict]) -> tuple[Series, int]:
+    """Convert recorder statistics rows to {epoch_seconds: mean_value} for CO2.
+
+    Validates the hourly bucket against broad analytics suitability bounds (300..10000 ppm).
+    Rejects the entire hourly bucket if mean or any supplied extrema (min, max) are outside
+    these bounds or non-finite (e.g. brief 99999 sentinel diluted into an otherwise acceptable mean).
+    Missing extrema are handled compatibly for legacy/synthetic/mean-only data.
+
+    Returns:
+        tuple of (Series, excluded_bucket_count)
+    """
+    return clean_series_from_stats(rows, is_valid_co2_value, kind="mean")
+
+
+def temperature_series_from_stats(rows: list[dict]) -> tuple[Series, int]:
+    """Convert recorder statistics rows to {epoch_seconds: mean_value} for temperature (-90..80 °C)."""
+    return clean_series_from_stats(rows, is_valid_temperature_value, kind="mean")
+
+
+def humidity_series_from_stats(rows: list[dict]) -> tuple[Series, int]:
+    """Convert recorder statistics rows to {epoch_seconds: mean_value} for humidity (0..100%)."""
+    return clean_series_from_stats(rows, is_valid_humidity_value, kind="mean")
+
+
+def heating_power_series_from_stats(rows: list[dict]) -> tuple[Series, int]:
+    """Convert recorder statistics rows to {epoch_seconds: mean_value} for heating power (0..100%)."""
+    return clean_series_from_stats(rows, is_valid_heating_demand_value, kind="mean")
 
 
 def linear_fit(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
@@ -1009,9 +1163,8 @@ def night_taus(
             ]
         if heating is not None and expected_hours:
             h_vals = [heating[ts] for ts in expected_hours if ts in heating]
-            # Missing heating observations are not evidence that the radiator
-            # stayed off. Require at least 80% coverage when configured.
-            if len(h_vals) / len(expected_hours) < 0.8 or max(h_vals) > TAU_MAX_HEATING_PCT:
+            # Missing/rejected demand cannot establish a free cooldown.
+            if len(h_vals) != len(expected_hours) or max(h_vals) > TAU_MAX_HEATING_PCT:
                 continue
         if any(ts not in outdoor for ts in hours):
             continue
@@ -1112,26 +1265,49 @@ def air_change_rate(
     reported. Measured in one room and used as a whole-home infiltration
     proxy - a reasonable ballpark, not an exact whole-flat measurement.
     """
-    items = sorted((ts, v) for ts, v in co2.items() if _local(ts, tz).date() >= since)
-    if len(items) < 2:
+    if outdoor_baseline_ppm is not None:
+        if not is_valid_co2_value(outdoor_baseline_ppm):
+            return None
+        baseline = float(outdoor_baseline_ppm)
+    else:
+        valid_values = [
+            float(v)
+            for ts, v in co2.items()
+            if _local(ts, tz).date() >= since and is_valid_co2_value(v)
+        ]
+        if len(valid_values) < 2:
+            return None
+        baseline = _percentile(valid_values, CO2_BASELINE_PCT)
+        if not is_valid_co2_value(baseline):
+            return None
+
+    raw_items = sorted((ts, v) for ts, v in co2.items() if _local(ts, tz).date() >= since)
+    if len(raw_items) < 2:
         return None
-    baseline = (
-        outdoor_baseline_ppm
-        if outdoor_baseline_ppm is not None
-        else _percentile([v for _, v in items], CO2_BASELINE_PCT)
-    )
+
+    # Coerce valid entries to float, preserving invalid items as barriers (None)
+    items: list[tuple[int, float | None]] = [
+        (ts, float(v) if is_valid_co2_value(v) else None)
+        for ts, v in raw_items
+    ]
 
     fits = []
     i, n = 0, len(items)
     while i < n - 1:
+        if items[i][1] is None:
+            i += 1
+            continue
         j = i
         while (
             j + 1 < n
+            and items[j + 1][1] is not None
             and items[j + 1][0] - items[j][0] <= CO2_MAX_GAP_S
             and items[j + 1][1] <= items[j][1] + 2  # tolerate small sensor noise
         ):
             j += 1
-        window = items[i : j + 1]
+        window: list[tuple[int, float]] = [
+            (ts, v) for ts, v in items[i : j + 1] if v is not None
+        ]
         i = j if j > i else i + 1
         if (window[-1][0] - window[0][0]) / 3600 < CO2_MIN_WINDOW_H:
             continue
@@ -1183,43 +1359,63 @@ def compute_all(
     invalid_heating_power = set(heating_power_issues)
     room_temp: dict[str, Series] = {}
     room_heat: dict[str, Series] = {}
+    numeric_issues: dict[str, str] = {}
+
+    def ingest(source_id, validator, label, kind="mean") -> Series:
+        if not source_id:
+            return {}
+        values, rejected = clean_series_from_stats(
+            stats.get(source_id, []), validator, kind
+        )
+        if rejected:
+            numeric_issues[source_id] = (
+                f"{rejected} historical {label} bucket(s) were invalid or "
+                "outside the analysis range and were ignored"
+            )
+        return values
+
     for name, spec in room_confs.items():
         temp_entity = spec.get("temperature")
-        room_temp[name] = series_from_stats(
-            stats.get(temp_entity, []), "mean"
-        ) if temp_entity else {}
+        room_temp[name] = ingest(temp_entity, is_valid_temperature_value, "temperature")
+        # Humidity is currently contextual rather than a model regressor, but
+        # expose source quality even when no loft ratio can be calculated.
+        ingest(spec.get("humidity"), is_valid_humidity_value, "humidity")
         heating_entity = spec.get("heating_power")
         if heating_entity:
             if heating_entity in invalid_heating_power:
                 room_heat[name] = {}
                 continue
-            heating_history = series_from_stats(
-                stats.get(heating_entity, []), "mean"
+            room_heat[name], invalid_points = heating_power_series_from_stats(
+                stats.get(heating_entity, [])
             )
-            room_heat[name] = {
-                ts: value
-                for ts, value in heating_history.items()
-                if isfinite(value) and 0.0 <= value <= 100.0
-            }
-            invalid_points = len(heating_history) - len(room_heat[name])
             if invalid_points:
                 heating_power_issues[heating_entity] = (
                     f"{invalid_points} historical observation(s) were outside "
                     "the finite 0-100% range and were ignored"
                 )
-    outdoor = series_from_stats(stats.get(conf["outdoor"], []), "mean") if conf.get("outdoor") else {}
+                numeric_issues[heating_entity] = heating_power_issues[heating_entity]
+    outdoor = ingest(conf.get("outdoor"), is_valid_temperature_value, "temperature")
+    loft_values = ingest(conf.get("loft"), is_valid_temperature_value, "temperature")
+    loft_humidity = ingest(conf.get("loft_humidity"), is_valid_humidity_value, "humidity")
     all_rooms = list(room_temp.values())
 
     result: dict = {
         "rooms": {},
+        "source_issues": numeric_issues,
         "heating_power_issues": heating_power_issues,
         "invalid_heating_power_entities": dict(
             conf.get("invalid_heating_power_entities") or {}
         ),
     }
 
-    gas = series_from_stats(stats.get(conf["gas_meter"], []), "sum") if conf.get("gas_meter") else {}
-    water = series_from_stats(stats.get(conf["water"], []), "sum") if conf.get("water") else {}
+    # Recorder sums can have large or negative baseline offsets. Validate
+    # finiteness here; physical plausibility belongs to the existing delta gates.
+    finite_meter = lambda value: is_valid_numeric_value(value, -float("inf"), float("inf"))
+    gas = ingest(conf.get("gas_meter"), finite_meter, "gas", "sum")
+    water = ingest(conf.get("water"), finite_meter, "water", "sum")
+    for role in ("gas_unit_rate", "electricity_unit_rate"):
+        if conf.get(role) is not None and coerce_tariff_rate(conf[role]) is None:
+            numeric_issues[role] = "Tariff must be finite and within 0-10 GBP/kWh"
     q_by_day = daily_gas_kwh(gas, tz)
     dt_by_day = daily_delta_t(all_rooms, outdoor, tz)
     room_source_issues = conf.get("room_source_issues") or {}
@@ -1390,8 +1586,8 @@ def compute_all(
             else baseline["kwh_per_day"] * 365
         )
         result["dhw"]["modelled_annual_kwh"] = annual_kwh
-        gas_rate = conf.get("gas_unit_rate")
-        if gas_rate is not None and isfinite(gas_rate) and gas_rate >= 0:
+        gas_rate = coerce_tariff_rate(conf.get("gas_unit_rate"))
+        if gas_rate is not None:
             result["dhw"]["cost_per_day_gbp"] = baseline["kwh_per_day"] * gas_rate
             result["dhw"]["cost_per_year_gbp"] = annual_kwh * gas_rate
         regression_diagnostics: dict = {}
@@ -1465,8 +1661,8 @@ def compute_all(
                 (yesterday - dhw_latest_day).days if dhw_latest_day else None
             ),
         }
-        gas_rate = conf.get("gas_unit_rate")
-        if gas_rate is not None and isfinite(gas_rate) and gas_rate >= 0:
+        gas_rate = coerce_tariff_rate(conf.get("gas_unit_rate"))
+        if gas_rate is not None:
             for key in ("dhw_kwh_per_day_7d", "space_heating_kwh_per_day_7d"):
                 if usage[key] is not None:
                     usage[key.replace("kwh_per_day", "cost_per_day_gbp")] = (
@@ -1497,7 +1693,7 @@ def compute_all(
         "configured": bool(conf.get("electricity_meter"))
     }
     if conf.get("electricity_meter"):
-        elec = series_from_stats(stats.get(conf["electricity_meter"], []), "sum")
+        elec = ingest(conf.get("electricity_meter"), finite_meter, "electricity", "sum")
         summary = electricity_summary(elec, tz, since_full, current_day)
         if summary:
             elec_daily = summary.pop("daily_kwh")
@@ -1529,8 +1725,8 @@ def compute_all(
             summary["source_lag_days"] = (
                 yesterday - summary["latest_complete_day"]
             ).days
-            elec_rate = conf.get("electricity_unit_rate")
-            if elec_rate is not None and isfinite(elec_rate) and elec_rate >= 0:
+            elec_rate = coerce_tariff_rate(conf.get("electricity_unit_rate"))
+            if elec_rate is not None:
                 summary["cost_per_day_gbp"] = summary["kwh_per_day"] * elec_rate
                 summary["cost_per_year_gbp"] = summary["kwh_per_day"] * elec_rate * 365
                 if summary["last_30d_kwh_per_day"] is not None:
@@ -1722,22 +1918,39 @@ def compute_all(
         configured_co2 = conf["co2"]
         co2_ids = [configured_co2] if isinstance(configured_co2, str) else configured_co2
         outdoor_baseline = conf.get("outdoor_co2_ppm")
+        if outdoor_baseline is not None and not is_valid_co2_value(outdoor_baseline):
+            outdoor_baseline = None
         outdoor_sensor_used = False
         if conf.get("outdoor_co2_sensor"):
-            outdoor_co2 = series_from_stats(
-                stats.get(conf["outdoor_co2_sensor"], []), "mean"
+            outdoor_sensor_id = conf["outdoor_co2_sensor"]
+            outdoor_co2, outdoor_rejected = co2_series_from_stats(
+                stats.get(outdoor_sensor_id, [])
             )
+            if outdoor_rejected:
+                msg = (
+                    f"{outdoor_rejected} historical observation(s) were outside "
+                    "the 300-10000 ppm range and were ignored"
+                )
+                result.setdefault("source_issues", {})[outdoor_sensor_id] = msg
             outdoor_values = [
                 value
                 for ts, value in outdoor_co2.items()
                 if _local(ts, tz).date() >= since_full
             ]
             if outdoor_values:
-                outdoor_baseline = median(outdoor_values)
-                outdoor_sensor_used = True
+                cand_baseline = median(outdoor_values)
+                if is_valid_co2_value(cand_baseline):
+                    outdoor_baseline = cand_baseline
+                    outdoor_sensor_used = True
         ach_fits = []
         for co2_id in co2_ids:
-            co2 = series_from_stats(stats.get(co2_id, []), "mean")
+            co2, co2_rejected = co2_series_from_stats(stats.get(co2_id, []))
+            if co2_rejected:
+                msg = (
+                    f"{co2_rejected} historical observation(s) were outside "
+                    "the 300-10000 ppm range and were ignored"
+                )
+                result.setdefault("source_issues", {})[co2_id] = msg
             fit_for_sensor = air_change_rate(
                 co2, tz, since_full, outdoor_baseline
             )
@@ -1750,6 +1963,7 @@ def compute_all(
                 if outdoor_sensor_used
                 else "configured value"
                 if conf.get("outdoor_co2_ppm") is not None
+                and is_valid_co2_value(conf.get("outdoor_co2_ppm"))
                 else "indoor low-percentile fallback"
             )
             ach_fit["co2_sensors_used"] = ach_fit["sensor_count"]
@@ -1845,18 +2059,15 @@ def compute_all(
     # can't catch it.
     result["loft"] = None
     if conf.get("loft") and not room_source_issues.get("loft", {}).get("temperature"):
-        loft = drop_flatlines(series_from_stats(stats.get(conf["loft"], []), "mean"))
+        loft = drop_flatlines(loft_values)
         loft_since = conf.get("loft_since")
         loft_cutoff = max(since_full, loft_since) if loft_since else since_full
         ratio = loft_ratio(all_rooms, loft, outdoor, tz, loft_cutoff)
         if ratio:
             result["loft"] = ratio | {"window_days": windows_days[-1]}
             if conf.get("loft_humidity"):
-                humidity = series_from_stats(
-                    stats.get(conf["loft_humidity"], []), "mean"
-                )
                 humidity = {
-                    ts: v for ts, v in humidity.items()
+                    ts: v for ts, v in loft_humidity.items()
                     if _local(ts, tz).date() >= loft_cutoff
                 }
                 if humidity:
@@ -2233,7 +2444,7 @@ def build_analysis_status(
     co2_conf = conf.get("co2")
     co2_entities = [co2_conf] if isinstance(co2_conf, str) else (co2_conf or [])
     co2_issue = _check_source_issue(conf, "co2", *co2_entities)
-    if co2_issue:
+    if co2_issue and result.get("air_change_rate") is None:
         ach_stat = {
             "status": "source_problem",
             "reason": co2_issue,

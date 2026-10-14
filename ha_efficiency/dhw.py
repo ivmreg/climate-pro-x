@@ -12,6 +12,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .quality import clean_numeric, is_valid_percentage, is_valid_temperature
+
 DHW_BASELINE_MAX_DT = 3.0
 DHW_BASELINE_MIN_DAYS = 7
 DHW_IDLE_MIN_DAYS = 3
@@ -42,7 +44,7 @@ MAX_METER_GAP = pd.Timedelta("1.5h")
 def hourly_change(cumulative: pd.Series, max_step: float) -> pd.Series:
     """Hourly deltas from a cumulative statistics series, dropping resets
     (negative steps) and implausible artifacts (> max_step)."""
-    cumulative = cumulative.sort_index()
+    cumulative = clean_numeric(cumulative).sort_index()
     diffs = cumulative.diff()
     gaps = cumulative.index.to_series().diff()
     valid = (
@@ -58,7 +60,10 @@ def daily_heating_pct(heating_by_room: dict[str, pd.Series]) -> pd.Series:
     """Daily mean of the busiest room over timestamps covered by every source."""
     if not heating_by_room:
         return pd.Series(dtype=float)
-    common = pd.DataFrame(heating_by_room).dropna(how="any")
+    common = pd.DataFrame({
+        name: clean_numeric(values, is_valid_percentage)
+        for name, values in heating_by_room.items()
+    }).dropna(how="any")
     if common.empty:
         return pd.Series(dtype=float)
     hourly = common.max(axis=1).resample("1h").mean()
@@ -105,7 +110,10 @@ def dhw_baseline(
     """
     if heating_off is None:
         heating_off = heating_off_days(dt_daily)
-    df = pd.DataFrame({"q": q_daily, "outdoor": outdoor_daily}).dropna()
+    df = pd.DataFrame({
+        "q": clean_numeric(q_daily),
+        "outdoor": clean_numeric(outdoor_daily, is_valid_temperature),
+    }).dropna()
     df = df[df.index.isin(list(heating_off))]
     away_index = pd.Index([])
     if water_daily is not None:

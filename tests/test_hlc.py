@@ -57,7 +57,11 @@ def test_cli_hlc_applies_measured_heating_off_days(monkeypatch):
         "outdoor_entity": "sensor.outdoor",
         "gas_kwh_entity": "sensor.gas",
     })
-    monkeypatch.setattr(cli.store, "load_resampled", lambda _entity: pd.Series(dtype=float))
+    def load_temperature(_entity, *, validator):
+        assert validator(20) and validator(-20) and not validator(99999)
+        return pd.Series(dtype=float)
+
+    monkeypatch.setattr(cli.store, "load_resampled", load_temperature)
     monkeypatch.setattr(cli.store, "load", lambda _entity: pd.Series(dtype=float))
     monkeypatch.setattr(cli, "_room_series", lambda _cfg, _role: {"room": pd.Series(dtype=float)})
     monkeypatch.setattr(cli.hlc, "daily_delta_t", lambda _rooms, _outdoor: pd.Series(dtype=float))

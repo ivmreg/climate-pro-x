@@ -326,12 +326,25 @@ def load(entity_id: str, *, source: str | None = None) -> pd.Series | None:
     return result
 
 
-def load_resampled(entity_id: str, freq: str = "5min") -> pd.Series | None:
-    """Load and put on a regular grid with a bounded forward fill."""
+def load_resampled(entity_id: str, freq: str = "5min", *, validator=None) -> pd.Series | None:
+    """Resample cached data; role-validated model inputs are never filled.
+
+    A bucket containing an invalid raw sample stays missing even if its mean
+    would be plausible. The default retains legacy bounded filling for callers
+    explicitly requesting an untyped display series.
+    """
     series = load(entity_id)
     if series is None or series.empty:
         return None
     attrs = dict(series.attrs)
+    if validator is not None:
+        from .quality import clean_numeric
+        valid = series.map(validator)
+        result = clean_numeric(series, validator).resample(freq).mean()
+        contaminated = (~valid).resample(freq).max().reindex(result.index).fillna(False)
+        result = result.mask(contaminated.astype(bool))
+        result.attrs.update(attrs)
+        return result
     result = series.resample(freq).mean().ffill(
         limit=int(pd.Timedelta("2h") / pd.Timedelta(freq))
     )

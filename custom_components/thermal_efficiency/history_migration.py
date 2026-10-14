@@ -48,6 +48,22 @@ async def committed(hass):
     await future
 
 
+def comparable_analysis(result, original_by_owned):
+    """Compare source-quality evidence using original IDs after preservation.
+
+    Only diagnostic keys change with the archive ID; model values and all
+    diagnostic messages must still match exactly.
+    """
+    normalized = dict(result)
+    for key in ("source_issues", "heating_power_issues", "invalid_heating_power_entities"):
+        if key in normalized:
+            normalized[key] = {
+                original_by_owned.get(source_id, source_id): issue
+                for source_id, issue in normalized[key].items()
+            }
+    return normalized
+
+
 def serializable(value):
     if isinstance(value, datetime):
         return value.isoformat()
@@ -399,7 +415,7 @@ class HistoryMigrator:
         sources = migration["sources"]
         ids = set(sources) | {record["statistic_id"] for record in sources.values()}
         stats = await get_instance(self.hass).async_add_executor_job(
-            statistics_during_period, self.hass, start, cutoff, ids, "hour", units, {"mean", "sum"}
+            statistics_during_period, self.hass, start, cutoff, ids, "hour", units, {"mean", "sum", "min", "max"}
         )
         original = {sid: stats.get(sid, []) for sid in sources}
         owned = {record["statistic_id"]: stats.get(record["statistic_id"], []) for record in sources.values()}
@@ -430,7 +446,8 @@ class HistoryMigrator:
         preserved = await self.hass.async_add_executor_job(
             compute_all, owned, owned_config, dt_util.get_default_time_zone(), cutoff, (days,)
         )
-        if baseline != preserved:
+        original_by_owned = {record["statistic_id"]: sid for sid, record in sources.items()}
+        if baseline != comparable_analysis(preserved, original_by_owned):
             raise ValueError("Preserved history changed fixed-date analysis")
         migration["parity_verified"] = True
         await self.save()

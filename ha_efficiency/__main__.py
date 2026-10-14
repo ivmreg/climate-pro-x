@@ -12,6 +12,7 @@ import yaml
 
 from . import cooling, dhw, discover, hlc, loft, store, ventilation
 from .client import HAClient
+from .quality import is_valid_percentage, is_valid_temperature
 
 
 def load_config() -> dict:
@@ -82,7 +83,9 @@ def _room_series(cfg: dict, key: str) -> dict[str, pd.Series]:
     for room, spec in cfg["rooms"].items():
         eid = spec.get(key)
         if eid:
-            s = store.load_resampled(eid)
+            s = store.load_resampled(
+                eid, validator=is_valid_temperature if key == "temperature" else is_valid_percentage
+            )
             if s is not None:
                 out[room] = s
     return out
@@ -90,7 +93,7 @@ def _room_series(cfg: dict, key: str) -> dict[str, pd.Series]:
 
 def cmd_cooling(args) -> None:
     cfg = load_config()
-    outdoor = store.load_resampled(cfg["outdoor_entity"])
+    outdoor = store.load_resampled(cfg["outdoor_entity"], validator=is_valid_temperature)
     if outdoor is None:
         sys.exit("No outdoor data cached — run `pull` first.")
     temps = _room_series(cfg, "temperature")
@@ -118,7 +121,7 @@ def cmd_cooling(args) -> None:
 
 def cmd_hlc(args) -> None:
     cfg = load_config()
-    outdoor = store.load_resampled(cfg["outdoor_entity"])
+    outdoor = store.load_resampled(cfg["outdoor_entity"], validator=is_valid_temperature)
     temps = _room_series(cfg, "temperature")
     if outdoor is None or not temps:
         sys.exit("Missing cached data — run `pull` first.")
@@ -194,8 +197,8 @@ def _plot_hlc(result: dict) -> None:
 
 def cmd_loft(args) -> None:
     cfg = load_config()
-    outdoor = store.load_resampled(cfg["outdoor_entity"])
-    loft_series = store.load_resampled(cfg["loft_entity"])
+    outdoor = store.load_resampled(cfg["outdoor_entity"], validator=is_valid_temperature)
+    loft_series = store.load_resampled(cfg["loft_entity"], validator=is_valid_temperature)
     temps = _room_series(cfg, "temperature")
     if outdoor is None or loft_series is None or not temps:
         sys.exit("Missing cached data — run `pull` first (and set loft_entity).")
@@ -210,7 +213,7 @@ def cmd_loft(args) -> None:
 
 def _gas_daily_inputs(cfg: dict) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """(q_daily, dt_daily, outdoor_daily, gas) shared by ventilation/dhw."""
-    outdoor = store.load_resampled(cfg["outdoor_entity"])
+    outdoor = store.load_resampled(cfg["outdoor_entity"], validator=is_valid_temperature)
     temps = _room_series(cfg, "temperature")
     gas_entity = cfg.get("gas_kwh_entity")
     if outdoor is None or not temps or not gas_entity:
