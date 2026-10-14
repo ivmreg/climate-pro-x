@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from .quality import clean_numeric, is_valid_temperature
+
 
 def loft_ratio(
     indoor_by_room: dict[str, pd.Series],
@@ -24,9 +26,14 @@ def loft_ratio(
     if not indoor_by_room:
         indoor = pd.Series(dtype=float)
     else:
-        indoor = pd.DataFrame(indoor_by_room).dropna().mean(axis=1)
+        indoor = pd.DataFrame({
+            name: clean_numeric(values, is_valid_temperature)
+            for name, values in indoor_by_room.items()
+        }).dropna().mean(axis=1)
     df = pd.DataFrame(
-        {"in": indoor, "loft": loft, "out": outdoor}
+        {"in": indoor,
+         "loft": clean_numeric(loft, is_valid_temperature),
+         "out": clean_numeric(outdoor, is_valid_temperature)}
     ).dropna()
     dt = df["in"] - df["out"]
     # Only cold, steady periods: night hours with a real gradient, so sun on

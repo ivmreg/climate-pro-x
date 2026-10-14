@@ -213,7 +213,7 @@ and manually deleting owned statistics removes those live records.
   hot-water metrics can continue learning from summer.
 - `sensor.thermal_efficiency_<room>_time_constant` — median effective overnight
   cooling τ in hours; nights require continuous temperature data and at least
-  80% heating-power coverage when that source is configured.
+  complete heating-power coverage when that source is configured.
 - `sensor.thermal_efficiency_loft_ratio` — ceiling-vs-roof loss split from
   cold nights; robust to flatlined (dead-battery) sensors, plus a
   `humidity_pct` attribute if the Loft room has a humidity source. The 0.7
@@ -264,6 +264,27 @@ and manually deleting owned statistics removes those live records.
   between modelled ventilation and fabric components (needs `co2`,
   `floor_area_m2`, `ceiling_height_m` and explicit experimental opt-in). It
   describes estimated components and does not select a retrofit.
+  *CO₂ Robustness:* Analysis applies a broad 300..10000 ppm acceptance policy
+  (analytics suitability, not universal physical/safety limits). Hourly buckets
+  with contaminated extrema (e.g. sentinel spikes) or invalid values are excluded,
+  preserving legitimate sustained high curves (5000–10000 ppm). Missing or excluded
+  hours are never interpolated or bridged into decay fits. Exclusions are reported
+  through `source_issues` diagnostics, and original Home Assistant sensor history
+  remains completely untouched.
+
+  Temperature, humidity and heating-demand inputs receive the same checks on
+  both their hourly means and any recorded minima/maxima. Broad analysis limits
+  are **−90 to 80°C**, **0–100% humidity/demand**, **300–10,000 ppm CO₂**, and
+  **0–10 GBP/kWh** for tariffs after unit conversion. These are analysis policies,
+  not safety thresholds. Bad live temperature samples become missing before
+  Climate-x records them; archived extrema remain available for validation.
+  Cooling fits cannot cross missing temperature data or assume heating was off
+  during missing demand observations. Offline model inputs are validated before
+  resampling and are not forward-filled. Cumulative meter totals have no absolute
+  ceiling: existing continuity, reset and consumption-step checks reject bad
+  deltas while allowing large totals and recorder baseline offsets. Excluded
+  buckets appear in source diagnostics; clean periods and other inputs remain
+  usable. Existing Home Assistant source data is not rewritten.
 
 ### Install
 

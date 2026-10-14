@@ -24,6 +24,8 @@ from homeassistant.util.unit_conversion import (
     VolumeConverter,
 )
 
+from .thermal_math import coerce_tariff_rate
+
 _LOGGER = logging.getLogger(__name__)
 
 CO2_UNITS = {"ppm"}
@@ -80,6 +82,21 @@ def is_tariff_unit(unit: Any) -> bool:
         return False
     norm = unit.strip().casefold().replace(" ", "")
     return norm in TARIFF_UNITS
+
+
+def normalized_tariff_rate(value: Any, unit: Any) -> float | None:
+    """Validate a supported live tariff after conversion to GBP/kWh."""
+    if not is_tariff_unit(unit):
+        return None
+    normalized = unit.strip().casefold().replace(" ", "")
+    divisor = 100.0 if normalized in {"p/kwh", "pence/kwh"} else (
+        1000.0 if normalized in {"gbp/mwh", "£/mwh"} else 1.0
+    )
+    try:
+        rate = float(value) / divisor
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return coerce_tariff_rate(rate)
 
 
 def _metadata_has_mean(metadata: dict[str, Any]) -> bool | None:
@@ -247,12 +264,8 @@ def validate_source_metadata_and_state(
             if state_unit is not None and not is_tariff_unit(state_unit):
                 return ("incompatible_unit", f"Tariff {entity_or_stat_id} has unsupported unit '{state_unit}'")
             if state.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
-                try:
-                    val = float(state.state)
-                except (ValueError, TypeError):
-                    return ("invalid_tariff", f"Tariff {entity_or_stat_id} state is not numeric")
-                if not isfinite(val) or val < 0.0:
-                    return ("invalid_tariff", f"Tariff {entity_or_stat_id} rate must be a finite non-negative number")
+                if normalized_tariff_rate(state.state, state_unit) is None:
+                    return ("invalid_tariff", f"Tariff {entity_or_stat_id} must normalize to a finite rate within 0-10 GBP/kWh")
         return (None, None)
 
     if role == "heating_power":

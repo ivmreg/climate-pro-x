@@ -39,6 +39,7 @@ from .const import (
     ROOM_TYPE_LOFT,
 )
 from .history_migration import HistoryMigrator, migration_manifest
+from .thermal_math import is_valid_temperature_value
 
 
 @dataclass(slots=True)
@@ -60,12 +61,14 @@ def observation(state, role):
         unit = state.attributes.get("unit_of_measurement")
         if role == "temperature":
             value = TemperatureConverter.convert(value, unit, "°C")
+            if not is_valid_temperature_value(value):
+                return None
         else:
             norm_unit = unit.strip().casefold() if isinstance(unit, str) else None
             if norm_unit not in {"%", "percent", "percentage"} or not 0 <= value <= 100:
                 return None
         return value if isfinite(value) else None
-    except (ValueError, TypeError, HomeAssistantError):
+    except (ValueError, TypeError, OverflowError, HomeAssistantError):
         return None
 
 

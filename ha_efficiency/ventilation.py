@@ -25,38 +25,87 @@ AIR_HEAT_CAPACITY = 0.335  # Wh/(m3*K), volumetric heat capacity of air
 MIN_ACH = 0.05
 MAX_ACH = 3.0
 
+# Broad CO2 analysis acceptance bounds (analytics suitability policy, not universal physical/safety limits)
+CO2_MIN_PPM = 300.0
+CO2_MAX_PPM = 10000.0
+
+
+def is_valid_co2_value(val: object) -> bool:
+    """Accept broad analytics suitability bounds 300..10000 ppm inclusive.
+
+    Analytics suitability policy, NOT universal physical or safety limits.
+    Rejects non-finite, NaN, Inf, negative, zero, and out-of-bounds sentinels.
+    """
+    if val is None:
+        return False
+    try:
+        v = float(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return np.isfinite(v) and CO2_MIN_PPM <= v <= CO2_MAX_PPM
+
 
 def air_change_rate(
     co2: pd.Series, outdoor_baseline_ppm: float | None = None
 ) -> dict | None:
     """Median air-change rate (1/h) from CO2 decay curves; see module
     docstring for the model."""
-    co2 = co2.dropna().sort_index()
+    if outdoor_baseline_ppm is not None:
+        if not is_valid_co2_value(outdoor_baseline_ppm):
+            return None
+        baseline = float(outdoor_baseline_ppm)
+    else:
+        valid_vals = [
+            float(v)
+            for v in co2.dropna().values
+            if is_valid_co2_value(v)
+        ]
+        if len(valid_vals) < 2:
+            return None
+        baseline = float(pd.Series(valid_vals).quantile(CO2_BASELINE_PCT))
+        if not is_valid_co2_value(baseline):
+            return None
+
+    co2 = co2.sort_index()
     if len(co2) < 2:
         return None
-    baseline = (
-        float(outdoor_baseline_ppm)
-        if outdoor_baseline_ppm is not None
-        else float(co2.quantile(CO2_BASELINE_PCT))
-    )
 
-    times, values = co2.index, co2.values
+    times = co2.index
+    # Coerce valid entries to float, preserving invalid items as barriers (None)
+    values: list[float | None] = [
+        float(v) if is_valid_co2_value(v) else None
+        for v in co2.values
+    ]
     n = len(co2)
     fits = []
     i = 0
     while i < n - 1:
+        if values[i] is None:
+            i += 1
+            continue
         j = i
         while (
             j + 1 < n
+            and values[j + 1] is not None
             and times[j + 1] - times[j] <= CO2_MAX_GAP
             and values[j + 1] <= values[j] + 2  # tolerate small sensor noise
         ):
             j += 1
         window_hours = (times[j] - times[i]).total_seconds() / 3600
-        if window_hours >= CO2_MIN_WINDOW_H and values[i] - baseline >= CO2_MIN_DROP_PPM:
-            excess = values[i : j + 1] - baseline
+        val_i = values[i]
+        val_j = values[j]
+        if (
+            val_i is not None
+            and val_j is not None
+            and window_hours >= CO2_MIN_WINDOW_H
+            and val_i - baseline >= CO2_MIN_DROP_PPM
+        ):
+            window_vals = np.array(values[i : j + 1], dtype=float)
+            excess = window_vals - baseline
             if (excess > 0).all():
-                t = (times[i : j + 1] - times[i]).total_seconds() / 3600
+                t = np.array(
+                    [(times[k] - times[i]).total_seconds() / 3600 for k in range(i, j + 1)]
+                )
                 y = np.log(excess)
                 slope, intercept = np.polyfit(t, y, 1)
                 pred = slope * t + intercept
