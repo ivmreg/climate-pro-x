@@ -1,9 +1,12 @@
 .env
 .venv/
+.venv-test-*/
 data/
 output/
 config.yaml
 __pycache__/
 *.pyc
 .coverage
+coverage.json
+pytest.xml
 .pytest_cache/

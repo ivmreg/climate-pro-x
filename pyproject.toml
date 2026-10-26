@@ -1,6 +1,6 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-addopts = "-ra --strict-config --strict-markers --cov=ha_efficiency.cooling --cov=ha_efficiency.dhw --cov=ha_efficiency.hlc --cov=ha_efficiency.loft --cov=ha_efficiency.store --cov=ha_efficiency.ventilation --cov=custom_components --cov-branch --cov-report=term-missing"
+addopts = "-ra --strict-config --strict-markers --cov=ha_efficiency.cooling --cov=ha_efficiency.dhw --cov=ha_efficiency.evidence --cov=ha_efficiency.hlc --cov=ha_efficiency.loft --cov=ha_efficiency.store --cov=ha_efficiency.ventilation --cov=custom_components --cov-branch --cov-report=term-missing"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 from datetime import timedelta
+from time import perf_counter
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
@@ -56,6 +59,21 @@ from .validation import (
 from .history import RoomHistoryManager
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _evidence_fingerprints(conf: dict, evidence: dict) -> tuple[str, str]:
+    """Hash a private configuration and anonymous evidence away from the loop."""
+    configuration_fingerprint = hashlib.sha256(
+        json.dumps(conf, sort_keys=True, default=str).encode()
+    ).hexdigest()
+    identity_fields = {
+        key: value for key, value in evidence.items()
+        if key not in {"performance", "evidence_id"}
+    }
+    identity_fields["configuration_fingerprint"] = configuration_fingerprint
+    return configuration_fingerprint, hashlib.sha256(
+        json.dumps(identity_fields, sort_keys=True, default=str).encode()
+    ).hexdigest()
 
 
 class ThermalCoordinator(DataUpdateCoordinator[dict]):
@@ -125,6 +143,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         )
 
     async def _async_update_data(self) -> dict:
+        started = perf_counter()
         max_days = self.conf[CONF_MAX_WINDOW_DAYS]
         windows = (
             tuple(d for d in EXPANDING_WINDOWS_DAYS if d < max_days)
@@ -134,6 +153,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         all_statistic_ids = self._statistic_ids()
 
         metadata = await async_fetch_recorder_metadata(self.hass, all_statistic_ids)
+        metadata_seconds = perf_counter() - started
         source_issues: dict[str, str] = {}
         source_health: dict[str, str] = {}
         unsuitable_ids: set[str] = set()
@@ -270,6 +290,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         # the shared recorder converter from one malformed optional source.
         valid_statistic_ids = all_statistic_ids - unsuitable_ids
 
+        query_started = perf_counter()
         stats = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
@@ -286,9 +307,11 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             },
             {"mean", "sum", "min", "max"},
         )
+        query_seconds = perf_counter() - query_started
         # compute_all is pure CPU and takes ~1s on a full season of hourly
         # statistics, so it must not run on the event loop. Tariffs are read
         computation_stats = stats
+        composition_started = perf_counter()
         if self.history:
             computation_stats, prepared = await self.history.async_prepare(
                 stats, self.conf, dt_util.get_default_time_zone()
@@ -297,6 +320,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         else:
             prepared = analysis_configuration(self.conf)
             room_conf = prepared[CONF_ROOMS]
+        composition_seconds = perf_counter() - composition_started
 
         # history.prepare composes archived and synthetic aliases after the
         # recorder query. Remove aliases for invalid sources again here so an
@@ -322,6 +346,8 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             issue = invalid_heating_power[entity_id]
             _LOGGER.warning("Ignoring invalid heating-power source: %s", issue)
         conf = {
+            "history_revision": prepared.get("history_revision"),
+            "history_schema_version": prepared.get("history_schema_version"),
             "rooms": room_conf,
             "excluded_model_days": prepared.get("excluded_model_days", []),
             "outdoor": self.conf[CONF_OUTDOOR],
@@ -357,6 +383,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             "room_source_issues": room_source_issues,
             "source_issues": source_issues,
         }
+        computation_started = perf_counter()
         result = await self.hass.async_add_executor_job(
             thermal_math.compute_all,
             computation_stats,
@@ -368,5 +395,27 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
 
         result["source_issues"] = {**result.get("source_issues", {}), **source_issues}
         result["source_health"] = source_health
+        # Hash the complete effective configuration, but never export source IDs.
+        # This detects changed mappings/parameters without placing them in the
+        # downloadable, anonymous calculation evidence.
+        evidence = result.get("analysis_evidence")
+        if isinstance(evidence, dict):
+            evidence["history_schema_version"] = prepared.get("history_schema_version")
+            evidence["performance"] = {
+                "metadata_seconds": round(metadata_seconds, 6),
+                "recorder_query_seconds": round(query_seconds, 6),
+                "composition_seconds": round(composition_seconds, 6),
+                "calculation_seconds": round(perf_counter() - computation_started, 6),
+                "total_seconds": round(perf_counter() - started, 6),
+                "requested_statistics": len(valid_statistic_ids),
+                "returned_rows": sum(len(rows) for rows in stats.values()),
+            }
+            # Stable across serialization and independent of wall-clock timings.
+            fingerprint, evidence_id = await self.hass.async_add_executor_job(
+                _evidence_fingerprints, conf, evidence
+            )
+            evidence["configuration_fingerprint"] = fingerprint
+            evidence["evidence_id"] = evidence_id
+            evidence["performance"]["total_seconds"] = round(perf_counter() - started, 6)
 
         return result

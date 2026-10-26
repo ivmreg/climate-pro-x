@@ -160,6 +160,18 @@ def test_checked_in_dashboards_match_mapping_byte_for_byte():
     yaml.safe_load(live)
 
 
+@pytest.mark.parametrize("status", ["source_problem", "collecting", "historical_baseline_held"])
+def test_interpretation_does_not_claim_current_fabric_dominance_with_unready_loss(tmp_path, status):
+    text, _ = generate_dashboards(_write_mapping(tmp_path, _make_valid_mapping(1)))
+    card = _find_card(yaml.safe_load(text), title="Interpretation")
+    rendered = Environment().from_string(card["content"]).render(
+        states=lambda entity: "300" if "fabric" in entity else "10",
+        state_attr=lambda entity, key: status if key == "status" else None,
+    )
+    assert "predominantly fabric heat transfer" not in rendered
+    assert ("not ready" in rendered) or ("held historical heating baseline" in rendered)
+
+
 def test_entity_mapping_and_name_validation():
     validate_entity_id("sensor.room_temperature", "test")
     with pytest.raises(ValueError, match="Invalid entity ID"):

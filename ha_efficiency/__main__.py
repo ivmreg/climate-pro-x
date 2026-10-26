@@ -12,6 +12,7 @@ import yaml
 
 from . import cooling, dhw, discover, hlc, loft, store, ventilation
 from .client import HAClient
+from .evidence import main as replay_evidence
 from .quality import is_valid_percentage, is_valid_temperature
 
 
@@ -462,6 +463,8 @@ def main() -> None:
     p_audit.add_argument("--max-step", type=float, default=40.0)
     p_audit.add_argument("--repair", action="store_true")
     p_audit.add_argument("--source", default="legacy")
+    p_replay = sub.add_parser("replay-evidence", help="independently replay an exported HLC evidence bundle offline")
+    p_replay.add_argument("path", type=Path)
     args = parser.parse_args()
     {
         "discover": lambda a: discover.run(),
@@ -472,6 +475,7 @@ def main() -> None:
         "ventilation": cmd_ventilation,
         "dhw": cmd_dhw,
         "cache-audit": cmd_cache_audit,
+        "replay-evidence": lambda a: replay_evidence([str(a.path)]),
     }[args.command](args)
 
 

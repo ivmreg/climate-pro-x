@@ -26,6 +26,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Install test dependencies
         run: |
           python -m pip install -r requirements-dev.txt
@@ -34,6 +37,8 @@ jobs:
         run: python -m pytest --cov-report=json:coverage.json --junitxml=pytest.xml
       - name: Enforce live core branch and combined coverage gate
         run: python scripts/check_coverage.py --report coverage.json
+      - name: Check glance-card evidence states
+        run: node --test tests/test_glance_card.mjs
       - name: Save test evidence
         if: always()
         uses: actions/upload-artifact@v4

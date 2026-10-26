@@ -22,14 +22,76 @@ from .coordinator import ThermalCoordinator
 from .thermal_math import TAU_MIN_NIGHTS
 
 
+def _analysis_status(coordinator: ThermalCoordinator, metric: str) -> dict:
+    """Return the canonical calculated readiness for one metric."""
+    status_map = coordinator.data.get("analysis_status", {})
+    status = status_map.get(metric, {}) if isinstance(status_map, dict) else {}
+    return status if isinstance(status, dict) else {}
+
+
+def _status_attributes(status_info: dict, fallback_status: str | None = None) -> dict:
+    """Expose compact readiness beside a value without exporting model evidence."""
+    attrs = {
+        "status": status_info.get("status", fallback_status),
+        "reason": status_info.get("reason"),
+        "next_action": status_info.get("next_action"),
+    }
+    for key in (
+        "latest_source_day",
+        "raw_latest_source_day",
+        "latest_temperature_day",
+        "raw_latest_temperature_day",
+        "latest_heating_day",
+        "latest_demand_day",
+        "temperature_source_lag_days",
+        "latest_eligible_day",
+        "source_lag_days",
+        "eligible_source_lag_days",
+        "model_data_through",
+        "model_data_from",
+        "raw_complete_gas_days",
+        "raw_complete_temperature_days",
+        "eligible_observations",
+        "exclusion_counts",
+        "excluded_day_count",
+        "excluded_observation_count",
+        "excluded_dates_count",
+        "excluded_observations_count",
+        "excluded_dates_by_reason",
+        "sensor_count",
+        "temperature_sensor_count",
+        "heating_sensor_count",
+        "sensor_counts",
+        "candidate_nights",
+        "rejected_nights",
+        "rejection_counts",
+        "first_night",
+        "last_night",
+        "tau_q1_h",
+        "tau_q3_h",
+        "usable_observations",
+        "required_observations",
+        "dependencies",
+        "dependency_status",
+    ):
+        if key in status_info:
+            attrs[key] = status_info[key]
+    return attrs
+
+
 def _electricity_unavailable_attributes(coordinator: ThermalCoordinator) -> dict:
     status = coordinator.data.get("electricity_status", {})
+    analysis = _analysis_status(coordinator, "electricity")
     if not status.get("configured"):
-        return {"note": "electricity meter is not configured"}
+        return {
+            "note": "electricity meter is not configured",
+            **_status_attributes(analysis, "not_configured"),
+        }
     return {
         "note": "not enough complete hourly electricity statistics",
         "usable_days": status.get("usable_days", 0),
         "required_days": status.get("required_days", 14),
+        **_status_attributes(analysis, "collecting"),
     }
 
 async def async_setup_entry(
@@ -92,22 +154,21 @@ class HlcSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         fit = self.coordinator.data.get("hlc")
-        status_info = self.coordinator.data.get("analysis_status", {}).get("hlc", {})
+        status_info = _analysis_status(self.coordinator, "hlc")
         if not fit:
             return {
                 "scope": "whole_home",
-                "status": status_info.get("status", "collecting"),
+                **_status_attributes(status_info, "collecting"),
                 "note": status_info.get("reason") or (
                     "not enough qualifying heating days; the fit needs complete "
                     "gas and indoor/outdoor temperature data with sustained temperature "
                     "difference and a positive, credible regression"
                 ),
-                "next_action": status_info.get("next_action"),
             }
-        return {
+        attrs = {
             "scope": "whole_home",
             "rating": "not benchmarked; building type and floor area context required",
-            "status": status_info.get("status") or fit.get("status", "provisional"),
+            **_status_attributes(status_info, fit.get("status", "provisional")),
             "latest_source_day": status_info.get("latest_source_day"),
             "source_lag_days": status_info.get("source_lag_days"),
             "r_squared": round(fit["r_squared"], 3),
@@ -165,7 +226,40 @@ class HlcSensor(ThermalSensor):
                 else "not applied - configure a gas meter and enough summer "
                      "(heating-off) days to estimate a DHW baseline"
             ),
+            "confidence_interval_note": (
+                "conditional regression interval; it does not include uncertainty "
+                "in boiler efficiency, meter or sensor calibration, DHW attribution, "
+                "or how representative the selected rooms are"
+            ),
         }
+        sensitivity = status_info.get("boiler_efficiency_sensitivity") or fit.get(
+            "boiler_efficiency_sensitivity"
+        )
+        if not sensitivity:
+            evidence = self.coordinator.data.get("analysis_evidence", {})
+            metrics = evidence.get("metrics", {}) if isinstance(evidence, dict) else {}
+            evidence_hlc = metrics.get("hlc", {}) if isinstance(metrics, dict) else {}
+            sensitivity = (
+                evidence_hlc.get("boiler_efficiency_sensitivity")
+                if isinstance(evidence_hlc, dict)
+                else None
+            )
+        if isinstance(sensitivity, dict):
+            attrs["boiler_efficiency_sensitivity"] = {
+                key: sensitivity.get(key)
+                for key in (
+                    "low_efficiency",
+                    "high_efficiency",
+                    "low_hlc_w_per_k",
+                    "high_hlc_w_per_k",
+                    "delta_low_w_per_k",
+                    "delta_high_w_per_k",
+                    "bounds",
+                    "efficiency_bounds",
+                )
+                if key in sensitivity
+            }
+        return attrs
 
 
 class LoftSensor(ThermalSensor):
@@ -182,8 +276,10 @@ class LoftSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         fit = self.coordinator.data.get("loft")
+        status_info = _analysis_status(self.coordinator, "loft")
         if not fit:
             return {
+                **_status_attributes(status_info, "collecting"),
                 "note": "not enough valid cold-night overlap; indoor, loft and "
                 "outdoor sensors must all report while the indoor-outdoor "
                 "temperature difference is large enough",
@@ -196,6 +292,7 @@ class LoftSensor(ThermalSensor):
         else:
             verdict = "loft tracked outdoors; this can indicate insulation or strong ventilation"
         return {
+            **_status_attributes(status_info, "valid"),
             "verdict": verdict,
             "hours_used": fit["hours_used"],
             "window_days": fit["window_days"],
@@ -225,20 +322,19 @@ class AirChangeRateSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         ach = self.coordinator.data.get("air_change_rate") or self.coordinator.data.get("losses")
-        status_info = self.coordinator.data.get("analysis_status", {}).get("air_change_rate", {})
+        status_info = _analysis_status(self.coordinator, "air_change_rate")
         if not ach or "ach" not in ach:
             return {
                 "scope": "room",
-                "status": status_info.get("status", "collecting"),
+                **_status_attributes(status_info, "collecting"),
                 "note": status_info.get("reason") or (
                     "not enough clean CO2 decay windows yet - configure a CO2 sensor "
                     "(floor area and ceiling height are only required for the ventilation/fabric loss split)"
                 ),
-                "next_action": status_info.get("next_action"),
             }
         attrs = {
             "scope": ach.get("scope", "room"),
-            "status": status_info.get("status", "valid"),
+            **_status_attributes(status_info, "valid"),
             "decay_windows_used": ach["windows"],
             "outdoor_co2_baseline_ppm": round(ach["baseline_ppm"], 0),
             "co2_sensors_used": ach.get("co2_sensors_used", 1),
@@ -266,7 +362,7 @@ class VentilationLossSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         opt_in = self.coordinator.conf.get(CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION, False)
-        status_info = self.coordinator.data.get("analysis_status", {}).get("losses", {})
+        status_info = _analysis_status(self.coordinator, "losses")
         base_attrs = {
             "scope": "whole_home",
             "experimental": True,
@@ -289,13 +385,13 @@ class VentilationLossSensor(ThermalSensor):
                 diagnostic_note = losses["diagnostic_note"]
             return {
                 **base_attrs,
-                "status": status_info.get("status", "collecting"),
-                "note": diagnostic_note,
-                "next_action": status_info.get("next_action"),
+                **_status_attributes(status_info, "collecting"),
+                "note": status_info.get("reason") or diagnostic_note,
             }
         return {
             **base_attrs,
-            "status": status_info.get("status", "valid"),
+            **_status_attributes(status_info, "valid"),
+            "note": status_info.get("reason"),
             "share_of_delivered_hlc_pct": (
                 round(losses["ventilation_share_pct"], 1)
                 if losses.get("ventilation_share_pct") is not None
@@ -322,7 +418,7 @@ class FabricLossSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         opt_in = self.coordinator.conf.get(CONF_EXPERIMENTAL_WHOLE_HOME_VENTILATION, False)
-        status_info = self.coordinator.data.get("analysis_status", {}).get("losses", {})
+        status_info = _analysis_status(self.coordinator, "losses")
         base_attrs = {
             "scope": "whole_home",
             "experimental": True,
@@ -345,13 +441,13 @@ class FabricLossSensor(ThermalSensor):
                 diagnostic_note = losses["diagnostic_note"]
             return {
                 **base_attrs,
-                "status": status_info.get("status", "collecting"),
-                "note": diagnostic_note,
-                "next_action": status_info.get("next_action"),
+                **_status_attributes(status_info, "collecting"),
+                "note": status_info.get("reason") or diagnostic_note,
             }
         return {
             **base_attrs,
-            "status": status_info.get("status", "valid"),
+            **_status_attributes(status_info, "valid"),
+            "note": status_info.get("reason"),
             "hlc_delivered_w_per_k": round(losses["hlc_delivered_w_per_k"], 1) if losses.get("hlc_delivered_w_per_k") is not None else None,
             "boiler_efficiency_used": losses.get("boiler_efficiency_used"),
         }
@@ -372,10 +468,14 @@ class HotWaterGasSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         dhw = self.coordinator.data.get("dhw")
+        status_info = _analysis_status(self.coordinator, "dhw")
         if not dhw:
-            return {"note": "not enough summer (heating-off) days yet"}
+            return {
+                **_status_attributes(status_info, "collecting"),
+                "note": status_info.get("reason") or "not enough summer (heating-off) days yet",
+            }
         return {
-            "status": dhw.get("status", "provisional"),
+            **_status_attributes(status_info, dhw.get("status", "provisional")),
             "includes": "all non-heating gas: hot water, plus cooking/pilot "
                         "only if those burn gas (pure DHW in an "
                         "electric-cooking home)",
@@ -463,9 +563,14 @@ class HotWaterUsageSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         usage = self.coordinator.data.get("usage")
+        status_info = _analysis_status(self.coordinator, "usage")
         if not usage:
-            return {"note": "needs a gas meter and a hot-water baseline first"}
+            return {
+                **_status_attributes(status_info, "collecting"),
+                "note": status_info.get("reason") or "needs a gas meter and a hot-water baseline first",
+            }
         return {
+            **_status_attributes(status_info, "provisional"),
             "method": "heating-off days: all gas counted as hot water; "
                       "heating days: modelled from that day's metered litres "
                       "(or the mains-scaled baseline without water data)",
@@ -517,9 +622,14 @@ class SpaceHeatingUsageSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         usage = self.coordinator.data.get("usage")
+        status_info = _analysis_status(self.coordinator, "usage")
         if not usage:
-            return {"note": "needs a gas meter and a hot-water baseline first"}
+            return {
+                **_status_attributes(status_info, "collecting"),
+                "note": status_info.get("reason") or "needs a gas meter and a hot-water baseline first",
+            }
         return {
+            **_status_attributes(status_info, "provisional"),
             "method": "daily gas minus the attributed hot-water share "
                       "(zero on heating-off days by construction)",
             "kwh_per_day_30d": (
@@ -552,7 +662,9 @@ class ElectricityBaseloadSensor(ThermalSensor):
         elec = self.coordinator.data.get("electricity")
         if not elec:
             return _electricity_unavailable_attributes(self.coordinator)
+        status_info = _analysis_status(self.coordinator, "electricity")
         return {
+            **_status_attributes(status_info, "valid"),
             "method": "median across up to the latest 30 days of each day's "
                       "cheapest hour - the "
                       "always-on load (fridges, standby, network gear)",
@@ -619,7 +731,9 @@ class ElectricityUsageSensor(ThermalSensor):
         elec = self.coordinator.data.get("electricity")
         if not elec:
             return _electricity_unavailable_attributes(self.coordinator)
+        status_info = _analysis_status(self.coordinator, "electricity")
         return {
+            **_status_attributes(status_info, "valid"),
             "kwh_per_day_30d": (
                 round(elec["last_30d_kwh_per_day"], 2)
                 if elec["last_30d_kwh_per_day"] is not None
@@ -668,16 +782,22 @@ class WaterUsageSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         water = self.coordinator.data.get("water_usage")
+        analysis = _analysis_status(self.coordinator, "water_usage")
         if not water:
             status = self.coordinator.data.get("water_status", {})
             if not status.get("configured"):
-                return {"note": "water statistic is not configured"}
+                return {
+                    "note": "water statistic is not configured",
+                    **_status_attributes(analysis, "not_configured"),
+                }
             return {
                 "note": "not enough complete hourly water statistics",
                 "usable_days": status.get("usable_days", 0),
                 "required_days": status.get("required_days", 5),
+                **_status_attributes(analysis, "collecting"),
             }
         return {
+            **_status_attributes(analysis, "valid"),
             "scope": "total metered water; not inferred hot-water litres",
             "litres_per_day_30d": (
                 round(water["litres_per_day_30d"], 1)
@@ -724,11 +844,10 @@ class RoomTauSensor(ThermalSensor):
     @property
     def extra_state_attributes(self) -> dict:
         fit = self.coordinator.data["rooms"].get(self._room)
-        status_info = (
-            self.coordinator.data.get("analysis_status", {})
-            .get("rooms", {})
-            .get(self._room, {})
-        )
+        room_status = self.coordinator.data.get("analysis_status", {}).get("rooms", {})
+        status_info = room_status.get(self._room, {}) if isinstance(room_status, dict) else {}
+        if not isinstance(status_info, dict):
+            status_info = {}
         if not fit:
             room_conf = self.coordinator.conf.get(CONF_ROOMS, {}).get(
                 self._room, {}
@@ -740,32 +859,50 @@ class RoomTauSensor(ThermalSensor):
             if heating_issue:
                 return {
                     "scope": "room",
-                    "status": status_info.get("status", "source_problem"),
+                    **_status_attributes(status_info, "source_problem"),
                     "note": "configured heating-demand source is invalid, so cooling "
                     "fits are suppressed until it reports 0-100%",
                     "source_issue": heating_issue,
                     "required_nights": TAU_MIN_NIGHTS,
-                    "next_action": status_info.get("next_action"),
                 }
             return {
                 "scope": "room",
-                "status": status_info.get("status", "collecting"),
+                **_status_attributes(status_info, "collecting"),
                 "note": status_info.get("reason") or (
                     f"fewer than {TAU_MIN_NIGHTS} usable unheated cooling nights "
                     "passed the coverage, temperature-drop and fit-quality checks"
                 ),
                 "required_nights": TAU_MIN_NIGHTS,
-                "next_action": status_info.get("next_action"),
             }
         attrs = {
             "scope": "room",
-            "status": status_info.get("status", "valid"),
+            **_status_attributes(status_info, "valid"),
             "nights_fitted": fit["nights_fitted"],
             "last_night": fit["last_night"],
             "window_days": fit["window_days"],
         }
         if status_info.get("latest_source_day"):
             attrs["latest_source_day"] = status_info["latest_source_day"]
+        for key in (
+            "sensor_count",
+            "temperature_sensor_count",
+            "heating_sensor_count",
+            "sensor_counts",
+            "first_night",
+            "candidate_nights",
+            "rejected_nights",
+            "rejection_counts",
+            "tau_q1_h",
+            "tau_q3_h",
+            "latest_temperature_day",
+            "latest_heating_day",
+            "latest_demand_day",
+            "latest_source_day",
+        ):
+            if key in fit:
+                attrs[key] = fit[key]
+            elif key in status_info:
+                attrs[key] = status_info[key]
         return attrs
 
 
@@ -798,18 +935,18 @@ class DataReadinessSensor(CoordinatorEntity[ThermalCoordinator], SensorEntity):
             elif isinstance(v, dict):
                 statuses.append(v.get("status"))
 
-        if "source_problem" in statuses:
-            return "source_problem"
-        if "rejected" in statuses:
-            return "rejected"
-        if "collecting" in statuses:
-            return "collecting"
-        if "provisional" in statuses:
-            return "provisional"
-        if "valid" in statuses:
-            return "ready"
-        if "historical_baseline_held" in statuses:
-            return "historical_baseline_held"
+        # Keep a held primary heating baseline visible in aggregate readiness,
+        # even when independent secondary metrics are valid.
+        for status, readiness in (
+            ("source_problem", "source_problem"),
+            ("rejected", "rejected"),
+            ("historical_baseline_held", "historical_baseline_held"),
+            ("collecting", "collecting"),
+            ("provisional", "provisional"),
+            ("valid", "ready"),
+        ):
+            if status in statuses:
+                return readiness
         return "not_configured"
 
     @property

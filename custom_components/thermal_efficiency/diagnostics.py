@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 from typing import Any
 
@@ -22,6 +23,85 @@ from .const import (
     DEFAULT_MAX_WINDOW_DAYS,
     ROOM_TYPE_CONDITIONED,
 )
+
+_MACHINE_EVIDENCE_FIELDS = {
+    "status",
+    "code",
+    "type",
+    "date",
+    "day",
+    "timestamp",
+    "generated_at",
+    "completed_at",
+    "cutoff",
+    "timezone",
+    "tz",
+    "schema_version",
+    "model_version",
+    "version",
+    "configuration_schema_version",
+    "history_schema_version",
+    "history_revision",
+    "revision",
+    "configuration_fingerprint",
+    "config_fingerprint",
+    "fingerprint",
+    "evidence_id",
+    "role",
+    "source_role",
+    "scope",
+    "unit",
+    "normalized_unit",
+    "retryable",
+    "source_index",
+    "first_night",
+    "last_night",
+    "first_observation",
+    "last_observation",
+    "model_data_from",
+    "model_data_through",
+    "latest_source_day",
+    "raw_latest_source_day",
+    "latest_eligible_day",
+}
+_HUMAN_TEXT_FIELDS = {
+    "reason",
+    "next_action",
+    "note",
+    "summary",
+    "guidance",
+    "error",
+    "diagnostic_note",
+    "description",
+}
+_SOURCE_CONTEXT_FIELDS = {
+    "source",
+    "sources",
+    "meter",
+    "sensor",
+    "entity",
+    "entity_id",
+    "statistic_id",
+    "source_id",
+    "identifier",
+    "id",
+    "name",
+    "friendly_name",
+    "source_name",
+    "entity_name",
+    "sensor_name",
+    "room_name",
+}
+
+
+def _is_machine_evidence_field(field: str | None) -> bool:
+    if field is None:
+        return False
+    name = field.casefold()
+    return (
+        name in _MACHINE_EVIDENCE_FIELDS
+        or name.endswith(("_date", "_day", "_at", "_timestamp", "_version", "_revision", "_fingerprint"))
+    )
 
 
 def _anonymize(
@@ -69,7 +149,10 @@ async def async_get_config_entry_diagnostics(
         CONF_CO2, CONF_GAS_UNIT_RATE, CONF_ELECTRICITY_UNIT_RATE,
     ):
         value = entry_data.get(field)
-        source_ids.update(value if isinstance(value, list) else ([value] if isinstance(value, str) else []))
+        if isinstance(value, list):
+            source_ids.update(item for item in value if isinstance(item, str))
+        elif isinstance(value, str):
+            source_ids.add(value)
     for room in entry_data.get("rooms", {}).values():
         source_ids.update(value for value in room.values() if isinstance(value, str) and "." in value)
     for source in history_sources.values():
@@ -81,8 +164,104 @@ async def async_get_config_entry_diagnostics(
     for source in migration.get("sources", {}).values():
         if isinstance(source, dict) and isinstance(source.get("statistic_id"), str):
             source_ids.add(source["statistic_id"])
+    raw_evidence = coordinator.data.get("analysis_evidence") if coordinator and coordinator.data else None
+
+    def _collect_evidence_source_ids(
+        value: Any, sensitive_context: bool = False, parent_key: str | None = None
+    ) -> None:
+        """Add custom identifiers named by evidence source fields to the scrub list."""
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_text = str(key).casefold()
+                source_field = (
+                    sensitive_context
+                    or key_text in _SOURCE_CONTEXT_FIELDS
+                    or key_text.endswith(("_source", "_sources", "_meter", "_sensor", "_entity", "_entity_id", "_statistic_id"))
+                )
+                if (
+                    sensitive_context
+                    and isinstance(key, str)
+                    and key_text not in _MACHINE_EVIDENCE_FIELDS
+                    and key_text not in _HUMAN_TEXT_FIELDS
+                    and key_text not in _SOURCE_CONTEXT_FIELDS
+                ):
+                    source_ids.add(key)
+                _collect_evidence_source_ids(item, source_field, key_text)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _collect_evidence_source_ids(item, sensitive_context, parent_key)
+        elif (
+            sensitive_context
+            and isinstance(value, str)
+            and value
+            and not _is_machine_evidence_field(parent_key)
+            and parent_key not in _HUMAN_TEXT_FIELDS
+        ):
+            source_ids.add(value)
+
+    _collect_evidence_source_ids(raw_evidence)
     source_ids = sorted(source_ids, key=len, reverse=True)
+    source_key_aliases = {
+        source_id: f"source_{index + 1}"
+        for index, source_id in enumerate(source_ids)
+    }
     source_health = coordinator.data.get("source_health", {}) if coordinator and coordinator.data else {}
+
+    def _sanitize_bundle(value: Any) -> Any:
+        """Deep-copy once, scrub values, and preserve canonical evidence keys."""
+        copied = copy.deepcopy(value)
+
+        def _sanitize_node(
+            item: Any, parent_key: str | None = None, source_context: bool = False
+        ) -> Any:
+            if isinstance(item, dict):
+                sanitized: dict[Any, Any] = {}
+                for key, child in item.items():
+                    if isinstance(key, str) and parent_key == "rooms" and key in room_names:
+                        safe_key = room_names[key]
+                    elif isinstance(key, str) and key in source_key_aliases:
+                        safe_key = source_key_aliases[key]
+                    elif isinstance(key, str) and (
+                        key in source_ids
+                        or re.search(r"\b[a-z_]+(?:\.[a-z0-9_-]+)+\b", key, re.IGNORECASE)
+                        or re.search(r"(?<![\w])[a-z0-9_.-]+:[a-z0-9_.:-]+", key, re.IGNORECASE)
+                    ):
+                        safe_key = _anonymize(key, room_names, source_ids)
+                    else:
+                        # Schema keys remain stable even when a user chose a room
+                        # name such as "configuration", "hlc", or "date".
+                        safe_key = key
+                    if safe_key in sanitized:
+                        suffix = 2
+                        while f"{safe_key}_{suffix}" in sanitized:
+                            suffix += 1
+                        safe_key = f"{safe_key}_{suffix}"
+                    key_text = str(safe_key).casefold()
+                    child_source_context = (
+                        source_context
+                        or key_text in _SOURCE_CONTEXT_FIELDS
+                        or key_text.endswith(("_source", "_sources", "_meter", "_sensor", "_entity", "_entity_id", "_statistic_id"))
+                    )
+                    if parent_key is None and key_text == "timezone":
+                        sanitized[safe_key] = "local"
+                    else:
+                        sanitized[safe_key] = _sanitize_node(
+                            child, key_text, child_source_context
+                        )
+                return sanitized
+            if isinstance(item, list):
+                return [_sanitize_node(child, parent_key, source_context) for child in item]
+            if isinstance(item, tuple):
+                return tuple(
+                    _sanitize_node(child, parent_key, source_context) for child in item
+                )
+            if isinstance(item, str):
+                if _is_machine_evidence_field(parent_key):
+                    return item
+                return _anonymize(item, room_names, source_ids)
+            return item
+
+        return _sanitize_node(copied)
 
     def _determine_health(field_key: str, role_key: str) -> str:
         val = entry_data.get(field_key)
@@ -188,7 +367,37 @@ async def async_get_config_entry_diagnostics(
         },
     }
 
-    return {
+    migration_diagnostics = {
+        "status": migration.get("status"),
+        "cutoff": migration.get("cutoff"),
+        "completed_at": migration.get("completed_at"),
+        "error": _anonymize(migration.get("error"), room_names, source_ids),
+        "parity_verified": migration.get("parity_verified", False),
+    }
+    failure = migration.get("failure")
+    if isinstance(failure, dict):
+        allowed_failure_fields = (
+            "stage",
+            "code",
+            "type",
+            "reason",
+            "retryable",
+            "guidance",
+            "source_index",
+            "source",
+            "chunk",
+        )
+        migration_diagnostics["failure"] = {
+            key: (
+                failure.get(key)
+                if key == "retryable"
+                else _sanitize_bundle(failure.get(key))
+            )
+            for key in allowed_failure_fields
+            if key in failure
+        }
+
+    diagnostics = {
         "model_version": 2,
         "configuration_schema_version": entry.version,
         "experimental_whole_home_ventilation": entry_data.get(
@@ -196,13 +405,7 @@ async def async_get_config_entry_diagnostics(
         ),
         "history_schema_version": history.get("version"),
         "history_revision": history.get("revision"),
-        "migration": {
-            "status": migration.get("status"),
-            "cutoff": migration.get("cutoff"),
-            "completed_at": migration.get("completed_at"),
-            "error": _anonymize(migration.get("error"), room_names, source_ids),
-            "parity_verified": migration.get("parity_verified", False),
-        },
+        "migration": migration_diagnostics,
         "rooms": len(history.get("rooms", {})),
         "room_types": {
             room_type: sum(
@@ -254,3 +457,6 @@ async def async_get_config_entry_diagnostics(
         "sanitized_analysis_status": sanitized_status,
         "window_and_count_evidence": window_evidence,
     }
+    if isinstance(raw_evidence, dict):
+        diagnostics["analysis_evidence"] = _sanitize_bundle(raw_evidence)
+    return diagnostics

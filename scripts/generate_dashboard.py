@@ -141,10 +141,15 @@ def generate_storyboard_yaml(home: dict[str, str | None], rooms: list[dict[str, 
               {{% set vent = states('{vent_id}') | float(0) %}}
               {{% set co2_count = state_attr('{ach_id}', 'co2_sensors_used') | int(0) %}}
               {{% set status = state_attr('{hlc_id}', 'status') %}}
+              {{% set loss_status = state_attr('{fabric_id}', 'status') %}}
               {{% set raw_rooms = {jinja_rooms_repr} %}}
               {{% set valid_rooms = raw_rooms | selectattr(1, 'gt', 0) | sort(attribute=1) | list %}}
 
-              {{% if fabric and vent and fabric > vent * 2 %}}
+              {{% if loss_status not in ['valid', 'historical_baseline_held'] %}}
+              The experimental loss split is not ready: **{{{{ loss_status or 'unavailable' }}}}**. Review its source evidence before interpreting the components.
+              {{% elif loss_status == 'historical_baseline_held' %}}
+              The experimental split uses a held historical heating baseline; it does not measure current fabric or ventilation losses.
+              {{% elif fabric and vent and fabric > vent * 2 %}}
               **Observed loss signal is predominantly fabric heat transfer**, rather than ventilation.
               {{% elif fabric and vent %}}
               Ventilation is a material part of total building heat loss.

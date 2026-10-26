@@ -1,5 +1,11 @@
 # Lovelace Dashboards for Thermal Efficiency
 
+`climate-x-glance-card.js` is the optional compact overview's version-controlled
+source. Configure entity mappings through its `entities` and `rooms` options.
+It keeps source warnings and model/source dates beside retained estimates.
+Adding or replacing an installed dashboard resource is a separate deployment
+step; changing this file does not update an existing inline resource.
+
 This directory provides portable Home Assistant dashboards generated from one editable mapping file:
 
 - `thermal_efficiency_dashboard.yaml`: Comprehensive Thermal Storyboard dashboard with HLC evidence, loss Sankey flow, and dynamic room cooling fingerprints.

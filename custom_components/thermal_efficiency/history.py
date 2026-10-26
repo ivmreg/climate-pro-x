@@ -95,6 +95,88 @@ def _to_dict(val):
     return val
 
 
+class HistoryDataError(ValueError):
+    """Saved history cannot be safely interpreted by this integration."""
+
+    def __init__(self, code, reason):
+        super().__init__(reason)
+        self.code = code
+
+
+def migrate_history_data(stored):
+    """Validate and minimally migrate the persisted history document.
+
+    Version 1 and the pre-versioned journal have the same room/source/stream
+    shape as version 2. The only known schema change was assigning the runtime
+    data version independently of Home Assistant's Store version, so this
+    migration preserves every field and archive reference and only stamps the
+    current version after validating the required containers. Unknown versions
+    are refused instead of being reinterpreted as current data.
+    """
+    if not isinstance(stored, dict):
+        raise HistoryDataError(
+            "invalid_history_document", "Saved room history is not an object."
+        )
+
+    missing = object()
+    version = stored.get("version", missing)
+    legacy = version is missing or (type(version) is int and version == 1)
+    if not legacy and not (type(version) is int and version == HISTORY_DATA_VERSION):
+        if type(version) is int and version > HISTORY_DATA_VERSION:
+            raise HistoryDataError(
+                "newer_history_version",
+                "Saved room history was written by a newer integration version.",
+            )
+        if version is not missing and type(version) is not int:
+            raise HistoryDataError(
+                "invalid_history_version", "Saved room history has an invalid version value."
+            )
+        raise HistoryDataError(
+            "unsupported_history_version", "Saved room history uses an unsupported version."
+        )
+
+    for key in ("rooms", "sources", "streams", "configured", "migration"):
+        if not isinstance(stored.get(key), dict):
+            raise HistoryDataError(
+                "invalid_history_shape", f"Saved room history has an invalid {key} section."
+            )
+    if type(stored.get("revision")) is not int or stored["revision"] < 0:
+        raise HistoryDataError(
+            "invalid_history_shape", "Saved room history has an invalid revision."
+        )
+    if not isinstance(stored["migration"].get("sources"), dict):
+        raise HistoryDataError(
+            "invalid_history_shape", "Saved migration history has an invalid sources section."
+        )
+    for room in stored["rooms"].values():
+        if not isinstance(room, dict) or not isinstance(room.get("visits"), list):
+            raise HistoryDataError(
+                "invalid_history_shape", "Saved room history has an invalid visit list."
+            )
+    for stream in stored["streams"].values():
+        if not isinstance(stream, dict) or not isinstance(stream.get("coverage"), list):
+            raise HistoryDataError(
+                "invalid_history_shape", "Saved room history has an invalid coverage list."
+            )
+
+    migrated = deepcopy(stored)
+    if legacy:
+        migrated["version"] = HISTORY_DATA_VERSION
+    return migrated
+
+
+def _migration_retry_allowed(migration, now, force=False):
+    """Automatic retries stop on immutable-evidence conflicts; manual retries remain possible."""
+    if force:
+        return True
+    if migration.get("status") != "failed":
+        return True
+    failure = migration.get("failure")
+    if isinstance(failure, dict) and failure.get("retryable") is False:
+        return False
+    return now >= migration.get("next_retry", 0)
+
+
 class RoomHistoryManager:
     def __init__(self, hass, entry, config):
         self.hass, self.entry, self.config = hass, entry, deepcopy(_to_dict(config))
@@ -243,13 +325,15 @@ class RoomHistoryManager:
         now = self._now()
         self._started_at = now
         stored = await self.store.async_load()
-        self.data = stored or {
-            "version": HISTORY_DATA_VERSION, "revision": 0, "rooms": {},
-            "sources": {}, "streams": {}, "configured": {},
-            "original_config": deepcopy(self.config),
-            "migration": migration_manifest(self.config, self.entry.entry_id, now),
-        }
-        self.data["version"] = HISTORY_DATA_VERSION
+        if stored is None:
+            self.data = {
+                "version": HISTORY_DATA_VERSION, "revision": 0, "rooms": {},
+                "sources": {}, "streams": {}, "configured": {},
+                "original_config": deepcopy(self.config),
+                "migration": migration_manifest(self.config, self.entry.entry_id, now),
+            }
+        else:
+            self.data = migrate_history_data(stored)
         last = self.data.get("last_verified", now)
         for sid in self.data["streams"]:
             self._gap(sid, last)
@@ -474,6 +558,9 @@ class RoomHistoryManager:
         # Mutate synchronously at the event boundary, before any subsequent
         # reading can be attributed to yesterday's registry snapshot.
         if self._reconcile_registry(event.time_fired.timestamp()):
+            # Invalidate already-open correction forms in the same callback as
+            # the assignment mutation. The async commit below only persists it.
+            self.data["revision"] += 1
             self._spawn(self._commit_registry())
 
     def _reconcile_registry(self, when, offline_since=None):
@@ -517,10 +604,13 @@ class RoomHistoryManager:
 
     async def _commit_registry(self):
         async with self._lock:
-            self.data["revision"] += 1
             await self._save()
             self._publish_new()
             self._subscribe_states()
+        # Capture routing changes immediately. Refresh analytical evidence too,
+        # rather than leaving the old room population/readiness for six hours.
+        if self._coordinator:
+            await self._coordinator.async_request_refresh()
 
     @callback
     def _tick(self, now):
@@ -541,33 +631,39 @@ class RoomHistoryManager:
         if self.ready or self._stopping or self._migration_task and not self._migration_task.done():
             return
         migration = self.data.get("migration", {})
-        if not force and migration.get("status") == "failed":
-            next_retry = migration.get("next_retry", 0)
-            if self._now() < next_retry:
-                return
+        if not _migration_retry_allowed(migration, self._now(), force):
+            return
         self._migration_task = self.hass.async_create_background_task(
             self.async_migrate_history(), f"{DOMAIN} preserve retained history"
         )
 
     async def async_migrate_history(self):
+        migrator = HistoryMigrator(
+            self.hass, self.entry, self.data, self._save, self._publish_migration_status
+        )
         try:
-            await HistoryMigrator(
-                self.hass, self.entry, self.data, self._save, self._publish_migration_status
-            ).run()
+            await migrator.run()
             if self.ready:
                 self.data["migration"].pop("retries", None)
                 self.data["migration"].pop("next_retry", None)
+                self.data["migration"].pop("error", None)
+                self.data["migration"].pop("failure", None)
                 await self._save()
         except Exception as err:
             retries = self.data["migration"].get("retries", 0)
             backoff = min(3600, 60 * (2 ** retries))
             now = self._now()
+            failure = migrator.failure_details(err)
             self.data["migration"].update(
                 status="failed",
                 error=type(err).__name__,
+                failure=failure,
                 retries=retries + 1,
-                next_retry=now + backoff,
             )
+            if failure["retryable"]:
+                self.data["migration"]["next_retry"] = now + backoff
+            else:
+                self.data["migration"].pop("next_retry", None)
             await self._save()
         self._publish_migration_status()
         if self._coordinator:
@@ -603,9 +699,16 @@ class RoomHistoryManager:
     async def async_prepare(self, stats, conf, tz):
         """Compose an analytical history snapshot away from the event loop."""
         snapshot = deepcopy(self.data)
-        return await self.hass.async_add_executor_job(
+        revision = snapshot.get("revision")
+        schema_version = snapshot.get("version")
+        composed_stats, prepared = await self.hass.async_add_executor_job(
             compose, stats, conf, snapshot, tz
         )
+        # Bind provenance to the same frozen history used by compose, even if a
+        # registry callback changes live history while the executor is running.
+        prepared["history_revision"] = revision
+        prepared["history_schema_version"] = schema_version
+        return composed_stats, prepared
 
     def current_rooms(self):
         rooms = deepcopy(self.config["rooms"])

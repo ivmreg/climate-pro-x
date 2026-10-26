@@ -142,6 +142,12 @@ long-term statistics — no tokens, no polling, no pip requirements.
 
 Analysis entities update every 6 h under the "Thermal Efficiency" device.
 
+Download integration diagnostics for versioned daily evidence, eligibility
+exclusions, frozen HLC targets, dependency readiness and pipeline timings.
+An offline command independently replays the exported HLC regression. See
+[analytical evidence and reproducibility](docs/analysis-evidence.md) for its
+scope, uncertainty limits, recovery behavior and test setup.
+
 Room inputs are protected by integration-owned history streams. On the first
 0.6.x or later startup, retained hourly statistics for **all configured inputs** are copied
 into climate-pro-x's own statistics and read back to verify every timestamp and

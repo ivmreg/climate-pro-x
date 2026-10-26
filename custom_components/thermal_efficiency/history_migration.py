@@ -36,6 +36,85 @@ FIELDS = {"mean", "min", "max", "sum", "state", "last_reset", "mean_weight"}
 ARCHIVE_FIELDS = set(FIELDS)
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
+_RETRYABLE_GUIDANCE = (
+    "This recorder operation can be retried after storage is available; "
+    "manual retry is also available."
+)
+_CONFLICT_GUIDANCE = (
+    "Automatic retries are paused because immutable preservation evidence conflicts. "
+    "Review recorder history and its matching Home Assistant storage backup together. "
+    "Manual retry remains available and will revalidate existing chunks without replacing them."
+)
+_STAGE_FAILURES = {
+    "inventory": (
+        "inventory_operation_failed",
+        "Source inventory could not be read. Retry after recorder availability is restored.",
+    ),
+    "archive": (
+        "archive_operation_failed",
+        "Archive preservation could not complete. Existing chunks are checked before reuse.",
+    ),
+    "import": (
+        "recorder_import_failed",
+        "Recorder import or read-back could not complete. Retry after recorder "
+        "availability is restored.",
+    ),
+    "verification": (
+        "preservation_verification_failed",
+        "Preservation verification could not complete. Retry after recorder "
+        "availability is restored.",
+    ),
+    "parity": (
+        "analysis_parity_failed",
+        "Preserved history parity could not be checked. Retry after recorder "
+        "availability is restored.",
+    ),
+    "finalization": (
+        "migration_finalization_failed",
+        "History preservation could not be finalized. Retry after recorder availability is restored.",
+    ),
+    "startup": (
+        "migration_operation_failed",
+        "History preservation could not start. Retry after recorder availability "
+        "is restored.",
+    ),
+}
+
+
+def _safe_chunk_name(value):
+    """Keep only known chunk labels and generated numeric boundaries."""
+    if not isinstance(value, str):
+        return None
+    if value in {"raw", "5minute", "hour"}:
+        return value
+    parts = value.rsplit("_", 2)
+    if len(parts) != 3 or parts[0] not in {"raw", "5minute", "hour"}:
+        return None
+    try:
+        start, end = int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+    return f"{parts[0]}_{start}_{end}"
+
+
+class MigrationFailure(ValueError):
+    """Safe, structured failure for a migration operation or immutable conflict."""
+
+    def __init__(
+        self, code, stage, reason, *, retryable, source_index=None, chunk=None,
+        guidance=None,
+    ):
+        super().__init__(reason)
+        self.code = code
+        self.stage = stage
+        self.reason = reason
+        self.retryable = retryable
+        self.source_index = source_index
+        self.chunk = _safe_chunk_name(chunk)
+        self.guidance = guidance or (
+            _RETRYABLE_GUIDANCE if retryable else _CONFLICT_GUIDANCE
+        )
+
 
 async def committed(hass):
     """Queue an explicit barrier, including an import currently being processed.
@@ -129,6 +208,65 @@ class HistoryMigrator:
         self.hass, self.entry, self.data, self.save = hass, entry, data, save
         self.on_status = on_status
         self.prefix = f"{DOMAIN}.archive.{entry.entry_id}"
+        sources = data.get("migration", {}).get("sources", {})
+        self._source_indexes = {
+            source: index for index, source in enumerate(sorted(sources))
+        }
+        self._failure_stage = "startup"
+        self._failure_source_index = None
+        self._failure_chunk = None
+
+    def _set_failure_context(self, stage, source=None, chunk=None):
+        self._failure_stage = stage
+        self._failure_source_index = self._source_indexes.get(source)
+        self._failure_chunk = _safe_chunk_name(chunk)
+
+    def _conflict(self, code, reason, stage=None, source=None, chunk=None):
+        if stage is None:
+            stage = self._failure_stage
+        source_index = (
+            self._source_indexes.get(source)
+            if source is not None else self._failure_source_index
+        )
+        return MigrationFailure(
+            code,
+            stage,
+            reason,
+            retryable=False,
+            source_index=source_index,
+            chunk=chunk if chunk is not None else self._failure_chunk,
+        )
+
+    def failure_details(self, error):
+        """Return privacy-safe recovery guidance without serializing exception text."""
+        if isinstance(error, MigrationFailure):
+            failure = {
+                "stage": error.stage,
+                "code": error.code,
+                "type": type(error).__name__,
+                "reason": error.reason,
+                "retryable": error.retryable,
+                "guidance": error.guidance,
+            }
+            source_index, chunk = error.source_index, _safe_chunk_name(error.chunk)
+        else:
+            code, reason = _STAGE_FAILURES.get(
+                self._failure_stage, _STAGE_FAILURES["startup"]
+            )
+            failure = {
+                "stage": self._failure_stage,
+                "code": code,
+                "type": type(error).__name__,
+                "reason": reason,
+                "retryable": True,
+                "guidance": _RETRYABLE_GUIDANCE,
+            }
+            source_index, chunk = self._failure_source_index, self._failure_chunk
+        if source_index is not None:
+            failure["source_index"] = source_index
+        if chunk is not None:
+            failure["chunk"] = chunk
+        return failure
 
     def _chunk_summary(self, rows, kind):
         times = [timestamp(row["last_updated"] if kind == "raw" else row["start"]) for row in rows]
@@ -181,19 +319,37 @@ class HistoryMigrator:
 
     async def _archive(self, source, kind, start, end, metadata):
         key = f"{kind}_{int(start.timestamp())}_{int(end.timestamp())}"
+        self._set_failure_context("archive", source, key)
         record = self.data["migration"]["sources"][source]
         store = Store(self.hass, 1, f"{self.prefix}.{identity(source)}.{key}")
         stored = await store.async_load()
         if stored is not None:
-            if digest(stored["rows"]) != stored["digest"]:
-                raise ValueError("Archive integrity verification failed")
+            try:
+                stored_rows = stored["rows"]
+                stored_digest = stored["digest"]
+                valid = digest(stored_rows) == stored_digest
+            except (KeyError, TypeError, ValueError):
+                valid = False
+                stored_rows = None
+            if not valid:
+                raise self._conflict(
+                    "archive_chunk_corrupt",
+                    "An immutable archive chunk failed its integrity check.",
+                    source=source,
+                    chunk=key,
+                )
             # The chunk may have been committed before a crash lost its manifest entry.
             if key not in record["chunks"]:
-                record["chunks"][key] = self._chunk_summary(stored["rows"], kind)
+                record["chunks"][key] = self._chunk_summary(stored_rows, kind)
                 await self.save()
-            return stored["rows"], key
+            return stored_rows, key
         if key in record["chunks"]:
-            raise ValueError("A recorded migration archive chunk is missing")
+            raise self._conflict(
+                "archive_chunk_missing",
+                "A manifest-recorded immutable archive chunk is missing.",
+                source=source,
+                chunk=key,
+            )
         if kind == "raw":
             rows = await self._raw_query(source, start, end)
         else:
@@ -204,7 +360,12 @@ class HistoryMigrator:
         await store.async_save(chunk)
         check = await store.async_load()
         if check != chunk:
-            raise ValueError("Archive write/read verification failed")
+            raise self._conflict(
+                "archive_write_verification_failed",
+                "A newly written immutable archive chunk failed read-back verification.",
+                source=source,
+                chunk=key,
+            )
         record["chunks"][key] = self._chunk_summary(rows, kind)
         await self.save()
         return rows, key
@@ -213,6 +374,7 @@ class HistoryMigrator:
         """Snapshot every retained source row before the first copy is accepted."""
         inventory = {}
         for source in self.data["migration"]["sources"]:
+            self._set_failure_context("inventory", source)
             meta = metadata[source][1] if source in metadata else None
             raw_rows = (
                 await self._raw_query(source, raw_start, initial_end)
@@ -237,27 +399,72 @@ class HistoryMigrator:
         """Prove immutable chunks and imported hourly rows match the snapshot."""
         migration = self.data["migration"]
         for source, expected in migration["inventory"].items():
+            self._set_failure_context("verification", source)
             record = migration["sources"][source]
             archived = {"raw": [], "5minute": [], "hour": []}
             for key, summary in record["chunks"].items():
-                kind, _start, end = key.rsplit("_", 2)
-                if int(end) > int(initial_end.timestamp()):
+                self._set_failure_context("verification", source, key)
+                try:
+                    kind, _start, end = key.rsplit("_", 2)
+                    end = int(end)
+                except (AttributeError, TypeError, ValueError):
+                    raise self._conflict(
+                        "archive_manifest_invalid",
+                        "The archive manifest contains an invalid chunk reference.",
+                        source=source,
+                    ) from None
+                if kind not in archived:
+                    raise self._conflict(
+                        "archive_manifest_invalid",
+                        "The archive manifest contains an unsupported chunk kind.",
+                        source=source,
+                        chunk=key,
+                    )
+                if end > int(initial_end.timestamp()):
                     continue
                 store = Store(
                     self.hass, 1,
                     f"{self.prefix}.{identity(source)}.{key}",
                 )
                 chunk = await store.async_load()
-                if chunk is None or digest(chunk["rows"]) != chunk["digest"]:
-                    raise ValueError("Migration archive inventory is missing or corrupt")
-                if summary["digest"] != digest(chunk["rows"]):
-                    raise ValueError("Migration archive manifest does not match its chunk")
-                archived[kind].extend(chunk["rows"])
+                try:
+                    chunk_rows = chunk["rows"] if chunk is not None else None
+                    chunk_digest = chunk["digest"] if chunk is not None else None
+                    valid_chunk = digest(chunk_rows) == chunk_digest
+                    valid_manifest = summary["digest"] == digest(chunk_rows)
+                except (KeyError, TypeError, ValueError):
+                    valid_chunk = valid_manifest = False
+                    chunk_rows = None
+                if not valid_chunk:
+                    raise self._conflict(
+                        "archive_chunk_missing_or_corrupt",
+                        "An immutable archive chunk is missing or failed its integrity check.",
+                        source=source,
+                        chunk=key,
+                    )
+                if not valid_manifest:
+                    raise self._conflict(
+                        "archive_manifest_mismatch",
+                        "The archive manifest does not match its immutable chunk.",
+                        source=source,
+                        chunk=key,
+                    )
+                if not isinstance(chunk_rows, list):
+                    raise self._conflict(
+                        "archive_chunk_corrupt",
+                        "An immutable archive chunk has an invalid row collection.",
+                        source=source,
+                        chunk=key,
+                    )
+                archived[kind].extend(chunk_rows)
 
             for kind in ("raw", "5minute", "hour"):
                 if fingerprint(archived[kind], kind) != expected[kind]:
-                    raise ValueError(
-                        f"Source {source} changed or disappeared during {kind} preservation"
+                    raise self._conflict(
+                        "source_inventory_mismatch",
+                        f"Source changed or disappeared during {kind} preservation.",
+                        source=source,
+                        chunk=kind,
                     )
 
             meta = record.get("metadata")
@@ -268,14 +475,21 @@ class HistoryMigrator:
                 if meta else []
             )
             if fingerprint(copied, "hour") != expected["hour"]:
-                raise ValueError("Imported history does not match the source inventory")
+                raise self._conflict(
+                    "imported_history_mismatch",
+                    "Imported history no longer matches the captured source inventory.",
+                    source=source,
+                    chunk="hour",
+                )
 
     async def run(self):
         migration = self.data["migration"]
         if migration["status"] == "complete":
             return
+        self._set_failure_context("inventory")
         migration["status"] = "copying"
         migration.pop("error", None)
+        migration.pop("failure", None)
         if self.on_status:
             self.on_status()
         instance = get_instance(self.hass)
@@ -291,13 +505,18 @@ class HistoryMigrator:
         migration.setdefault("raw_start", raw_start.timestamp())
         if migration.get("inventory_version") != 2:
             if any(record.get("copied") for record in migration["sources"].values()):
-                raise ValueError("Migration inventory format changed after copying began")
+                raise self._conflict(
+                    "inventory_format_conflict",
+                    "The migration inventory format changed after copying began.",
+                    stage="inventory",
+                )
             migration["inventory"] = await self._snapshot_inventory(
                 metadata, raw_start, initial_end
             )
             migration["inventory_version"] = 2
         await self.save()
         for source, record in migration["sources"].items():
+            self._set_failure_context("archive", source)
             if record.get("copied"):
                 continue
             if "metadata" not in record:
@@ -354,6 +573,7 @@ class HistoryMigrator:
             record["copied"] = True
             await self.save()
         if not migration.get("snapshot_verified"):
+            self._set_failure_context("verification")
             await self._verify_snapshot_inventory(initial_end)
             migration["snapshot_verified"] = True
             await self.save()
@@ -380,12 +600,14 @@ class HistoryMigrator:
                 await self.save()
 
         if dt_util.utcnow() < cutoff + timedelta(minutes=6):
+            self._set_failure_context("finalization")
             migration["status"] = "finalizing"
             await self.save()
             if self.on_status:
                 self.on_status()
             return
         for source, record in migration["sources"].items():
+            self._set_failure_context("finalization", source)
             meta = record["metadata"]
             if not record.get("tail_done"):
                 if ":" not in source:
@@ -396,7 +618,9 @@ class HistoryMigrator:
                     await self._import_verify(source, rows, key, initial_end, cutoff)
                 record["tail_done"] = True
                 await self.save()
+        self._set_failure_context("parity")
         await self._verify_model_parity(cutoff)
+        self._set_failure_context("finalization")
         migration["status"] = "complete"
         migration["completed_at"] = dt_util.utcnow().timestamp()
         await self.save()
@@ -405,6 +629,7 @@ class HistoryMigrator:
 
     async def _verify_model_parity(self, cutoff):
         """Evaluate both copies on the same date, mappings, units and window."""
+        self._set_failure_context("parity")
         migration = self.data["migration"]
         raw_config = deepcopy(migration["configuration"])
         raw_config["gas_unit_rate"] = raw_config["electricity_unit_rate"] = None
@@ -421,7 +646,12 @@ class HistoryMigrator:
         owned = {record["statistic_id"]: stats.get(record["statistic_id"], []) for record in sources.values()}
         for sid, record in sources.items():
             if canonical(original[sid]) != canonical(owned[record["statistic_id"]]):
-                raise ValueError("Source changed or disappeared during preservation")
+                raise self._conflict(
+                    "source_history_mismatch",
+                    "Source history no longer matches the preserved recorder rows.",
+                    stage="parity",
+                    source=sid,
+                )
         for key in (*GLOBAL_INPUTS, "loft", "loft_humidity"):
             val = owned_raw_config.get(key)
             if isinstance(val, str) and val in sources:
@@ -448,11 +678,16 @@ class HistoryMigrator:
         )
         original_by_owned = {record["statistic_id"]: sid for sid, record in sources.items()}
         if baseline != comparable_analysis(preserved, original_by_owned):
-            raise ValueError("Preserved history changed fixed-date analysis")
+            raise self._conflict(
+                "analysis_parity_mismatch",
+                "Preserved history does not match the fixed-date analysis baseline.",
+                stage="parity",
+            )
         migration["parity_verified"] = True
         await self.save()
 
     async def _import_verify(self, source, rows, key, start, end):
+        self._set_failure_context("import", source, key)
         record = self.data["migration"]["sources"][source]
         if record["chunks"][key].get("verified"):
             return
@@ -463,7 +698,13 @@ class HistoryMigrator:
             await committed(self.hass)
             copied = await self.query(record["statistic_id"], start, end, "hour", metadata)
             if canonical(rows) != canonical(copied):
-                raise ValueError("Imported history did not match the archived observations")
+                raise self._conflict(
+                    "import_readback_mismatch",
+                    "Recorder read-back does not match the immutable archived observations.",
+                    stage="import",
+                    source=source,
+                    chunk=key,
+                )
         record["chunks"][key]["verified"] = True
         await self.save()
         if self.on_status:
