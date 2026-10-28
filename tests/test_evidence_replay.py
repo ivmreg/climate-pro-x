@@ -22,8 +22,11 @@ def bundle():
                                 "days_used": 40, "regression_intercept_kwh_per_day": -10}}}
 
 
-def test_independent_replay_and_temporal_split():
-    result = replay_hlc_evidence({"analysis_evidence": bundle()})
+@pytest.mark.parametrize("model_version", ["1", "2"])
+def test_independent_replay_and_temporal_split(model_version):
+    evidence = bundle()
+    evidence["model_version"] = model_version
+    result = replay_hlc_evidence({"analysis_evidence": evidence})
     assert result["matches_reported"] is True
     assert result["fit"]["delivered_hlc_w_per_k"] == pytest.approx(300)
     assert result["temporal_holdout"]["training_days"] == 32
@@ -48,6 +51,7 @@ def test_reported_mismatch_is_not_silently_accepted():
     lambda x: x.update(schema_version=True),
     lambda x: x.update(model_version="future"),
     lambda x: x.update(model_version=True),
+    lambda x: x.update(model_version=[]),
     lambda x: x["daily"].append(deepcopy(x["daily"][0])),
     lambda x: x["daily"][0].update(hlc_adjusted_kwh=float("nan")),
     lambda x: x["daily"][0].update(eligible={"hlc": False}),

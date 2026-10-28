@@ -44,9 +44,14 @@ class DailyAnalysisEvidence(TypedDict):
     date: str
     gas_kwh: float | None
     delta_t_k: float | None
+    strict_delta_t_k: float | None
     outdoor_c: float | None
     water_litres: float | None
     heating_pct: float | None
+    heating_pct_lower_bound: float | None
+    temperature_short_gap_hours: int
+    temperature_interpolated_hours: int
+    heating_missing_hours: int
     eligible: DailyEligibility
     exclusions: list[EvidenceExclusion]
     hlc_dhw_kwh: float | None
@@ -68,7 +73,13 @@ class AnalysisEvidenceEnvelope(TypedDict):
 
 
 ANALYSIS_EVIDENCE_SCHEMA_VERSION = 1
-ANALYSIS_MODEL_VERSION = "1"
+ANALYSIS_MODEL_VERSION = "2"
+
+HLC_MAX_TEMPERATURE_GAP_SECONDS = 120
+HLC_MAX_TEMPERATURE_GAP_HOURS_PER_DAY = 2
+HLC_MAX_INTERPOLATION_GAP_SECONDS = 3 * 3600
+HLC_MAX_INTERPOLATED_HOURS_PER_DAY = 2
+HLC_MAX_HEATING_MISSING_HOURS_PER_DAY = 2
 
 GAS_MAX_STEP_KWH = 40.0  # bigger hourly steps are meter/statistics artifacts
 HLC_MIN_DT = 4.0
@@ -1441,6 +1452,7 @@ def compute_all(
     )
     invalid_heating_power = set(heating_power_issues)
     room_temp: dict[str, Series] = {}
+    hlc_room_temp: dict[str, Series] = {}
     room_heat: dict[str, Series] = {}
     numeric_issues: dict[str, str] = {}
 
@@ -1460,6 +1472,11 @@ def compute_all(
     for name, spec in room_confs.items():
         temp_entity = spec.get("temperature")
         room_temp[name] = ingest(temp_entity, is_valid_temperature_value, "temperature")
+        hlc_source = spec.get("hlc_temperature") if conf.get("hlc_allow_short_gaps") else None
+        hlc_room_temp[name] = (
+            ingest(hlc_source, is_valid_temperature_value, "temperature")
+            if hlc_source and hlc_source != temp_entity else room_temp[name]
+        )
         # Humidity is currently contextual rather than a model regressor, but
         # expose source quality even when no loft ratio can be calculated.
         ingest(spec.get("humidity"), is_valid_humidity_value, "humidity")
@@ -1500,7 +1517,8 @@ def compute_all(
         if conf.get(role) is not None and coerce_tariff_rate(conf[role]) is None:
             numeric_issues[role] = "Tariff must be finite and within 0-10 GBP/kWh"
     raw_q_by_day = daily_gas_kwh(gas, tz)
-    raw_dt_by_day = daily_delta_t(all_rooms, outdoor, tz)
+    raw_dt_by_day = daily_delta_t(list(hlc_room_temp.values()), outdoor, tz)
+    strict_dt_by_day = daily_delta_t(all_rooms, outdoor, tz)
     room_source_issues = conf.get("room_source_issues") or {}
     has_room_temperature_issue = any(
         issues.get("temperature")
@@ -1511,10 +1529,11 @@ def compute_all(
         # Keep the configured room population fixed. An invalid room source
         # cannot be silently dropped to make a smaller home appear complete.
         raw_dt_by_day = {}
+        strict_dt_by_day = {}
     raw_outdoor_by_day = daily_mean(outdoor, tz)
     raw_water_by_day = daily_water_litres(water, tz)
     raw_room_temp_by_day = {
-        name: daily_mean(temps, tz) for name, temps in room_temp.items()
+        name: daily_mean(temps, tz) for name, temps in hlc_room_temp.items()
     }
     raw_heat_pct_by_day = daily_heating_pct(list(room_heat.values()), tz)
 
@@ -1527,6 +1546,7 @@ def compute_all(
 
     expected_heating_gap_days: set[date] = set()
     expected_heating_gap_rooms: dict[date, set[str]] = defaultdict(set)
+    partial_heating_on: dict[date, int] = {}
     has_expected_heating = any(
         "heating_expected_intervals" in spec for spec in room_confs.values()
     )
@@ -1586,6 +1606,7 @@ def compute_all(
             if not required_slots:
                 continue
             observations = []
+            missing_hours = 0
             for ts, expected_rooms in required_slots:
                 missing_rooms = [
                     name for name in expected_rooms
@@ -1593,10 +1614,25 @@ def compute_all(
                 ]
                 if missing_rooms:
                     expected_heating_gap_rooms[day].update(missing_rooms)
+                    missing_hours += 1
                     continue
                 observations.append(max(room_heat[name][ts] for name in expected_rooms))
             if expected_heating_gap_rooms.get(day) or len(observations) != len(required_slots):
-                expected_heating_gap_days.add(day)
+                # Missing demand is never interpreted as heating off. When at
+                # most two hours are unknown, observed non-negative demand can
+                # nevertheless prove that the full-day mean exceeds the off
+                # threshold even if every missing hour were zero.
+                lower_bound = sum(observations) / expected_hours
+                if (
+                    conf.get("hlc_allow_short_gaps")
+                    and 0 < missing_hours <= HLC_MAX_HEATING_MISSING_HOURS_PER_DAY
+                    and lower_bound > HEATING_OFF_MAX_PCT
+                ):
+                    raw_heat_pct_by_day[day] = lower_bound
+                    partial_heating_on[day] = missing_hours
+                    expected_heating_gap_rooms.pop(day, None)
+                else:
+                    expected_heating_gap_days.add(day)
             else:
                 raw_heat_pct_by_day[day] = sum(observations) / len(observations)
 
@@ -1630,6 +1666,7 @@ def compute_all(
     for by_day in (
         raw_q_by_day,
         raw_dt_by_day,
+        strict_dt_by_day,
         raw_outdoor_by_day,
         raw_water_by_day,
         raw_heat_pct_by_day,
@@ -1644,6 +1681,7 @@ def compute_all(
     excluded_days = {day.isoformat() for day in model_excluded_dates}
     q_by_day = {d: value for d, value in raw_q_by_day.items() if d not in model_excluded_dates}
     dt_by_day = {d: value for d, value in raw_dt_by_day.items() if d not in model_excluded_dates}
+    strict_model_dt_by_day = {d: value for d, value in strict_dt_by_day.items() if d not in model_excluded_dates}
     outdoor_by_day = dict(raw_outdoor_by_day)
     water_by_day = dict(raw_water_by_day)
     heat_pct_by_day = {d: value for d, value in raw_heat_pct_by_day.items() if d not in model_excluded_dates}
@@ -1653,7 +1691,7 @@ def compute_all(
     result["hlc"] = None
     since_full = (now - timedelta(days=windows_days[-1])).astimezone(tz).date()
 
-    heating_off = heating_off_days(dt_by_day, heat_pct_by_day)
+    heating_off = heating_off_days(strict_model_dt_by_day, heat_pct_by_day)
     if heating_power_issues:
         # An invalid configured demand source cannot be replaced by the dT
         # proxy to claim heating was off.
@@ -1687,7 +1725,7 @@ def compute_all(
         else None
     )
     baseline = dhw_baseline(
-        q_by_day, dt_by_day, outdoor_by_day, since_full,
+        q_by_day, strict_model_dt_by_day, outdoor_by_day, since_full,
         heating_off, water_by_day, min_water_l,
     )
     water_rate_diagnostics: dict = {}
@@ -1929,7 +1967,7 @@ def compute_all(
     hlc_baseline = None
     if model_day:
         locked_q = {d: v for d, v in q_by_day.items() if d <= model_day}
-        locked_dt = {d: v for d, v in dt_by_day.items() if d <= model_day}
+        locked_dt = {d: v for d, v in strict_model_dt_by_day.items() if d <= model_day}
         locked_outdoor = {d: v for d, v in outdoor_by_day.items() if d <= model_day}
         locked_water = {d: v for d, v in water_by_day.items() if d <= model_day}
         locked_off = {d for d in heating_off if d <= model_day}
@@ -2352,6 +2390,7 @@ def compute_all(
         since_full=since_full,
         heating_off=heating_off,
         dt_by_day=raw_dt_by_day,
+        strict_dt_by_day=strict_dt_by_day,
         eligible_q_by_day=q_by_day,
         eligible_dt_by_day=dt_by_day,
         eligible_hlc_days={
@@ -2378,6 +2417,16 @@ def compute_all(
         date.fromisoformat(row["date"]): row
         for row in selected_hlc_fit_rows
     }
+    temperature_gap_hours_by_day: dict[date, int] = defaultdict(int)
+    temperature_interpolated_hours_by_day: dict[date, int] = defaultdict(int)
+    if conf.get("hlc_allow_short_gaps"):
+        for name, spec in room_confs.items():
+            for ts in spec.get("hlc_tolerated_temperature_hours", []):
+                if ts in hlc_room_temp.get(name, {}) and ts not in room_temp.get(name, {}):
+                    temperature_gap_hours_by_day[_local(ts, tz).date()] += 1
+            for ts in spec.get("hlc_interpolated_temperature_hours", []):
+                if ts in hlc_room_temp.get(name, {}) and ts not in room_temp.get(name, {}):
+                    temperature_interpolated_hours_by_day[_local(ts, tz).date()] += 1
     evidence_dates = sorted(
         raw_observed_days
         | set(raw_q_by_day)
@@ -2484,9 +2533,14 @@ def compute_all(
             "date": day.isoformat(),
             "gas_kwh": raw_q_by_day.get(day),
             "delta_t_k": raw_dt_by_day.get(day),
+            "strict_delta_t_k": strict_dt_by_day.get(day),
             "outdoor_c": raw_outdoor_by_day.get(day),
             "water_litres": raw_water_by_day.get(day),
-            "heating_pct": raw_heat_pct_by_day.get(day),
+            "heating_pct": None if day in partial_heating_on else raw_heat_pct_by_day.get(day),
+            "heating_pct_lower_bound": raw_heat_pct_by_day.get(day) if day in partial_heating_on else None,
+            "temperature_short_gap_hours": temperature_gap_hours_by_day.get(day, 0),
+            "temperature_interpolated_hours": temperature_interpolated_hours_by_day.get(day, 0),
+            "heating_missing_hours": partial_heating_on.get(day, 0),
             "eligible": {"hlc": bool(hlc_day_eligible), "dhw": bool(dhw_day_eligible)},
             "exclusions": exclusions,
             "hlc_dhw_kwh": hlc_dhw_kwh,
@@ -2501,6 +2555,21 @@ def compute_all(
     result["analysis_status"]["hlc"]["exclusion_counts"] = dict(exclusion_counts)
     result["analysis_status"]["hlc"]["eligible_days"] = sum(
         1 for record in daily_evidence if record["eligible"]["hlc"]
+    )
+    included_days = set(fit_rows_by_day)
+    result["analysis_status"]["hlc"]["temperature_short_gap_days"] = len(
+        included_days & set(temperature_gap_hours_by_day)
+    )
+    result["analysis_status"]["hlc"]["temperature_interpolated_days"] = len(
+        included_days & set(temperature_interpolated_hours_by_day)
+    )
+    result["analysis_status"]["hlc"]["heating_on_with_missing_hours_days"] = len(
+        included_days & set(partial_heating_on)
+    )
+    result["analysis_status"]["hlc"]["coverage_note"] = (
+        "Short temperature gaps use the recorded partial-hour mean; limited "
+        "longer gaps are interpolated. Heating with missing hours is accepted "
+        "only when observed demand proves it was on."
     )
     result["analysis_status"]["dhw"]["eligible_days"] = sum(
         1 for record in daily_evidence if record["eligible"]["dhw"]
@@ -2680,6 +2749,15 @@ def _analysis_evidence_configuration(
         "model_window_days": windows_days[-1],
         "model_window_from": hlc_since.isoformat(),
         "model_anchor_day": _iso_date_str(model_day),
+        "coverage_policy": {
+            "enabled": bool(conf.get("hlc_allow_short_gaps")),
+            "max_partial_temperature_gap_seconds": HLC_MAX_TEMPERATURE_GAP_SECONDS,
+            "max_partial_temperature_hours_per_room_day": HLC_MAX_TEMPERATURE_GAP_HOURS_PER_DAY,
+            "max_temperature_interpolation_gap_seconds": HLC_MAX_INTERPOLATION_GAP_SECONDS,
+            "max_interpolated_hours_per_room_day": HLC_MAX_INTERPOLATED_HOURS_PER_DAY,
+            "max_missing_heating_hours_per_day": HLC_MAX_HEATING_MISSING_HOURS_PER_DAY,
+            "heating_off_requires_complete_expected_coverage": True,
+        },
         "rooms": {
             room_aliases[name]: {
                 "temperature_configured": bool(spec.get("temperature")),
@@ -2744,6 +2822,7 @@ def build_analysis_status(
     since_full: date | None = None,
     heating_off: set | None = None,
     dt_by_day: dict | None = None,
+    strict_dt_by_day: dict | None = None,
     eligible_q_by_day: dict | None = None,
     eligible_dt_by_day: dict | None = None,
     eligible_hlc_days: set | None = None,
@@ -2768,6 +2847,8 @@ def build_analysis_status(
     latest_gas_day = max(q_by_day) if q_by_day else None
     gas_lag = (yesterday - latest_gas_day).days if latest_gas_day else None
     latest_temperature_day = max(dt_by_day) if dt_by_day else None
+    strict_temperature = dt_by_day if strict_dt_by_day is None else strict_dt_by_day
+    latest_strict_temperature_day = max(strict_temperature) if strict_temperature else None
     temperature_lag = (
         (yesterday - latest_temperature_day).days
         if latest_temperature_day
@@ -2977,8 +3058,9 @@ def build_analysis_status(
         hlc_stat["source_lag_days"] = gas_lag
     if latest_temperature_day is not None:
         hlc_stat["latest_temperature_day"] = _iso_date_str(latest_temperature_day)
-        hlc_stat["raw_latest_temperature_day"] = _iso_date_str(latest_temperature_day)
         hlc_stat["temperature_source_lag_days"] = temperature_lag
+    if latest_strict_temperature_day is not None:
+        hlc_stat["raw_latest_temperature_day"] = _iso_date_str(latest_strict_temperature_day)
     hlc_stat["latest_eligible_day"] = _iso_date_str(latest_eligible_day)
     hlc_stat["eligible_source_lag_days"] = (
         (yesterday - latest_eligible_day).days
@@ -2990,6 +3072,10 @@ def build_analysis_status(
         if (since_full is None or day >= since_full) and day <= yesterday
     )
     hlc_stat["raw_complete_temperature_days"] = sum(
+        1 for day in (strict_temperature or {})
+        if (since_full is None or day >= since_full) and day <= yesterday
+    )
+    hlc_stat["qualified_complete_temperature_days"] = sum(
         1 for day in (dt_by_day or {})
         if (since_full is None or day >= since_full) and day <= yesterday
     )
@@ -3096,7 +3182,7 @@ def build_analysis_status(
         if (since_full is None or day >= since_full) and day <= yesterday
     )
     dhw_stat["raw_complete_temperature_days"] = sum(
-        1 for day in (dt_by_day or {})
+        1 for day in (strict_temperature or {})
         if (since_full is None or day >= since_full) and day <= yesterday
     )
     dhw_stat["eligible_observations"] = len(dhw_eligible)
@@ -3175,7 +3261,7 @@ def build_analysis_status(
         if (since_full is None or day >= since_full) and day <= yesterday
     )
     usage_stat["raw_complete_temperature_days"] = sum(
-        1 for day in (dt_by_day or {})
+        1 for day in (strict_temperature or {})
         if (since_full is None or day >= since_full) and day <= yesterday
     )
     usage_stat["eligible_observations"] = len(dhw_eligible)

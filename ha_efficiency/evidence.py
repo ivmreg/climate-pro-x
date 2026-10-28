@@ -61,7 +61,7 @@ def replay_hlc_evidence(document: dict) -> dict:
     if (not isinstance(bundle, dict) or type(bundle.get("schema_version")) is not int
             or bundle["schema_version"] != 1):
         raise ValueError("Unsupported analysis evidence schema")
-    if bundle.get("model_version") != "1":
+    if not isinstance(bundle.get("model_version"), str) or bundle["model_version"] not in {"1", "2"}:
         raise ValueError("Unsupported HLC evidence model version")
     configuration = bundle.get("configuration")
     if not isinstance(configuration, dict):

@@ -76,6 +76,43 @@ def _evidence_fingerprints(conf: dict, evidence: dict) -> tuple[str, str]:
     ).hexdigest()
 
 
+def _compute_with_coverage_comparison(stats, conf, tz, now, windows):
+    """Compare a qualified HLC fit with the prior strict policy on one snapshot."""
+    result = thermal_math.compute_all(stats, conf, tz, now, windows)
+    evidence = result.get("analysis_evidence", {})
+    uses_gaps = any(
+        row.get("eligible", {}).get("hlc") and (
+            row.get("temperature_short_gap_hours")
+            or row.get("temperature_interpolated_hours")
+            or row.get("heating_missing_hours")
+        )
+        for row in evidence.get("daily", [])
+    )
+    if not conf.get("hlc_allow_short_gaps") or not uses_gaps:
+        return result
+    strict = thermal_math.compute_all(
+        stats, {**conf, "hlc_allow_short_gaps": False}, tz, now, windows
+    )
+    fit, strict_fit = result.get("hlc") or {}, strict.get("hlc") or {}
+    value = fit.get("hlc_w_per_k")
+    strict_value = strict_fit.get("hlc_w_per_k")
+    strict_day = strict_fit.get("model_data_through")
+    comparison = {
+        "strict_hlc_w_per_k": strict_value,
+        "strict_days_used": strict_fit.get("days_used"),
+        "strict_model_data_through": strict_day.isoformat() if hasattr(strict_day, "isoformat") else strict_day,
+        "difference_w_per_k": value - strict_value if value is not None and strict_value is not None else None,
+        "note": "Policy comparison on the same snapshot; model window and DHW training can also differ.",
+    }
+    result["analysis_status"]["hlc"]["coverage_sensitivity"] = comparison
+    evidence.get("metrics", {}).get("hlc", {})["coverage_sensitivity"] = comparison
+    evidence.get("uncertainty", {})["coverage"] = (
+        "Regression intervals do not include uncertainty from partial-hour means "
+        "or interpolated temperatures; compare the strict-policy fit."
+    )
+    return result
+
+
 class ThermalCoordinator(DataUpdateCoordinator[dict]):
     def __init__(
         self,
@@ -331,6 +368,8 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
                 alias = spec.get(role)
                 if alias:
                     computation_stats.pop(alias, None)
+                if role == "temperature" and spec.get("hlc_temperature"):
+                    computation_stats.pop(spec["hlc_temperature"], None)
                 if role == "heating_power":
                     if alias:
                         invalid_heating_power[alias] = issue
@@ -346,6 +385,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             issue = invalid_heating_power[entity_id]
             _LOGGER.warning("Ignoring invalid heating-power source: %s", issue)
         conf = {
+            "hlc_allow_short_gaps": bool(self.history),
             "history_revision": prepared.get("history_revision"),
             "history_schema_version": prepared.get("history_schema_version"),
             "rooms": room_conf,
@@ -385,7 +425,7 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
         }
         computation_started = perf_counter()
         result = await self.hass.async_add_executor_job(
-            thermal_math.compute_all,
+            _compute_with_coverage_comparison,
             computation_stats,
             conf,
             dt_util.get_default_time_zone(),

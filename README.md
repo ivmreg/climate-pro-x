@@ -189,9 +189,11 @@ An Area change detected after downtime is held for **Resolve a move while
 offline**, where you provide the destination and effective timestamp.
 
 Fresh reports are required after a move or restart. Missing, invalid, disabled,
-excluded, or silent-for-24-hours inputs become gaps. Partial transition hours
-and transition dates are excluded from thermal models; missing expected heating
-data cannot be treated as evidence of heating being off. A room that previously
+excluded, or silent-for-24-hours inputs become gaps. Partial assignment-transition
+hours and transition dates are excluded from thermal models. HLC can use bounded
+temperature gaps and demonstrably heating-on days with limited missing demand;
+the evidence reports these qualifications and compares the strict fit. Missing
+expected heating data cannot be treated as evidence of heating being off. A room that previously
 had heating-demand data retains that expectation when its sensor moves away.
 
 Back up HA configuration and recorder before upgrading, including the

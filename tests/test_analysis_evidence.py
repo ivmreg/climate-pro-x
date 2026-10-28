@@ -161,7 +161,7 @@ def test_evidence_bundle_is_json_safe_private_and_alias_stable(thermal_math):
         "uncertainty", "models",
     }
     assert evidence["schema_version"] == 1
-    assert evidence["model_version"] == "1"
+    assert evidence["model_version"] == "2"
     assert evidence["history_revision"] == 42
     assert evidence["configuration"]["boiler_efficiency_used"] == 0.88
     assert set(evidence["configuration"]["rooms"]) == {"room_1", "room_2"}

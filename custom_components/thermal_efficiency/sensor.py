@@ -51,7 +51,13 @@ def _status_attributes(status_info: dict, fallback_status: str | None = None) ->
         "model_data_from",
         "raw_complete_gas_days",
         "raw_complete_temperature_days",
+        "qualified_complete_temperature_days",
         "eligible_observations",
+        "temperature_short_gap_days",
+        "temperature_interpolated_days",
+        "heating_on_with_missing_hours_days",
+        "coverage_note",
+        "coverage_sensitivity",
         "exclusion_counts",
         "excluded_day_count",
         "excluded_observation_count",
@@ -229,7 +235,7 @@ class HlcSensor(ThermalSensor):
             "confidence_interval_note": (
                 "conditional regression interval; it does not include uncertainty "
                 "in boiler efficiency, meter or sensor calibration, DHW attribution, "
-                "or how representative the selected rooms are"
+                "temperature gap estimation, or how representative the selected rooms are"
             ),
         }
         sensitivity = status_info.get("boiler_efficiency_sensitivity") or fit.get(

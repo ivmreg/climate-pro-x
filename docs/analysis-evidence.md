@@ -4,7 +4,29 @@ Observed meter days are retained separately from thermal eligibility. A
 complete gas day can remain available while missing room temperatures, expected
 heating data or an assignment transition exclude that date from HLC and DHW
 classification. Source freshness and model eligibility are separate dates.
-Strict coverage checks remain in force.
+Meter days and heating-off classification still require complete coverage.
+
+For the HLC only, a recorder temperature mean can be used when it is bracketed
+by observed coverage across one interruption of at most 120 seconds, limited to
+two such hours per room per local day. A temperature gap of at most three hours
+may instead be interpolated between valid fully covered hourly observations,
+with at most two interpolated hours per room per local day. Neither method
+crosses assignment boundaries or quarantined periods; unbounded, contaminated,
+or longer gaps remain excluded. Room-cooling and loft fits retain strict inputs.
+
+Heating-off days still need complete expected heating coverage. An HLC day
+with at most two missing heating hours is accepted as heating-on only when the
+sum of observed hourly demand proves its full-day mean exceeds the off
+threshold even if all missing hours were zero. The exported daily evidence
+labels this as a lower bound, not a measured daily mean. Missing demand is never
+filled with zero for the baseline or cooling fits.
+
+The bundle's model version 2 records partial and interpolated temperature
+hours and missing heating hours. When qualified days are present, HLC diagnostics
+include a strict-policy comparison on the same input snapshot. Its change can
+also reflect a different model window or hot-water training period, not just the
+interpolation. The conditional regression interval does not account for gap
+estimation. Earlier model-version-1 bundles remain supported by offline replay.
 
 Download the integration's Home Assistant diagnostics for its versioned
 `analysis_evidence` bundle. It contains anonymous model configuration, daily
@@ -58,8 +80,13 @@ Numeric historical estimates can coexist with `source_problem` or
 ventilation/fabric results inherit HLC problems instead of claiming validity
 merely because numeric fits exist.
 
+The daily evidence's `delta_t_k` may use qualified temperatures, while
+`strict_delta_t_k` contains only fully covered room-temperature days. Status
+attributes distinguish raw complete days from qualified complete days. DHW
+baseline training continues to use strict temperatures.
+
 HLC confidence intervals describe conditional regression uncertainty. They
-exclude uncertainty in boiler efficiency, DHW attribution, calibration and room
+exclude uncertainty in temperature gap estimation, boiler efficiency, DHW attribution, calibration and room
 representativeness. A separate sensitivity range varies configured efficiency
 by five percentage points within supported bounds; it is a scenario rather
 than a confidence interval or an estimate of actual efficiency.
