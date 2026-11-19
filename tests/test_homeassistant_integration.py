@@ -219,7 +219,10 @@ async def test_analysis_does_not_run_on_the_event_loop(hass, monkeypatch):
     ran_on: dict = {}
 
     def _fake_statistics(*args, **kwargs):
-        ran_on["lookback"] = args[2] - args[1]
+        period = args[4] if len(args) > 4 else kwargs.get("period", "hour")
+        ran_on.setdefault("lookbacks", {})[period] = args[2] - args[1]
+        if period == "hour":
+            ran_on["lookback"] = args[2] - args[1]
         return {}
 
     def _fake_compute_all(stats, conf, tz, now, windows):

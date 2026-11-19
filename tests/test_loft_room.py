@@ -1,7 +1,7 @@
 """Loft regressions for the unified room and source-history model."""
 
 from copy import deepcopy
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 import voluptuous as vol
