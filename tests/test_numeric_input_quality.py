@@ -154,12 +154,60 @@ def test_live_observation_converts_before_checking_bounds(thermal_math):
     ns = _load_functions("history.py", {"observation"}, {
         "TemperatureConverter": TemperatureConverter, "HomeAssistantError": RuntimeError,
         "isfinite": isfinite, "is_valid_temperature_value": thermal_math.is_valid_temperature_value,
+        "is_valid_indoor_temperature_value": thermal_math.is_valid_indoor_temperature_value,
     })
     for value, unit, expected in [(68, "°F", 20), (328.15, "K", 55), (-25, "°C", -25),
                                   (99999, "°C", None), (-999, "°C", None), (float("nan"), "°C", None)]:
         state = SimpleNamespace(state=str(value), attributes={"unit_of_measurement": unit})
         assert ns["observation"](state, "temperature") == expected
+    assert ns["observation"](SimpleNamespace(state="52.09", attributes={"unit_of_measurement": "°C"}), "temperature", "conditioned") is None
+    assert ns["observation"](SimpleNamespace(state="-5.0", attributes={"unit_of_measurement": "°C"}), "temperature", "conditioned") is None
+    assert ns["observation"](SimpleNamespace(state="21.5", attributes={"unit_of_measurement": "°C"}), "temperature", "conditioned") == 21.5
+    assert ns["observation"](SimpleNamespace(state="55.0", attributes={"unit_of_measurement": "°C"}), "temperature", "loft") == 55.0
     assert ns["observation"](SimpleNamespace(state="99999", attributes={"unit_of_measurement": "%"}), "humidity") is None
+
+
+def test_indoor_temperature_bounds_and_spike_tail_rejection(thermal_math):
+    assert thermal_math.INDOOR_TEMP_MIN_C == 0.0
+    assert thermal_math.INDOOR_TEMP_MAX_C == 45.0
+    assert thermal_math.is_valid_indoor_temperature_value(0.0)
+    assert thermal_math.is_valid_indoor_temperature_value(45.0)
+    assert not thermal_math.is_valid_indoor_temperature_value(-0.1)
+    assert not thermal_math.is_valid_indoor_temperature_value(45.1)
+    assert not thermal_math.is_valid_indoor_temperature_value(52.09)
+    assert thermal_math.is_valid_temperature_value(55.0)
+    assert thermal_math.is_valid_temperature_value(-25.0)
+
+    # VTRV EMA decay tail + isolated <45C spike are all rejected
+    t0 = int(START.timestamp())
+    rows = [
+        {"start": t0 + 0 * 3600, "mean": 20.94},
+        {"start": t0 + 1 * 3600, "mean": 114.52},
+        {"start": t0 + 2 * 3600, "mean": 52.09},
+        {"start": t0 + 3 * 3600, "mean": 21.11},
+        {"start": t0 + 4 * 3600, "mean": 20.85},
+        {"start": t0 + 5 * 3600, "mean": 44.03},
+        {"start": t0 + 6 * 3600, "mean": 23.17},
+        {"start": t0 + 7 * 3600, "mean": 21.52},
+    ]
+    cleaned, rejected = thermal_math.indoor_temperature_series_from_stats(rows)
+    assert rejected == 3
+    for bad_h in (1, 2, 5):
+        assert (t0 + bad_h * 3600) not in cleaned
+    assert (t0 + 3 * 3600) in cleaned
+    assert (t0 + 6 * 3600) in cleaned
+
+    # Two-step decay tail inside 0..45 after >45 spike
+    rows_2 = [
+        {"start": t0 + 0 * 3600, "mean": 20.8},
+        {"start": t0 + 1 * 3600, "mean": 447.3},
+        {"start": t0 + 2 * 3600, "mean": 42.0},
+        {"start": t0 + 3 * 3600, "mean": 30.0},
+        {"start": t0 + 4 * 3600, "mean": 21.1},
+    ]
+    cleaned_2, rejected_2 = thermal_math.indoor_temperature_series_from_stats(rows_2)
+    assert rejected_2 == 3
+    assert set(cleaned_2) == {t0, t0 + 4 * 3600}
 
 
 def test_tariff_normalization_precedes_bounds(thermal_math):

@@ -1,5 +1,10 @@
 """Boundary contracts for actionable readiness and rejected source evidence."""
+import importlib.util
+import sys
+import types
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -199,3 +204,335 @@ def test_invalid_heating_source_cannot_be_assumed_off(thermal_math):
     result = thermal_math.compute_all({}, conf, UTC, NOW, (30,))
     assert result["rooms"]["bed"] is None
     assert result["analysis_status"]["rooms"]["bed"]["status"] == "source_problem"
+
+
+@pytest.fixture
+def sensor_module(monkeypatch):
+    """Load sensor.py with minimal HA stubs so contract tests run standalone."""
+    root = Path(__file__).resolve().parents[1]
+    package_name = "custom_components.thermal_efficiency"
+
+    def _stub(name: str, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        monkeypatch.setitem(sys.modules, name, module)
+        return module
+
+    class CoordinatorEntity:
+        def __class_getitem__(cls, _item):
+            return cls
+
+        def __init__(self, coordinator):
+            self.coordinator = coordinator
+
+    class SensorEntity:
+        pass
+
+    class DeviceInfo:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class EntityCategory:
+        DIAGNOSTIC = "diagnostic"
+
+    class SensorStateClass:
+        MEASUREMENT = "measurement"
+
+    pkg_root = types.ModuleType("custom_components")
+    pkg_root.__path__ = [str(root / "custom_components")]
+    monkeypatch.setitem(sys.modules, "custom_components", pkg_root)
+    integration = types.ModuleType(package_name)
+    integration.__path__ = [str(root / "custom_components" / "thermal_efficiency")]
+    monkeypatch.setitem(sys.modules, package_name, integration)
+
+    _stub("homeassistant")
+    _stub("homeassistant.components")
+    _stub(
+        "homeassistant.components.sensor",
+        SensorEntity=SensorEntity,
+        SensorStateClass=SensorStateClass,
+    )
+    _stub("homeassistant.config_entries", ConfigEntry=object)
+    _stub("homeassistant.const", EntityCategory=EntityCategory)
+    _stub("homeassistant.core", HomeAssistant=object)
+    _stub("homeassistant.helpers")
+    _stub("homeassistant.helpers.device_registry", DeviceInfo=DeviceInfo)
+    _stub("homeassistant.helpers.entity_platform", AddEntitiesCallback=object)
+    _stub("homeassistant.helpers.update_coordinator", CoordinatorEntity=CoordinatorEntity)
+    _stub(f"{package_name}.coordinator", ThermalCoordinator=type("ThermalCoordinator", (), {}))
+    _stub(f"{package_name}.thermal_math", TAU_MIN_NIGHTS=3)
+
+    spec = importlib.util.spec_from_file_location(
+        f"{package_name}.sensor",
+        root / "custom_components" / "thermal_efficiency" / "sensor.py",
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_data_readiness_preserves_all_source_issues_with_deterministic_keys(sensor_module):
+    coordinator = SimpleNamespace(
+        conf={
+            "rooms": {
+                "bed": {"name": "Master Bedroom", "temperature": "sensor.bed_temp"},
+                "office": {"name": "Home Office", "temperature": "sensor.office_temp"},
+            }
+        },
+        data={
+            "analysis_status": {"hlc": {"status": "source_problem", "reason": "bad", "next_action": "fix"}},
+            "source_issues": {
+                "sensor.office_co2": "sensor.office_co2 had 1287 out-of-range CO2 hours in Home Office",
+                "co2": "all CO2 sensors had quality warnings",
+                "sensor.bed_co2": "sensor.bed_co2 had 2305 out-of-range CO2 hours in Master Bedroom",
+                "loft": "sensor.loft_temp has gaps",
+                "external:office_heat": "external:office_heat invalid unit in Home Office",
+            },
+        },
+    )
+    attrs = sensor_module.DataReadinessSensor(coordinator).extra_state_attributes
+    issues = attrs["source_issues"]
+
+    assert set(issues) == {"co2", "loft", "room_source_1", "room_source_2", "room_source_3"}
+    assert issues["co2"] == "all CO2 sensors had quality warnings"
+    assert issues["loft"] == "<source> has gaps"
+    # Sorted non-global keys: external:office_heat -> room_source_1, sensor.bed_co2 -> room_source_2, sensor.office_co2 -> room_source_3
+    assert issues["room_source_1"] == "<source> invalid unit in room_2"
+    assert "2305" in issues["room_source_2"]
+    assert "room_1" in issues["room_source_2"]
+    assert "1287" in issues["room_source_3"]
+    assert "room_2" in issues["room_source_3"]
+    serialized = repr(issues)
+    for secret in ("sensor.office_co2", "sensor.bed_co2", "sensor.loft_temp", "external:office_heat", "Master Bedroom", "Home Office"):
+        assert secret not in serialized
+
+
+def test_data_readiness_excludes_loft_from_conditioned_room_aliases(sensor_module):
+    coordinator = SimpleNamespace(
+        conf={
+            "rooms": {
+                "bed": {"name": "Bedroom", "room_type": "conditioned"},
+                "dining": {"name": "Dining", "room_type": "conditioned"},
+                "hall": {"name": "Hall", "room_type": "conditioned"},
+                "kitchen": {"name": "Kitchen", "room_type": "conditioned"},
+                "living": {"name": "Living", "room_type": "conditioned"},
+                "loft": {"name": "Loft", "room_type": "loft"},
+                "office": {"name": "Office", "room_type": "conditioned"},
+                "attic": {"name": "Secret Attic", "room_type": "loft"},
+            }
+        },
+        data={
+            "analysis_status": {
+                "loft": {
+                    "status": "valid",
+                    "reason": "loft resistance ratio established over 500 hours (Secret Attic)",
+                    "next_action": "keep monitoring Loft",
+                },
+                "rooms": {
+                    "bed": {"status": "valid"},
+                    "dining": {"status": "valid"},
+                    "hall": {"status": "valid"},
+                    "kitchen": {"status": "valid"},
+                    "living": {"status": "valid"},
+                    "office": {
+                        "status": "source_problem",
+                        "reason": "Office sensor sensor.office_temp is stale",
+                        "next_action": "check Office",
+                    },
+                },
+            },
+            "source_issues": {},
+        },
+    )
+    attrs = sensor_module.DataReadinessSensor(coordinator).extra_state_attributes
+    assert attrs["metrics"]["loft"]["reason"] == "loft resistance ratio established over 500 hours (loft)"
+    assert attrs["metrics"]["loft"]["next_action"] == "keep monitoring Loft"
+    assert "room_6" not in attrs["metrics"]["loft"]["reason"]
+    assert attrs["metrics"]["rooms"]["room_6"]["reason"] == "room_6 sensor <source> is stale"
+    assert attrs["metrics"]["rooms"]["room_6"]["next_action"] == "check room_6"
+    assert "Secret Attic" not in repr(attrs)
+    assert "Office" not in repr(attrs)
+
+
+def test_data_readiness_surfaces_eligible_source_lag_days(sensor_module):
+    coordinator = SimpleNamespace(
+        conf={"rooms": {}},
+        data={
+            "analysis_status": {
+                "hlc": {
+                    "status": "source_problem",
+                    "reason": "eligible days lag",
+                    "next_action": "restore heating coverage",
+                    "source_lag_days": 0,
+                    "eligible_source_lag_days": 5,
+                    "latest_source_day": "2026-06-30",
+                    "model_data_through": "2026-06-25",
+                },
+                "dhw": {
+                    "status": "provisional",
+                    "reason": "ok",
+                    "next_action": "wait",
+                    "source_lag_days": 0,
+                    "eligible_source_lag_days": 3,
+                },
+                "usage": {
+                    "status": "valid",
+                    "reason": "ok",
+                    "next_action": "none",
+                    "source_lag_days": 0,
+                    "eligible_source_lag_days": 2,
+                },
+            },
+            "source_issues": {},
+        },
+    )
+    attrs = sensor_module.DataReadinessSensor(coordinator).extra_state_attributes
+    assert attrs["metrics"]["hlc"]["source_lag_days"] == 0
+    assert attrs["metrics"]["hlc"]["eligible_source_lag_days"] == 5
+    assert attrs["metrics"]["dhw"]["eligible_source_lag_days"] == 3
+    assert attrs["metrics"]["usage"]["eligible_source_lag_days"] == 2
+
+
+def test_hlc_loft_ach_and_readiness_expose_phase4_and_lag_attributes(sensor_module):
+    coordinator = SimpleNamespace(
+        conf={
+            "experimental_whole_home_ventilation": True,
+            "rooms": {"bed": {"name": "Master Bedroom", "room_type": "conditioned"}},
+        },
+        data={
+            "hlc": {
+                "hlc_w_per_k": 264.34,
+                "r_squared": 0.89,
+                "days_used": 60,
+                "window_days": 120,
+                "hlc_ci_low_w_per_k": 245.1,
+                "hlc_ci_high_w_per_k": 283.6,
+                "residual_autocorrelation": 0.15,
+                "effective_independent_days": 45,
+                "free_gains_w": 420,
+                "fuel_input_hlc_w_per_k": 300.4,
+                "space_heating_fuel_input_hlc_w_per_k": 295.2,
+                "boiler_efficiency_used": 0.88,
+                "regression_intercept_kwh_per_day": 1.4,
+                "dhw_baseline_kwh_per_day": 1.1,
+                "solar_adjusted": True,
+                "unadjusted_hlc_w_per_k": 306.44,
+                "solar_gain_coefficient_kwh_per_day": -8.254,
+                "winter_hlc_w_per_k": 261.87,
+            },
+            "loft": {
+                "ratio": 0.095,
+                "hours_used": 410,
+                "window_days": 120,
+                "iqr": 0.042,
+                "out_of_range_pct": 0.0,
+                "cold_night_gate": True,
+            },
+            "air_change_rate": {
+                "ach": 0.382,
+                "windows": 18,
+                "baseline_ppm": 495.0,
+                "co2_sensors_used": 2,
+                "baseline_source": "indoor low-percentile (configured baseline below sensor floor)",
+                "cadence": "5minute",
+                "baseline_mismatch_note": "Configured outdoor CO2 (400 ppm) is >50 ppm below sensor p02",
+            },
+            "losses": {
+                "ach": 0.382,
+                "ventilation_w_per_k": 32.0,
+                "fabric_w_per_k": 232.3,
+                "ventilation_share_pct": 12.1,
+                "hlc_delivered_w_per_k": 264.3,
+                "boiler_efficiency_used": 0.88,
+                "cadence": "5minute",
+                "baseline_mismatch_note": "Configured outdoor CO2 (400 ppm) is >50 ppm below sensor p02",
+            },
+            "analysis_status": {
+                "hlc": {
+                    "status": "valid",
+                    "reason": "HLC fitted",
+                    "next_action": "keep monitoring",
+                    "source_lag_days": 0,
+                    "eligible_source_lag_days": 4,
+                    "eligibility_degraded": True,
+                    "eligible_lag_warning": "Master Bedroom sensor.bed_heat expected_heating_gap delayed eligibility by 4 days",
+                },
+                "dhw": {
+                    "status": "valid",
+                    "reason": "DHW fitted",
+                    "next_action": "keep monitoring",
+                    "source_lag_days": 0,
+                    "eligible_source_lag_days": 0,
+                    "eligibility_degraded": False,
+                    "eligible_lag_warning": None,
+                },
+            },
+            "source_issues": {},
+        },
+    )
+
+    hlc_attrs = sensor_module.HlcSensor(coordinator).extra_state_attributes
+    assert hlc_attrs["solar_adjusted"] is True
+    assert hlc_attrs["unadjusted_hlc_w_per_k"] == 306.4
+    assert hlc_attrs["solar_gain_coefficient_kwh_per_day"] == -8.25
+    assert hlc_attrs["winter_hlc_w_per_k"] == 261.9
+    assert hlc_attrs["eligibility_degraded"] is True
+    assert "expected_heating_gap" in hlc_attrs["eligible_lag_warning"]
+
+    loft_attrs = sensor_module.LoftSensor(coordinator).extra_state_attributes
+    assert loft_attrs["cold_night_gate"] is True
+
+    ach_attrs = sensor_module.AirChangeRateSensor(coordinator).extra_state_attributes
+    assert ach_attrs["cadence"] == "5minute"
+    assert ach_attrs["co2_baseline_source"] == "indoor low-percentile (configured baseline below sensor floor)"
+    assert ach_attrs["baseline_mismatch_note"] == "Configured outdoor CO2 (400 ppm) is >50 ppm below sensor p02"
+
+    vent_attrs = sensor_module.VentilationLossSensor(coordinator).extra_state_attributes
+    assert vent_attrs["cadence"] == "5minute"
+    assert vent_attrs["baseline_mismatch_note"] == "Configured outdoor CO2 (400 ppm) is >50 ppm below sensor p02"
+
+    readiness_attrs = sensor_module.DataReadinessSensor(coordinator).extra_state_attributes
+    assert readiness_attrs["metrics"]["hlc"]["eligibility_degraded"] is True
+    assert readiness_attrs["metrics"]["hlc"]["eligible_lag_warning"] == "room_1 <source> expected_heating_gap delayed eligibility by 4 days"
+    assert readiness_attrs["metrics"]["dhw"]["eligibility_degraded"] is False
+    assert readiness_attrs["metrics"]["dhw"]["eligible_lag_warning"] is None
+    assert "Master Bedroom" not in repr(readiness_attrs)
+    assert "sensor.bed_heat" not in repr(readiness_attrs)
+
+
+def test_hlc_unadjusted_handles_none_solar_and_winter_fields(sensor_module):
+    coordinator = SimpleNamespace(
+        conf={"rooms": {}},
+        data={
+            "hlc": {
+                "hlc_w_per_k": 280.0,
+                "r_squared": 0.81,
+                "days_used": 30,
+                "window_days": 60,
+                "hlc_ci_low_w_per_k": 250.0,
+                "hlc_ci_high_w_per_k": 310.0,
+                "residual_autocorrelation": 0.1,
+                "effective_independent_days": 25,
+                "free_gains_w": 300,
+                "fuel_input_hlc_w_per_k": 318.2,
+                "space_heating_fuel_input_hlc_w_per_k": 318.2,
+                "boiler_efficiency_used": 0.88,
+                "regression_intercept_kwh_per_day": 1.0,
+                "dhw_baseline_kwh_per_day": None,
+                "solar_adjusted": False,
+                "unadjusted_hlc_w_per_k": 280.0,
+                "solar_gain_coefficient_kwh_per_day": None,
+                "winter_hlc_w_per_k": None,
+            },
+            "analysis_status": {"hlc": {"status": "provisional", "reason": "ok", "next_action": "wait"}},
+        },
+    )
+    hlc_attrs = sensor_module.HlcSensor(coordinator).extra_state_attributes
+    assert hlc_attrs["solar_adjusted"] is False
+    assert hlc_attrs["unadjusted_hlc_w_per_k"] == 280.0
+    assert hlc_attrs["solar_gain_coefficient_kwh_per_day"] is None
+    assert hlc_attrs["winter_hlc_w_per_k"] is None
+

@@ -15,8 +15,11 @@ from .thermal_math import (
     HLC_MAX_INTERPOLATION_GAP_SECONDS,
     HLC_MAX_TEMPERATURE_GAP_HOURS_PER_DAY,
     HLC_MAX_TEMPERATURE_GAP_SECONDS,
+    INDOOR_TEMP_MAX_JUMP_C,
     clean_series_from_stats,
+    is_valid_indoor_temperature_value,
     is_valid_temperature_value,
+    reject_indoor_temperature_spikes,
 )
 
 from .const import (
@@ -253,6 +256,10 @@ def compose(stats: dict, config: dict, data: dict, tz) -> tuple[dict, dict]:
                 }
                 hlc_key = f"{key}_hlc"
                 hlc_rows = {**by_time, **{ts: item[0] for ts, item in accepted.items()}}
+                raw_valid_by_time, _ = clean_series_from_stats(
+                    list(by_time.values()), is_valid_indoor_temperature_value, "mean"
+                )
+                valid_by_time, _ = reject_indoor_temperature_spikes(raw_valid_by_time)
                 interpolated = {}
                 for visit in relevant:
                     stream = data.get("streams", {}).get(visit.get("stream"))
@@ -277,16 +284,15 @@ def compose(stats: dict, config: dict, data: dict, tz) -> tuple[dict, dict]:
                                 or any(after + 3600 > q["start"] and (q.get("end") is None or before < q["end"])
                                        for q in stream.get("quarantine", []))):
                             continue
-                        edge_values, _ = clean_series_from_stats(
-                            [by_time[before], by_time[after]], is_valid_temperature_value, "mean"
-                        )
-                        if before not in edge_values or after not in edge_values:
+                        if before not in valid_by_time or after not in valid_by_time:
+                            continue
+                        if abs(valid_by_time[after] - valid_by_time[before]) > INDOOR_TEMP_MAX_JUMP_C:
                             continue
                         for ts in missing:
                             fraction = (ts - before) / (after - before)
                             interpolated[ts] = {
                                 "start": ts,
-                                "mean": edge_values[before] + fraction * (edge_values[after] - edge_values[before]),
+                                "mean": valid_by_time[before] + fraction * (valid_by_time[after] - valid_by_time[before]),
                             }
                 interpolated_by_day = {}
                 for ts, row in interpolated.items():

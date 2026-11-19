@@ -17,6 +17,7 @@ from .const import (
     CONF_ROOM_TYPE,
     DOMAIN,
     ROOM_TYPE_CONDITIONED,
+    ROOM_TYPE_LOFT,
 )
 from .coordinator import ThermalCoordinator
 from .thermal_math import TAU_MIN_NIGHTS
@@ -47,6 +48,8 @@ def _status_attributes(status_info: dict, fallback_status: str | None = None) ->
         "latest_eligible_day",
         "source_lag_days",
         "eligible_source_lag_days",
+        "eligibility_degraded",
+        "eligible_lag_warning",
         "model_data_through",
         "model_data_from",
         "raw_complete_gas_days",
@@ -226,6 +229,22 @@ class HlcSensor(ThermalSensor):
                 if "space_heating_hlc_w_per_k" in fit
                 else None
             ),
+            "solar_adjusted": fit.get("solar_adjusted"),
+            "unadjusted_hlc_w_per_k": (
+                round(fit["unadjusted_hlc_w_per_k"], 1)
+                if fit.get("unadjusted_hlc_w_per_k") is not None
+                else None
+            ),
+            "solar_gain_coefficient_kwh_per_day": (
+                round(fit["solar_gain_coefficient_kwh_per_day"], 2)
+                if fit.get("solar_gain_coefficient_kwh_per_day") is not None
+                else None
+            ),
+            "winter_hlc_w_per_k": (
+                round(fit["winter_hlc_w_per_k"], 1)
+                if fit.get("winter_hlc_w_per_k") is not None
+                else None
+            ),
             "dhw_correction": (
                 "non-heating (hot-water) gas estimated and subtracted before fitting"
                 if "space_heating_hlc_w_per_k" in fit
@@ -310,6 +329,7 @@ class LoftSensor(ThermalSensor):
             "humidity_pct": (
                 round(fit["humidity_pct"], 1) if "humidity_pct" in fit else None
             ),
+            "cold_night_gate": fit.get("cold_night_gate"),
         }
 
 
@@ -344,7 +364,9 @@ class AirChangeRateSensor(ThermalSensor):
             "decay_windows_used": ach["windows"],
             "outdoor_co2_baseline_ppm": round(ach["baseline_ppm"], 0),
             "co2_sensors_used": ach.get("co2_sensors_used", 1),
-            "co2_baseline_source": ach.get("co2_baseline_source"),
+            "co2_baseline_source": ach.get("co2_baseline_source") or ach.get("baseline_source"),
+            "cadence": ach.get("cadence"),
+            "baseline_mismatch_note": ach.get("baseline_mismatch_note"),
         }
         if status_info.get("latest_source_day"):
             attrs["latest_source_day"] = status_info["latest_source_day"]
@@ -404,6 +426,8 @@ class VentilationLossSensor(ThermalSensor):
                 else None
             ),
             "air_change_rate": round(losses["ach"], 3) if losses.get("ach") is not None else None,
+            "cadence": losses.get("cadence"),
+            "baseline_mismatch_note": losses.get("baseline_mismatch_note"),
         }
 
 
@@ -961,8 +985,22 @@ class DataReadinessSensor(CoordinatorEntity[ThermalCoordinator], SensorEntity):
         source_issues = self.coordinator.data.get("source_issues", {})
         room_names = {}
         rooms = self.coordinator.conf.get(CONF_ROOMS, {})
-        for index, (room_id, room) in enumerate(sorted(rooms.items()), 1):
-            room_names[room.get("name") or room_id] = f"room_{index}"
+        conditioned_rooms = []
+        for room_id, room in sorted(rooms.items()):
+            if (
+                isinstance(room, dict)
+                and room.get(CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED) == ROOM_TYPE_LOFT
+            ):
+                room_name = room.get("name")
+                if room_id.casefold() != "loft":
+                    room_names[room_id] = "loft"
+                if isinstance(room_name, str) and room_name and room_name.casefold() != "loft":
+                    room_names[room_name] = "loft"
+                continue
+            conditioned_rooms.append((room_id, room))
+        for index, (room_id, room) in enumerate(conditioned_rooms, 1):
+            room_name = room.get("name") if isinstance(room, dict) else None
+            room_names[room_name or room_id] = f"room_{index}"
             room_names[room_id] = f"room_{index}"
 
         def sanitize(value):
@@ -980,10 +1018,27 @@ class DataReadinessSensor(CoordinatorEntity[ThermalCoordinator], SensorEntity):
             text = re.sub(r"(?<![\w])[a-z0-9_.-]+:[a-z0-9_.:-]+", "<source>", text, flags=re.IGNORECASE)
             return text
 
-        sanitized_issues = {
-            role if role in {"outdoor", "gas_meter", "water", "electricity_meter", "co2", "outdoor_co2_sensor", "gas_unit_rate", "electricity_unit_rate"} else "room_source": sanitize(msg)
-            for role, msg in source_issues.items()
+        global_issue_roles = {
+            "outdoor",
+            "gas_meter",
+            "water",
+            "electricity_meter",
+            "co2",
+            "outdoor_co2_sensor",
+            "gas_unit_rate",
+            "electricity_unit_rate",
+            "loft",
+            "loft_humidity",
         }
+        sanitized_issues: dict[str, str | None] = {}
+        room_source_index = 0
+        for role, msg in sorted(source_issues.items()):
+            if role in global_issue_roles:
+                safe_key = role
+            else:
+                room_source_index += 1
+                safe_key = f"room_source_{room_source_index}"
+            sanitized_issues[safe_key] = sanitize(msg)
         summary_parts = []
         sanitized_status = {}
         for metric, info in status_map.items():
@@ -996,7 +1051,14 @@ class DataReadinessSensor(CoordinatorEntity[ThermalCoordinator], SensorEntity):
                             "next_action": sanitize(room.get("next_action")),
                             **{
                                 key: room[key]
-                                for key in ("usable_observations", "required_observations", "latest_source_day", "source_lag_days", "model_data_through")
+                                for key in (
+                                    "usable_observations",
+                                    "required_observations",
+                                    "latest_source_day",
+                                    "source_lag_days",
+                                    "eligible_source_lag_days",
+                                    "model_data_through",
+                                )
                                 if key in room
                             },
                         }
@@ -1015,8 +1077,17 @@ class DataReadinessSensor(CoordinatorEntity[ThermalCoordinator], SensorEntity):
                 "reason": sanitize(info.get("reason")),
                 "next_action": sanitize(info.get("next_action")),
                 **{
-                    key: info[key]
-                    for key in ("usable_observations", "required_observations", "latest_source_day", "source_lag_days", "model_data_through")
+                    key: sanitize(info[key]) if key == "eligible_lag_warning" else info[key]
+                    for key in (
+                        "usable_observations",
+                        "required_observations",
+                        "latest_source_day",
+                        "source_lag_days",
+                        "eligible_source_lag_days",
+                        "eligibility_degraded",
+                        "eligible_lag_warning",
+                        "model_data_through",
+                    )
                     if key in info
                 },
             }

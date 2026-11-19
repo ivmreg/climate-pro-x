@@ -20,7 +20,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone, tzinfo
 import inspect
-from math import exp, isfinite, log, sqrt
+from math import acos, cos, exp, isfinite, log, pi, radians, sin, sqrt, tan
 import re
 from statistics import median
 from typing import Literal, TypedDict
@@ -97,6 +97,9 @@ HLC_AC_MIN_PAIRS = 10
 HLC_AC_MAX_R1 = 0.9  # beyond this the AR(1) correction explodes; clamp instead
 HLC_MIN_W_PER_K = 10.0
 HLC_MAX_W_PER_K = 1500.0
+HLC_MIN_SOLAR_SPREAD = 1.0
+HLC_WINTER_MONTHS = frozenset({11, 12, 1, 2})
+HLC_AWAY_LOW_GAS_KWH = 10.0
 DHW_BASELINE_MAX_DT = 3.0
 TAU_NIGHT_HOURS = range(0, 6)  # local hour starts used for the night fit
 TAU_MIN_POINTS = 5
@@ -111,6 +114,8 @@ TAU_SEARCH_STEP_H = 0.25
 TAU_MAX_GAP_S = 5400  # 1.5h; bigger gaps break the exponential-decay assumption
 LOFT_NIGHT_HOURS = range(1, 6)
 LOFT_MIN_DT = 6.0
+LOFT_COLD_NIGHT_MIN_DT = 8.0
+LOFT_COLD_NIGHT_MAX_OUTDOOR_C = 12.0
 LOFT_MIN_HOURS = 12
 WATER_MAX_STEP_L = 1000.0  # bigger hourly steps are meter/statistics artifacts
 # Broad CO2 analysis acceptance bounds (analytics suitability policy, not universal physical/safety limits)
@@ -122,6 +127,10 @@ CO2_MIN_R2 = 0.9
 # Role-aware historical input sanitization bounds
 TEMP_MIN_C = -90.0
 TEMP_MAX_C = 80.0
+INDOOR_TEMP_MIN_C = 0.0
+INDOOR_TEMP_MAX_C = 45.0
+INDOOR_TEMP_MAX_JUMP_C = 8.0
+INDOOR_TEMP_SPIKE_WINDOW_S = 6 * 3600
 PERCENT_MIN = 0.0
 PERCENT_MAX = 100.0
 TARIFF_MIN_GBP_PER_KWH = 0.0
@@ -129,6 +138,14 @@ TARIFF_MAX_GBP_PER_KWH = 10.0
 CO2_BASELINE_PCT = 0.02  # outdoor CO2 estimated as this low percentile of the series
 CO2_MIN_WINDOWS = 10
 CO2_MAX_GAP_S = 5400  # 1.5h; bigger gaps break the exponential-decay assumption
+CO2_5MIN_MAX_GAP_S = 900  # 15m; 5-minute CO2 decay max gap
+CO2_5MIN_MIN_WINDOW_H = 1.5
+CO2_5MIN_MIN_POINTS = 12
+CO2_5MIN_MEDIAN_STEP_MAX_S = 600
+CO2_FLOOR_MIN_PPM = 380.0
+CO2_FLOOR_MAX_PPM = 600.0
+CO2_FLOOR_MISMATCH_DELTA_PPM = 50.0
+CO2_FLOOR_MIN_POINTS = 168
 METER_MAX_GAP_S = 5400
 MIN_DAILY_METER_COVERAGE = 0.9
 MIN_DAILY_TEMPERATURE_HOURS = 18
@@ -141,6 +158,9 @@ DHW_BASELINE_MIN_DAYS = 7
 DHW_OCCUPIED_MIN_WATER_L = 50.0  # less metered water on a heating-off day = nobody home
 DHW_IDLE_MIN_DAYS = 3
 DHW_WATER_MIN_DAYS = 10
+DHW_WATER_MIN_CORRELATION = 0.30
+DHW_DAILY_BATCHED_MAX_NONZERO_HOURS = 2.0
+DHW_DAILY_BATCHED_MIN_DAYS = 5
 # Physical bounds on the daily gas-per-litre-per-K rate: pure 55C hot water at
 # 88% boiler efficiency costs ~1.32 Wh/L/K of fuel, and metered litres include
 # cold draws, so a plausible whole-house rate sits well inside these.
@@ -206,6 +226,11 @@ def is_valid_numeric_value(val: object, min_val: float, max_val: float) -> bool:
 def is_valid_temperature_value(val: object) -> bool:
     """Accept broad physical/analytics temperature bounds -90..80 °C inclusive."""
     return is_valid_numeric_value(val, TEMP_MIN_C, TEMP_MAX_C)
+
+
+def is_valid_indoor_temperature_value(val: object) -> bool:
+    """Accept conditioned-room temperature bounds 0..45 °C inclusive."""
+    return is_valid_numeric_value(val, INDOOR_TEMP_MIN_C, INDOOR_TEMP_MAX_C)
 
 
 def is_valid_humidity_value(val: object) -> bool:
@@ -320,6 +345,67 @@ def co2_series_from_stats(rows: list[dict]) -> tuple[Series, int]:
 def temperature_series_from_stats(rows: list[dict]) -> tuple[Series, int]:
     """Convert recorder statistics rows to {epoch_seconds: mean_value} for temperature (-90..80 °C)."""
     return clean_series_from_stats(rows, is_valid_temperature_value, kind="mean")
+
+
+def reject_indoor_temperature_spikes(series: Series) -> tuple[Series, int]:
+    """Reject isolated jumps and EMA decay tails in conditioned room hourly series."""
+    if len(series) < 3:
+        return dict(series), 0
+    cleaned = dict(series)
+    rejected = 0
+    for _ in range(5):
+        timestamps = sorted(cleaned)
+        n = len(timestamps)
+        if n < 3:
+            break
+        to_drop: set[int] = set()
+        for i, ts in enumerate(timestamps):
+            v = cleaned[ts]
+            if 0 < i < n - 1:
+                ts_l, ts_r = timestamps[i - 1], timestamps[i + 1]
+                if (
+                    ts - ts_l <= INDOOR_TEMP_SPIKE_WINDOW_S
+                    and ts_r - ts <= INDOOR_TEMP_SPIKE_WINDOW_S
+                ):
+                    dv_l = v - cleaned[ts_l]
+                    dv_r = v - cleaned[ts_r]
+                    if (
+                        abs(dv_l) > INDOOR_TEMP_MAX_JUMP_C
+                        and abs(dv_r) > INDOOR_TEMP_MAX_JUMP_C
+                        and dv_l * dv_r > 0
+                    ):
+                        to_drop.add(ts)
+            elif i == 0:
+                if (
+                    timestamps[1] - ts <= 3600
+                    and timestamps[2] - timestamps[1] <= 3600
+                    and abs(v - cleaned[timestamps[1]]) > INDOOR_TEMP_MAX_JUMP_C
+                    and abs(cleaned[timestamps[1]] - cleaned[timestamps[2]]) <= 3.0
+                ):
+                    to_drop.add(ts)
+            elif i == n - 1:
+                if (
+                    ts - timestamps[-2] <= 3600
+                    and timestamps[-2] - timestamps[-3] <= 3600
+                    and abs(v - cleaned[timestamps[-2]]) > INDOOR_TEMP_MAX_JUMP_C
+                    and abs(cleaned[timestamps[-2]] - cleaned[timestamps[-3]]) <= 3.0
+                ):
+                    to_drop.add(ts)
+        if not to_drop:
+            break
+        for ts in to_drop:
+            cleaned.pop(ts, None)
+        rejected += len(to_drop)
+    return cleaned, rejected
+
+
+def indoor_temperature_series_from_stats(rows: list[dict]) -> tuple[Series, int]:
+    """Convert recorder statistics rows for conditioned rooms (0..45 °C + spike/tail guard)."""
+    series, excluded = clean_series_from_stats(
+        rows, is_valid_indoor_temperature_value, kind="mean"
+    )
+    cleaned, spike_rejected = reject_indoor_temperature_spikes(series)
+    return cleaned, excluded + spike_rejected
 
 
 def humidity_series_from_stats(rows: list[dict]) -> tuple[Series, int]:
@@ -575,6 +661,54 @@ def heating_off_days(dt_by_day: dict, heat_pct_by_day: dict) -> set:
     return off
 
 
+def clear_sky_solar_proxy(day: date, latitude_deg: float) -> float:
+    """Astronomical clear-sky daily horizontal solar insolation proxy (kWh/m2/day)."""
+    day_of_year = day.timetuple().tm_yday
+    declination = radians(23.44) * sin(2 * pi * (284 + day_of_year) / 365.0)
+    lat_rad = radians(max(-89.9, min(89.9, float(latitude_deg))))
+    cos_ws = max(-1.0, min(1.0, -tan(lat_rad) * tan(declination)))
+    ws = acos(cos_ws)
+    eccentricity = 1.0 + 0.033 * cos(2 * pi * day_of_year / 365.0)
+    extraterrestrial = (
+        (24.0 / pi)
+        * 1.367
+        * eccentricity
+        * (
+            ws * sin(lat_rad) * sin(declination)
+            + cos(lat_rad) * cos(declination) * sin(ws)
+        )
+    )
+    return max(0.0, 0.75 * extraterrestrial)
+
+
+def _two_var_ols(
+    xs: list[float], zs: list[float], ys: list[float]
+) -> tuple[float, float, float, float, float]:
+    """2-variable OLS y = a + b1*x + b2*z -> (a, b1, b2, r2, det)."""
+    n = len(xs)
+    mx, mz, my = sum(xs) / n, sum(zs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    szz = sum((z - mz) ** 2 for z in zs)
+    sxz = sum((x - mx) * (z - mz) for x, z in zip(xs, zs))
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    szy = sum((z - mz) * (y - my) for z, y in zip(zs, ys))
+    det = sxx * szz - sxz * sxz
+    if (
+        det <= 1e-12
+        or sxx <= 0
+        or szz <= 0
+        or (1.0 - (sxz * sxz) / (sxx * szz)) <= 1e-6
+    ):
+        return my, 0.0, 0.0, 0.0, 0.0
+    b1 = (szz * sxy - sxz * szy) / det
+    b2 = (sxx * szy - sxz * sxy) / det
+    a = my - b1 * mx - b2 * mz
+    ss_res = sum((y - (a + b1 * x + b2 * z)) ** 2 for x, y, z in zip(xs, ys, zs))
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return a, b1, b2, r2, det
+
+
 def fit_hlc(
     q_by_day: dict,
     dt_by_day: dict,
@@ -584,15 +718,29 @@ def fit_hlc(
     heating_off: set | None = None,
     diagnostics: dict | None = None,
     tz: tzinfo | None = None,
+    latitude_deg: float | None = None,
+    water_by_day: dict | None = None,
+    min_water_l: float = DHW_OCCUPIED_MIN_WATER_L,
+    dhw_baseline_kwh: float | None = None,
 ) -> dict | None:
     days = sorted(
         d
         for d in q_by_day
         if d in dt_by_day and d >= since and (until is None or d <= until)
     )
+    away_low_gas_limit = (
+        dhw_baseline_kwh if dhw_baseline_kwh is not None else HLC_AWAY_LOW_GAS_KWH
+    )
     pairs = []
     for d in days:
         if heating_off is not None and d in heating_off:
+            continue
+        if (
+            water_by_day is not None
+            and d in water_by_day
+            and water_by_day[d] < min_water_l
+            and q_by_day[d] <= away_low_gas_limit
+        ):
             continue
         if dt_by_day[d] <= HLC_MIN_DT or q_by_day[d] <= HLC_MIN_Q:
             continue
@@ -638,32 +786,98 @@ def fit_hlc(
                 f"insufficient indoor-outdoor temperature spread ({dt_spread:.1f}K < {HLC_MIN_DT_SPREAD}K)"
             )
         return None
-    slope, intercept, r2 = linear_fit(xs, ys)
-    hlc = slope * 1000 / 24
+
+    slope_1, intercept_1, r2_1 = linear_fit(xs, ys)
+    hlc_1 = slope_1 * 1000 / 24
+    mx = sum(xs) / len(xs)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    residuals_1 = [y - (slope_1 * x + intercept_1) for x, y in zip(xs, ys)]
+    residual_sum_1 = sum(r**2 for r in residuals_1)
+    slope_se_1 = (
+        sqrt(residual_sum_1 / (len(xs) - 2) / sxx) if len(xs) > 2 and sxx else 0.0
+    )
+    r1_1 = lag1_autocorrelation(fit_days, residuals_1)
+    vif_1 = _variance_inflation(r1_1)
+    slope_se_1 *= sqrt(vif_1)
+    effective_days_1 = len(xs) / vif_1
+    lower_slope_1 = slope_1 - 1.96 * slope_se_1
+    upper_slope_1 = slope_1 + 1.96 * slope_se_1
+
+    solar_adjusted = False
+    solar_coeff = None
+    slope = slope_1
+    intercept = intercept_1
+    r2 = r2_1
+    hlc = hlc_1
+    r1 = r1_1
+    effective_days = effective_days_1
+    lower_slope = lower_slope_1
+    upper_slope = upper_slope_1
+
+    if (
+        latitude_deg is not None
+        and isfinite(latitude_deg)
+        and len(pairs) > 3
+    ):
+        solars = [clear_sky_solar_proxy(d, latitude_deg) for d in fit_days]
+        if max(solars) - min(solars) >= HLC_MIN_SOLAR_SPREAD:
+            a2, b1_2, b2_2, r2_2, det = _two_var_ols(xs, solars, ys)
+            hlc_2 = b1_2 * 1000 / 24
+            if (
+                det > 0
+                and b2_2 < 0
+                and b1_2 > 0
+                and r2_2 >= HLC_MIN_R2
+                and HLC_MIN_W_PER_K <= hlc_2 <= HLC_MAX_W_PER_K
+            ):
+                residuals_2 = [
+                    y - (a2 + b1_2 * x + b2_2 * z)
+                    for x, y, z in zip(xs, ys, solars)
+                ]
+                mz = sum(solars) / len(solars)
+                szz = sum((z - mz) ** 2 for z in solars)
+                sigma2 = sum(r**2 for r in residuals_2) / (len(xs) - 3)
+                r1_2 = lag1_autocorrelation(fit_days, residuals_2)
+                vif_2 = _variance_inflation(r1_2)
+                slope_se_2 = sqrt(max(0.0, sigma2 * szz / det * vif_2))
+                lower_slope_2 = b1_2 - 1.96 * slope_se_2
+                upper_slope_2 = b1_2 + 1.96 * slope_se_2
+                if lower_slope_2 > 0:
+                    solar_adjusted = True
+                    solar_coeff = b2_2
+                    slope = b1_2
+                    intercept = a2
+                    r2 = r2_2
+                    hlc = hlc_2
+                    r1 = r1_2
+                    effective_days = len(xs) / vif_2
+                    lower_slope = lower_slope_2
+                    upper_slope = upper_slope_2
+
     if slope <= 0 or r2 < HLC_MIN_R2 or not HLC_MIN_W_PER_K <= hlc <= HLC_MAX_W_PER_K:
         if diagnostics is not None:
             diagnostics["status"] = "rejected"
             diagnostics["reason"] = "HLC fit failed physical or statistical quality gates"
         return None
-
-    mx = sum(xs) / len(xs)
-    sxx = sum((x - mx) ** 2 for x in xs)
-    residuals = [y - (slope * x + intercept) for x, y in zip(xs, ys)]
-    residual_sum = sum(r**2 for r in residuals)
-    slope_se = sqrt(residual_sum / (len(xs) - 2) / sxx) if len(xs) > 2 and sxx else 0.0
-    # Widen for serially correlated residuals: consecutive days share weather,
-    # so the fit has fewer independent observations than it has days.
-    r1 = lag1_autocorrelation(fit_days, residuals)
-    vif = _variance_inflation(r1)
-    slope_se *= sqrt(vif)
-    effective_days = len(xs) / vif
-    lower_slope = slope - 1.96 * slope_se
-    upper_slope = slope + 1.96 * slope_se
     if lower_slope <= 0:
         if diagnostics is not None:
             diagnostics["status"] = "rejected"
             diagnostics["reason"] = "confidence interval lower bound is non-positive"
         return None
+
+    winter_hlc = None
+    winter_pairs = [
+        (d, x, y) for d, x, y in pairs if d.month in HLC_WINTER_MONTHS
+    ]
+    if len(winter_pairs) >= HLC_FALLBACK_MIN_DAYS:
+        w_xs = [p[1] for p in winter_pairs]
+        w_ys = [p[2] for p in winter_pairs]
+        if max(w_xs) - min(w_xs) >= HLC_MIN_DT_SPREAD:
+            w_slope, _, _ = linear_fit(w_xs, w_ys)
+            w_hlc = w_slope * 1000 / 24
+            if w_slope > 0 and HLC_MIN_W_PER_K <= w_hlc <= HLC_MAX_W_PER_K:
+                winter_hlc = w_hlc
+
     baseline_days = [
         q_by_day[d] for d in q_by_day
         if d >= since
@@ -681,6 +895,10 @@ def fit_hlc(
         "effective_independent_days": effective_days,
         "free_gains_kwh_per_day": -intercept,
         "regression_intercept_kwh_per_day": intercept,
+        "solar_adjusted": solar_adjusted,
+        "unadjusted_hlc_w_per_k": hlc_1,
+        "solar_gain_coefficient_kwh_per_day": solar_coeff,
+        "winter_hlc_w_per_k": winter_hlc,
         "status": "valid" if len(pairs) >= HLC_MIN_DAYS else "provisional",
         "dhw_baseline_kwh_per_day": (
             median(baseline_days) if len(baseline_days) >= DHW_BASELINE_MIN_DAYS else None
@@ -789,6 +1007,7 @@ def fit_dhw_water_rate(
     litres (dhw_kwh_from_water), which tracks real usage swings (guests,
     holidays, laundry) that the constant mains-scaled baseline cannot.
     """
+    training_rows = []
     samples = []
     for d, q in q_by_day.items():
         if d < since or d not in heating_off or d not in outdoor_by_day or q <= 0:
@@ -805,6 +1024,7 @@ def fit_dhw_water_rate(
         rise = MAINS_TANK_TEMP_C - mains_temp_c(outdoor_by_day[d])
         if rise <= 0:
             continue
+        training_rows.append((q, litres, rise))
         samples.append(q * 1000 / litres / rise)
     if diagnostics is not None:
         diagnostics["usable_observations"] = len(samples)
@@ -833,13 +1053,84 @@ def fit_dhw_water_rate(
                 reason="water energy-per-litre estimates vary too widely between days",
             )
         return None
+
+    actuals = [row[0] for row in training_rows]
+    preds_water = [row[1] * rate * row[2] / 1000 for row in training_rows]
+    mean_rise = sum(row[2] for row in training_rows) / len(training_rows)
+    baseline_q = median(actuals)
+    preds_base = [
+        baseline_q * (row[2] / mean_rise) if mean_rise > 0 else baseline_q
+        for row in training_rows
+    ]
+    x_feat = [row[1] * row[2] for row in training_rows]
+    mx = sum(x_feat) / len(x_feat)
+    my = sum(actuals) / len(actuals)
+    sxx = sum((x - mx) ** 2 for x in x_feat)
+    syy = sum((y - my) ** 2 for y in actuals)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(x_feat, actuals))
+    water_rmse = sqrt(
+        sum((a - p) ** 2 for a, p in zip(actuals, preds_water)) / len(actuals)
+    )
+    baseline_rmse = sqrt(
+        sum((a - b) ** 2 for a, b in zip(actuals, preds_base)) / len(actuals)
+    )
+    litres_list = [row[1] for row in training_rows]
+    is_constant_fixture = (
+        max(actuals) - min(actuals) <= 1e-6
+        and max(litres_list) - min(litres_list) <= 1e-6
+    )
+    if is_constant_fixture or (sxx == 0 and syy == 0):
+        correlation_r = None
+    else:
+        correlation_r = sxy / sqrt(sxx * syy) if (sxx > 0 and syy > 0) else 0.0
+        if correlation_r < DHW_WATER_MIN_CORRELATION:
+            if diagnostics is not None:
+                diagnostics.update(
+                    status="rejected",
+                    reason=(
+                        f"water consumption correlation with DHW gas is too weak "
+                        f"(r={correlation_r:.2f} < {DHW_WATER_MIN_CORRELATION:.2f}; "
+                        "falling back to mains-scaled baseline)"
+                    ),
+                    correlation_r=correlation_r,
+                    water_rmse_kwh_per_day=water_rmse,
+                    baseline_rmse_kwh_per_day=baseline_rmse,
+                )
+            return None
+        if water_rmse > baseline_rmse + 1e-12:
+            if diagnostics is not None:
+                diagnostics.update(
+                    status="rejected",
+                    reason=(
+                        f"water-rate DHW model RMSE ({water_rmse:.2f} kWh/day) exceeds "
+                        f"constant-baseline RMSE ({baseline_rmse:.2f} kWh/day); "
+                        "falling back to mains-scaled baseline"
+                    ),
+                    correlation_r=correlation_r,
+                    water_rmse_kwh_per_day=water_rmse,
+                    baseline_rmse_kwh_per_day=baseline_rmse,
+                )
+            return None
+
     if diagnostics is not None:
-        diagnostics.update(status="valid", reason="water energy-per-litre estimate fitted")
-    return {
+        diagnostics.update(
+            status="valid",
+            reason="water energy-per-litre estimate fitted",
+            water_rmse_kwh_per_day=water_rmse,
+            baseline_rmse_kwh_per_day=baseline_rmse,
+        )
+        if correlation_r is not None:
+            diagnostics["correlation_r"] = correlation_r
+    out = {
         "wh_per_litre_per_k": rate,
         "days_used": len(samples),
         "iqr_wh_per_litre_per_k": iqr,
+        "water_rmse_kwh_per_day": water_rmse,
+        "baseline_rmse_kwh_per_day": baseline_rmse,
     }
+    if correlation_r is not None:
+        out["correlation_r"] = correlation_r
+    return out
 
 
 def dhw_kwh_from_water(litres: float, outdoor_c: float, water_rate: dict) -> float:
@@ -869,6 +1160,8 @@ def attribute_dhw_by_day(
         "water_outlier_days_ignored": 0,
     }
     clamp_days = 0
+    idle_days = 0
+    idle_gas = baseline.get("idle_gas_kwh_per_day")
     water_by_day = water_by_day or {}
     for d, q in q_by_day.items():
         if until is not None and d > until:
@@ -885,6 +1178,21 @@ def attribute_dhw_by_day(
         if water_is_outlier:
             quality["water_outlier_days_ignored"] += 1
         if (
+            litres is not None
+            and litres == 0
+            and idle_gas is not None
+            and not water_is_outlier
+        ):
+            estimate = idle_gas
+            if estimate > q:
+                clamp_days += 1
+            attributed[d] = min(estimate, q)
+            idle_days += 1
+            if water_rate and d in outdoor_by_day:
+                quality["water_attribution_days"] += 1
+            else:
+                quality["baseline_fallback_days"] += 1
+        elif (
             water_rate
             and litres is not None
             and not water_is_outlier
@@ -903,6 +1211,8 @@ def attribute_dhw_by_day(
             quality["baseline_fallback_days"] += 1
     if clamp_days:
         quality["dhw_clamp_days"] = clamp_days
+    if idle_days:
+        quality["idle_attribution_days"] = idle_days
     return attributed, quality
 
 
@@ -939,9 +1249,13 @@ def fit_water_gas(
     eligible = []
     rejected_heating_on = 0
     rejected_outside_window = 0
+    water_by_local_day: dict[date, list[float]] = defaultdict(list)
     for ts in common:
+        day = _local(ts, tz).date() if tz is not None else datetime.fromtimestamp(ts, timezone.utc).date()
+        in_window = (since is None or day >= since) and (until is None or day <= until)
+        if in_window:
+            water_by_local_day[day].append(water_hourly[ts])
         if tz is not None and (heating_off is not None or since is not None or until is not None):
-            day = _local(ts, tz).date()
             if since is not None and day < since:
                 rejected_outside_window += 1
                 continue
@@ -952,6 +1266,27 @@ def fit_water_gas(
                 rejected_heating_on += 1
                 continue
         eligible.append(ts)
+
+    nonzero_hours_per_day = [
+        sum(1 for v in vals if v > 0)
+        for vals in water_by_local_day.values()
+        if any(v > 0 for v in vals)
+    ]
+    if (
+        len(nonzero_hours_per_day) >= DHW_DAILY_BATCHED_MIN_DAYS
+        and (sum(nonzero_hours_per_day) / len(nonzero_hours_per_day)) <= DHW_DAILY_BATCHED_MAX_NONZERO_HOURS
+    ):
+        if diagnostics is not None:
+            diagnostics.update(
+                status="rejected",
+                reason="water meter reports daily totals; hourly gas/water regression not applicable",
+                eligible_observations=len(eligible),
+                required_observations=DHW_REGRESSION_MIN_HOURS,
+                rejected_heating_on_observations=rejected_heating_on,
+                rejected_outside_window_observations=rejected_outside_window,
+                total_common_observations=len(common),
+            )
+        return None
 
     if len(eligible) < DHW_REGRESSION_MIN_HOURS:
         if diagnostics is not None:
@@ -1310,7 +1645,8 @@ def night_taus(
 def loft_ratio(
     rooms: list[Series], loft: Series, outdoor: Series, tz: tzinfo, since
 ) -> dict | None:
-    ratios = []
+    cold_ratios = []
+    fallback_ratios = []
     for ts, t_loft in loft.items():
         local = _local(ts, tz)
         if local.hour not in LOFT_NIGHT_HOURS or local.date() < since:
@@ -1321,7 +1657,15 @@ def loft_ratio(
             continue
         dt = sum(temps) / len(temps) - t_out
         if dt > LOFT_MIN_DT:
-            ratios.append((t_loft - t_out) / dt)
+            ratio_val = (t_loft - t_out) / dt
+            fallback_ratios.append(ratio_val)
+            if (
+                t_out <= LOFT_COLD_NIGHT_MAX_OUTDOOR_C
+                and dt >= LOFT_COLD_NIGHT_MIN_DT
+            ):
+                cold_ratios.append(ratio_val)
+    use_cold = len(cold_ratios) >= LOFT_MIN_HOURS
+    ratios = cold_ratios if use_cold else fallback_ratios
     if len(ratios) < LOFT_MIN_HOURS:
         return None
     ratio = median(ratios)
@@ -1331,13 +1675,20 @@ def loft_ratio(
     q1 = ordered[len(ordered) // 4]
     q3 = ordered[(3 * len(ordered)) // 4]
     out_of_range_pct = sum(not 0 <= value <= 1 for value in ratios) / len(ratios) * 100
-    if q3 - q1 > 0.5 or out_of_range_pct > 20:
+    # Well-insulated lofts under clear night skies can sit slightly cooler
+    # than a sheltered outdoor sensor (ratio down to -0.15) without invalidating
+    # the cold-night estimate; reject only gross excursions outside [-0.15, 1.05].
+    gross_out_of_range_pct = (
+        sum(not -0.15 <= value <= 1.05 for value in ratios) / len(ratios) * 100
+    )
+    if q3 - q1 > 0.5 or gross_out_of_range_pct > 20:
         return None
     return {
         "ratio": ratio,
         "hours_used": len(ratios),
         "iqr": q3 - q1,
         "out_of_range_pct": out_of_range_pct,
+        "cold_night_gate": use_cold,
     }
 
 
@@ -1347,7 +1698,13 @@ def _percentile(values: list[float], pct: float) -> float:
 
 
 def air_change_rate(
-    co2: Series, tz: tzinfo, since, outdoor_baseline_ppm: float | None = None
+    co2: Series,
+    tz: tzinfo,
+    since,
+    outdoor_baseline_ppm: float | None = None,
+    *,
+    cadence: str | None = None,
+    check_sensor_floor: bool = True,
 ) -> dict | None:
     """Whole-home air-change rate (1/h) from CO2 decay curves.
 
@@ -1356,28 +1713,67 @@ def air_change_rate(
     so ln(C-C_out) is linear in t with slope -ACH. Falling stretches of the
     series are auto-detected (occupants leaving/sleeping does this several
     times a day) and fit individually; the median ACH across clean fits is
-    reported. Measured in one room and used as a whole-home infiltration
-    proxy - a reasonable ballpark, not an exact whole-flat measurement.
+    reported. Supports both hourly and 5-minute cadences.
     """
+    valid_items = sorted(
+        (ts, float(v))
+        for ts, v in co2.items()
+        if _local(ts, tz).date() >= since and is_valid_co2_value(v)
+    )
+    valid_values = [v for _, v in valid_items]
+    baseline_mismatch_note = None
     if outdoor_baseline_ppm is not None:
         if not is_valid_co2_value(outdoor_baseline_ppm):
             return None
         baseline = float(outdoor_baseline_ppm)
+        baseline_source = "configured value"
+        if check_sensor_floor and len(valid_values) >= CO2_FLOOR_MIN_POINTS:
+            p02 = _percentile(valid_values, CO2_BASELINE_PCT)
+            if p02 - baseline > CO2_FLOOR_MISMATCH_DELTA_PPM:
+                clamped = min(max(p02, CO2_FLOOR_MIN_PPM), CO2_FLOOR_MAX_PPM)
+                baseline_mismatch_note = (
+                    f"configured outdoor CO2 ({baseline:.0f} ppm) is "
+                    f">{CO2_FLOOR_MISMATCH_DELTA_PPM:.0f} ppm below sensor 2nd "
+                    f"percentile ({p02:.0f} ppm); using clamped {clamped:.0f} ppm"
+                )
+                baseline = clamped
+                baseline_source = (
+                    "indoor low-percentile (configured baseline below sensor floor)"
+                )
     else:
-        valid_values = [
-            float(v)
-            for ts, v in co2.items()
-            if _local(ts, tz).date() >= since and is_valid_co2_value(v)
-        ]
         if len(valid_values) < 2:
             return None
         baseline = _percentile(valid_values, CO2_BASELINE_PCT)
         if not is_valid_co2_value(baseline):
             return None
+        baseline_source = "indoor low-percentile fallback"
 
     raw_items = sorted((ts, v) for ts, v in co2.items() if _local(ts, tz).date() >= since)
     if len(raw_items) < 2:
         return None
+
+    if cadence is None:
+        ts_list = [ts for ts, _ in valid_items]
+        deltas = [b - a for a, b in zip(ts_list, ts_list[1:]) if b > a]
+        if (
+            len(ts_list) >= CO2_5MIN_MIN_POINTS
+            and deltas
+            and median(deltas) <= CO2_5MIN_MEDIAN_STEP_MAX_S
+        ):
+            resolved_cadence = "5minute"
+        else:
+            resolved_cadence = "hour"
+    else:
+        resolved_cadence = cadence
+
+    if resolved_cadence == "5minute":
+        max_gap_s = CO2_5MIN_MAX_GAP_S
+        min_window_h = CO2_5MIN_MIN_WINDOW_H
+        min_points = CO2_5MIN_MIN_POINTS
+    else:
+        max_gap_s = CO2_MAX_GAP_S
+        min_window_h = CO2_MIN_WINDOW_H
+        min_points = 2
 
     # Coerce valid entries to float, preserving invalid items as barriers (None)
     items: list[tuple[int, float | None]] = [
@@ -1395,7 +1791,8 @@ def air_change_rate(
         while (
             j + 1 < n
             and items[j + 1][1] is not None
-            and items[j + 1][0] - items[j][0] <= CO2_MAX_GAP_S
+            and items[j + 1][1] > baseline
+            and items[j + 1][0] - items[j][0] <= max_gap_s
             and items[j + 1][1] <= items[j][1] + 2  # tolerate small sensor noise
         ):
             j += 1
@@ -1403,7 +1800,9 @@ def air_change_rate(
             (ts, v) for ts, v in items[i : j + 1] if v is not None
         ]
         i = j if j > i else i + 1
-        if (window[-1][0] - window[0][0]) / 3600 < CO2_MIN_WINDOW_H:
+        if len(window) < min_points:
+            continue
+        if (window[-1][0] - window[0][0]) / 3600 < min_window_h:
             continue
         if window[0][1] - baseline < CO2_MIN_DROP_PPM:
             continue
@@ -1423,19 +1822,43 @@ def air_change_rate(
     ach = median(fits)
     if not MIN_ACH <= ach <= MAX_ACH:
         return None
-    return {"ach": ach, "windows": len(fits), "baseline_ppm": baseline}
+    return {
+        "ach": ach,
+        "windows": len(fits),
+        "baseline_ppm": baseline,
+        "cadence": resolved_cadence,
+        "baseline_source": baseline_source,
+        "baseline_mismatch_note": baseline_mismatch_note,
+    }
 
 
 def combine_air_change_rates(fits: list[dict]) -> dict | None:
     """Combine independently fitted room proxies without pooling raw CO2."""
     if not fits:
         return None
-    return {
+    cadences = {fit.get("cadence", "hour") for fit in fits}
+    combined_cadence = next(iter(cadences)) if len(cadences) == 1 else "mixed"
+    notes = [fit["baseline_mismatch_note"] for fit in fits if fit.get("baseline_mismatch_note")]
+    sources = [fit.get("baseline_source") for fit in fits if fit.get("baseline_source")]
+    floor_override = "indoor low-percentile (configured baseline below sensor floor)"
+    combined_source = (
+        floor_override
+        if floor_override in sources
+        else sources[0]
+        if len(set(sources)) == 1
+        else None
+    )
+    out = {
         "ach": median([fit["ach"] for fit in fits]),
         "windows": sum(fit["windows"] for fit in fits),
         "baseline_ppm": median([fit["baseline_ppm"] for fit in fits]),
         "sensor_count": len(fits),
+        "cadence": combined_cadence,
+        "baseline_mismatch_note": notes[0] if notes else None,
     }
+    if combined_source is not None:
+        out["baseline_source"] = combined_source
+    return out
 
 
 def compute_all(
@@ -1471,12 +1894,31 @@ def compute_all(
 
     for name, spec in room_confs.items():
         temp_entity = spec.get("temperature")
-        room_temp[name] = ingest(temp_entity, is_valid_temperature_value, "temperature")
+        if temp_entity:
+            room_vals, room_rejected = indoor_temperature_series_from_stats(
+                stats.get(temp_entity, [])
+            )
+            if room_rejected:
+                numeric_issues[temp_entity] = (
+                    f"{room_rejected} historical temperature bucket(s) were invalid or "
+                    "outside the analysis range and were ignored"
+                )
+            room_temp[name] = room_vals
+        else:
+            room_temp[name] = {}
         hlc_source = spec.get("hlc_temperature") if conf.get("hlc_allow_short_gaps") else None
-        hlc_room_temp[name] = (
-            ingest(hlc_source, is_valid_temperature_value, "temperature")
-            if hlc_source and hlc_source != temp_entity else room_temp[name]
-        )
+        if hlc_source and hlc_source != temp_entity:
+            hlc_vals, hlc_rejected = indoor_temperature_series_from_stats(
+                stats.get(hlc_source, [])
+            )
+            if hlc_rejected:
+                numeric_issues[hlc_source] = (
+                    f"{hlc_rejected} historical temperature bucket(s) were invalid or "
+                    "outside the analysis range and were ignored"
+                )
+            hlc_room_temp[name] = hlc_vals
+        else:
+            hlc_room_temp[name] = room_temp[name]
         # Humidity is currently contextual rather than a model regressor, but
         # expose source quality even when no loft ratio can be calculated.
         ingest(spec.get("humidity"), is_valid_humidity_value, "humidity")
@@ -2006,6 +2448,9 @@ def compute_all(
     selected_hlc_fit_rows: list[dict] = []
     selected_hlc_dhw_by_day: dict = {}
     hlc_diagnostics: dict = {}
+    latitude_deg = conf.get("latitude")
+    hlc_baseline_kwh = hlc_baseline["kwh_per_day"] if hlc_baseline else None
+    hlc_water_by_day = water_by_day if water_by_day else None
     if model_day:
         fit = fit_hlc(
             q_by_day,
@@ -2015,6 +2460,10 @@ def compute_all(
             heating_off=locked_off,
             diagnostics=hlc_diagnostics,
             tz=tz,
+            latitude_deg=latitude_deg,
+            water_by_day=hlc_water_by_day,
+            min_water_l=min_water_l,
+            dhw_baseline_kwh=hlc_baseline_kwh,
         )
     else:
         hlc_diagnostics["status"] = "collecting"
@@ -2044,6 +2493,10 @@ def compute_all(
                 heating_off=locked_off,
                 diagnostics=corrected_diagnostics,
                 tz=tz,
+                latitude_deg=latitude_deg,
+                water_by_day=hlc_water_by_day,
+                min_water_l=min_water_l,
+                dhw_baseline_kwh=hlc_baseline_kwh,
             )
             if hlc_dhw_by_day
             else None
@@ -2058,6 +2511,8 @@ def compute_all(
         selected_hlc_dhw_by_day = hlc_dhw_by_day if corrected else {}
         selected_fit_days = [date.fromisoformat(row["date"]) for row in selected_fit_rows]
         delivered_hlc = space_heating_fit["hlc_w_per_k"] * boiler_eff
+        solar_coeff = space_heating_fit.get("solar_gain_coefficient_kwh_per_day")
+        winter_hlc = space_heating_fit.get("winter_hlc_w_per_k")
         result["hlc"] = gas_side_fit | {
             "hlc_w_per_k": delivered_hlc,
             "hlc_ci_low_w_per_k": space_heating_fit["hlc_ci_low_w_per_k"] * boiler_eff,
@@ -2068,6 +2523,14 @@ def compute_all(
             "effective_independent_days": space_heating_fit[
                 "effective_independent_days"
             ],
+            "solar_adjusted": space_heating_fit["solar_adjusted"],
+            "unadjusted_hlc_w_per_k": space_heating_fit["unadjusted_hlc_w_per_k"] * boiler_eff,
+            "solar_gain_coefficient_kwh_per_day": (
+                solar_coeff * boiler_eff if solar_coeff is not None else None
+            ),
+            "winter_hlc_w_per_k": (
+                winter_hlc * boiler_eff if winter_hlc is not None else None
+            ),
             # The regression runs on gas, so its intercept is fuel input. Free
             # gains are a heat flow, and every other heat figure here is
             # delivered heat - so report them in that frame (x boiler
@@ -2135,6 +2598,10 @@ def compute_all(
                     model_day,
                     heating_off=locked_off,
                     tz=tz,
+                    latitude_deg=latitude_deg,
+                    water_by_day=hlc_water_by_day,
+                    min_water_l=min_water_l,
+                    dhw_baseline_kwh=hlc_baseline_kwh,
                 )
                 if recent and recent["days_used"] >= HLC_MIN_DAYS:
                     result["hlc"]["recent_hlc_w_per_k"] = (
@@ -2180,6 +2647,7 @@ def compute_all(
                     outdoor_baseline = cand_baseline
                     outdoor_sensor_used = True
         ach_fits = []
+        allow_floor_override = not outdoor_sensor_used and not conf.get("outdoor_co2_sensor")
         for co2_id in co2_ids:
             co2, co2_rejected = co2_series_from_stats(stats.get(co2_id, []))
             if co2_rejected:
@@ -2188,21 +2656,41 @@ def compute_all(
                     "the 300-10000 ppm range and were ignored"
                 )
                 result.setdefault("source_issues", {})[co2_id] = msg
-            fit_for_sensor = air_change_rate(
-                co2, tz, since_full, outdoor_baseline
-            )
+            fit_for_sensor = None
+            raw_5min = stats.get(f"5minute:{co2_id}")
+            if raw_5min:
+                co2_5min, _ = co2_series_from_stats(raw_5min)
+                if co2_5min:
+                    fit_for_sensor = air_change_rate(
+                        co2_5min,
+                        tz,
+                        since_full,
+                        outdoor_baseline,
+                        cadence="5minute",
+                        check_sensor_floor=allow_floor_override,
+                    )
+            if fit_for_sensor is None:
+                fit_for_sensor = air_change_rate(
+                    co2,
+                    tz,
+                    since_full,
+                    outdoor_baseline,
+                    check_sensor_floor=allow_floor_override,
+                )
             if fit_for_sensor:
                 ach_fits.append(fit_for_sensor)
         ach_fit = combine_air_change_rates(ach_fits)
         if ach_fit:
-            ach_fit["baseline_source"] = (
-                "outdoor sensor"
-                if outdoor_sensor_used
-                else "configured value"
-                if conf.get("outdoor_co2_ppm") is not None
-                and is_valid_co2_value(conf.get("outdoor_co2_ppm"))
-                else "indoor low-percentile fallback"
-            )
+            if outdoor_sensor_used:
+                ach_fit["baseline_source"] = "outdoor sensor"
+                ach_fit["baseline_mismatch_note"] = None
+            elif not ach_fit.get("baseline_source"):
+                ach_fit["baseline_source"] = (
+                    "configured value"
+                    if conf.get("outdoor_co2_ppm") is not None
+                    and is_valid_co2_value(conf.get("outdoor_co2_ppm"))
+                    else "indoor low-percentile fallback"
+                )
             ach_fit["co2_sensors_used"] = ach_fit["sensor_count"]
             ach_fit["co2_baseline_source"] = ach_fit["baseline_source"]
             ach_fit["scope"] = (
@@ -2230,8 +2718,10 @@ def compute_all(
                 "ach": ach_fit["ach"],
                 "windows": ach_fit["windows"],
                 "baseline_ppm": ach_fit["baseline_ppm"],
+                "cadence": ach_fit.get("cadence", "hour"),
                 "co2_sensors_used": ach_fit["sensor_count"],
                 "co2_baseline_source": ach_fit["baseline_source"],
+                "baseline_mismatch_note": ach_fit.get("baseline_mismatch_note"),
                 "ventilation_w_per_k": ventilation_w_per_k,
                 "fabric_w_per_k": fabric_w_per_k,
                 "hlc_delivered_w_per_k": hlc_delivered,
@@ -3067,6 +3557,43 @@ def build_analysis_status(
         if latest_eligible_day is not None
         else None
     )
+
+    def _apply_expected_gap_lag_warning(
+        stat_dict: dict,
+        elig_lag: int | None,
+        latest_elig: date | None,
+        base_reason_prefix: str,
+    ) -> None:
+        degraded = (
+            elig_lag is not None
+            and 2 <= elig_lag < HLC_SOURCE_STALE_DAYS
+            and gas_lag is not None
+            and gas_lag <= 1
+            and (temperature_lag is None or temperature_lag <= 1)
+            and latest_expected_gap is not None
+            and (latest_elig is None or latest_expected_gap > latest_elig)
+        )
+        stat_dict["eligibility_degraded"] = degraded
+        if degraded:
+            warning = (
+                f"model eligibility lags raw data by {elig_lag} days due to "
+                "incomplete expected heating-power coverage"
+            )
+            stat_dict["eligible_lag_warning"] = warning
+            if stat_dict.get("status") in ("valid", "provisional"):
+                stat_dict["reason"] = f"{base_reason_prefix}; {warning}"
+                stat_dict["next_action"] = (
+                    "restore expected heating-power coverage for recent days"
+                )
+        else:
+            stat_dict["eligible_lag_warning"] = None
+
+    _apply_expected_gap_lag_warning(
+        hlc_stat,
+        hlc_stat["eligible_source_lag_days"],
+        latest_eligible_day,
+        "heat loss coefficient model fitted",
+    )
     hlc_stat["raw_complete_gas_days"] = sum(
         1 for day in q_by_day
         if (since_full is None or day >= since_full) and day <= yesterday
@@ -3186,11 +3713,17 @@ def build_analysis_status(
         if (since_full is None or day >= since_full) and day <= yesterday
     )
     dhw_stat["eligible_observations"] = len(dhw_eligible)
+    dhw_stat["eligible_source_lag_days"] = dhw_eligibility_lag
     if dhw_latest_eligible is not None:
         dhw_stat["latest_eligible_day"] = _iso_date_str(dhw_latest_eligible)
         dhw_stat["eligibility_lag_days"] = dhw_eligibility_lag
-        dhw_stat["eligible_source_lag_days"] = dhw_eligibility_lag
         dhw_stat["model_data_through"] = _iso_date_str(dhw_latest_eligible)
+    _apply_expected_gap_lag_warning(
+        dhw_stat,
+        dhw_eligibility_lag,
+        dhw_latest_eligible,
+        "hot water baseline established",
+    )
 
     # --- USAGE ---
     usage_issue = _check_source_issue(conf, "gas_meter", conf.get("gas_meter"))
@@ -3265,11 +3798,17 @@ def build_analysis_status(
         if (since_full is None or day >= since_full) and day <= yesterday
     )
     usage_stat["eligible_observations"] = len(dhw_eligible)
+    usage_stat["eligible_source_lag_days"] = usage_eligibility_lag
     if usage_latest_eligible is not None:
         usage_stat["latest_eligible_day"] = _iso_date_str(usage_latest_eligible)
         usage_stat["eligibility_lag_days"] = usage_eligibility_lag
-        usage_stat["eligible_source_lag_days"] = usage_eligibility_lag
         usage_stat["model_data_through"] = _iso_date_str(usage_latest_eligible)
+    _apply_expected_gap_lag_warning(
+        usage_stat,
+        usage_eligibility_lag,
+        usage_latest_eligible,
+        "gas consumption attributed",
+    )
 
     # --- ELECTRICITY ---
     elec_issue = _check_source_issue(conf, "electricity_meter", conf.get("electricity_meter"))

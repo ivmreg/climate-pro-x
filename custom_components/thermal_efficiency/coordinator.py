@@ -344,6 +344,22 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
             },
             {"mean", "sum", "min", "max"},
         )
+        co2_5min_stats: dict[str, list[dict]] = {}
+        if valid_co2:
+            try:
+                co2_5min_stats = await get_instance(self.hass).async_add_executor_job(
+                    statistics_during_period,
+                    self.hass,
+                    now - timedelta(days=min(max_days, 30)),
+                    now,
+                    set(valid_co2),
+                    "5minute",
+                    None,
+                    {"mean", "min", "max"},
+                ) or {}
+            except Exception as err:  # pragma: no cover - defensive fallback to hourly
+                _LOGGER.debug("5-minute CO2 statistics unavailable, falling back to hourly: %s", err)
+                co2_5min_stats = {}
         query_seconds = perf_counter() - query_started
         # compute_all is pure CPU and takes ~1s on a full season of hourly
         # statistics, so it must not run on the event loop. Tariffs are read
@@ -381,13 +397,22 @@ class ThermalCoordinator(DataUpdateCoordinator[dict]):
                 None,
             )
 
+        if co2_5min_stats:
+            computation_stats = dict(computation_stats)
+            for co2_id in valid_co2:
+                rows_5min = co2_5min_stats.get(co2_id)
+                if rows_5min:
+                    computation_stats[f"5minute:{co2_id}"] = rows_5min
+
         for entity_id in list(invalid_heating_power):
             issue = invalid_heating_power[entity_id]
             _LOGGER.warning("Ignoring invalid heating-power source: %s", issue)
+        latitude = getattr(getattr(self.hass, "config", None), "latitude", None)
         conf = {
             "hlc_allow_short_gaps": bool(self.history),
             "history_revision": prepared.get("history_revision"),
             "history_schema_version": prepared.get("history_schema_version"),
+            "latitude": latitude,
             "rooms": room_conf,
             "excluded_model_days": prepared.get("excluded_model_days", []),
             "outdoor": self.conf[CONF_OUTDOOR],

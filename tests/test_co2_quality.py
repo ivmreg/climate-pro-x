@@ -347,3 +347,78 @@ def test_compute_all_outdoor_co2_fallback_when_all_invalid():
     assert res["air_change_rate"] is not None
     assert res["air_change_rate"]["baseline_source"] == "configured value"
     assert res["air_change_rate"]["baseline_ppm"] == 410.0
+
+
+def test_five_minute_co2_recovers_fast_decays_and_falls_back_to_hourly():
+    start_ts = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+    ach_true = 0.65
+    base_co2 = 420.0
+    # 2-hour decay windows every day at 5-minute resolution (1.5h..2.0h; fails 4h hourly gate)
+    co2_5min_rows = []
+    co2_hourly_rows = []
+    for day in range(12):
+        day_base = start_ts + day * 86400
+        for step in range(36):  # 2h decay + 1h floor at 5-min steps
+            ts = day_base + step * 300
+            if step <= 24:
+                val = base_co2 + 650.0 * np.exp(-ach_true * (step * 300 / 3600))
+            else:
+                val = base_co2
+            co2_5min_rows.append({"start": ts, "mean": float(val)})
+        # Hourly has only 2 points per decay (too short for 4h hourly window)
+        for h in range(2):
+            co2_hourly_rows.append({
+                "start": day_base + h * 3600,
+                "mean": float(base_co2 + 650.0 * np.exp(-ach_true * h)),
+            })
+
+    stats = {
+        "sensor.co2": co2_hourly_rows,
+        "5minute:sensor.co2": co2_5min_rows,
+    }
+    conf = {
+        "rooms": {},
+        "co2": "sensor.co2",
+        "outdoor_co2_ppm": base_co2,
+    }
+    now = datetime(2026, 1, 15, tzinfo=timezone.utc)
+    res = thermal_math.compute_all(stats, conf, TZ, now, (30,))
+    assert res["air_change_rate"] is not None
+    assert res["air_change_rate"]["cadence"] == "5minute"
+    assert res["air_change_rate"]["ach"] == pytest.approx(ach_true, abs=0.05)
+
+    # Without 5-minute rows and only 2h hourly decays, falls back cleanly to hourly -> None
+    res_hourly_only = thermal_math.compute_all(
+        {"sensor.co2": co2_hourly_rows}, conf, TZ, now, (30,)
+    )
+    assert res_hourly_only["air_change_rate"] is None
+
+
+def test_configured_outdoor_co2_below_sensor_floor_uses_clamped_p02():
+    start_ts = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp())
+    sensor_floor = 510.0
+    ach_true = 0.40
+    co2_rows = []
+    # Continuous 14-day hourly series flooring at 510 ppm while configured outdoor is 400 ppm
+    for day in range(14):
+        for h in range(24):
+            ts = start_ts + (day * 24 + h) * 3600
+            if h < 6:
+                val = sensor_floor + 500.0 * np.exp(-ach_true * h)
+            else:
+                val = sensor_floor
+            co2_rows.append({"start": ts, "mean": float(val)})
+
+    conf = {
+        "rooms": {},
+        "co2": "sensor.co2_floor",
+        "outdoor_co2_ppm": 400.0,
+    }
+    now = datetime(2026, 1, 16, tzinfo=timezone.utc)
+    res = thermal_math.compute_all({"sensor.co2_floor": co2_rows}, conf, TZ, now, (30,))
+    ach = res["air_change_rate"]
+    assert ach is not None
+    assert ach["baseline_ppm"] == pytest.approx(sensor_floor, abs=2.0)
+    assert ach["baseline_source"] == "indoor low-percentile (configured baseline below sensor floor)"
+    assert ach["baseline_mismatch_note"]
+    assert ach["ach"] == pytest.approx(ach_true, abs=0.05)

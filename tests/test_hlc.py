@@ -176,5 +176,68 @@ def test_hlc_rejects_negative_dhw_adjusted_energy(thermal_math, forty_days):
     assert _fit(thermal_math, forty_days, delta_t, energy, dhw) is None
 
 
+def test_clear_sky_solar_proxy_and_two_var_hlc_removal_of_solar_confounding(thermal_math):
+    from datetime import date, timedelta
+
+    assert (
+        thermal_math.clear_sky_solar_proxy(date(2026, 6, 21), 51.5)
+        > thermal_math.clear_sky_solar_proxy(date(2026, 3, 21), 51.5)
+        > thermal_math.clear_sky_solar_proxy(date(2026, 12, 21), 51.5)
+    )
+
+    # Full Nov-May heating season with true slope 250 W/K and solar gain -2.5 kWh/day/(kWh/m2)
+    start = date(2025, 11, 1)
+    days = [start + timedelta(days=i) for i in range(180)]
+    true_hlc = 250.0
+    true_slope = true_hlc * 24 / 1000
+    true_solar_coeff = -2.5
+    dt_by_day = {}
+    q_by_day = {}
+    for i, d in enumerate(days):
+        solar = thermal_math.clear_sky_solar_proxy(d, 51.5)
+        # Seasonal correlation: colder in winter (lower solar), milder in spring (higher solar)
+        dt = max(4.5, 14.0 - 0.9 * solar + (i % 7) - 3.0)
+        dt_by_day[d] = dt
+        q_by_day[d] = 5.0 + true_slope * dt + true_solar_coeff * solar
+
+    # Without latitude: pure-function 1-var OLS is upward-biased by solar confounding
+    unadj = thermal_math.fit_hlc(q_by_day, dt_by_day, start)
+    assert unadj is not None
+    assert unadj["solar_adjusted"] is False
+    assert unadj["solar_gain_coefficient_kwh_per_day"] is None
+    assert unadj["hlc_w_per_k"] == pytest.approx(unadj["unadjusted_hlc_w_per_k"])
+    assert unadj["hlc_w_per_k"] > true_hlc + 15.0
+    assert unadj["winter_hlc_w_per_k"] is not None
+
+    # With latitude: 2-var OLS recovers exact 250 W/K and negative solar coefficient
+    adj = thermal_math.fit_hlc(q_by_day, dt_by_day, start, latitude_deg=51.5)
+    assert adj is not None
+    assert adj["solar_adjusted"] is True
+    assert adj["hlc_w_per_k"] == pytest.approx(true_hlc, rel=1e-6)
+    assert adj["solar_gain_coefficient_kwh_per_day"] == pytest.approx(true_solar_coeff, rel=1e-6)
+    assert adj["unadjusted_hlc_w_per_k"] == pytest.approx(unadj["hlc_w_per_k"], rel=1e-6)
+    assert adj["r_squared"] > unadj["r_squared"]
+    assert adj["winter_hlc_w_per_k"] is not None
+
+
+def test_hlc_falls_back_to_one_var_when_solar_slope_non_negative(thermal_math):
+    from datetime import date, timedelta
+
+    start = date(2025, 11, 1)
+    days = [start + timedelta(days=i) for i in range(120)]
+    slope = 220.0 * 24 / 1000
+    dt_by_day = {d: 5.0 + (i % 10) for i, d in enumerate(days)}
+    # Positive solar coefficient (+1.0) violates physical solar gain -> fall back to 1-var
+    q_by_day = {
+        d: 4.0 + slope * dt_by_day[d] + 1.0 * thermal_math.clear_sky_solar_proxy(d, 51.5)
+        for d in days
+    }
+    res = thermal_math.fit_hlc(q_by_day, dt_by_day, start, latitude_deg=51.5)
+    assert res is not None
+    assert res["solar_adjusted"] is False
+    assert res["solar_gain_coefficient_kwh_per_day"] is None
+    assert res["hlc_w_per_k"] == pytest.approx(res["unadjusted_hlc_w_per_k"])
+
+
 # pytest is imported last to keep the test data and physics readable above.
 import pytest

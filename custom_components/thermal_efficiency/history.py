@@ -30,6 +30,7 @@ from .const import (
     CONF_ASSIGNMENT_SINCE,
     CONF_LOFT,
     CONF_LOFT_HUMIDITY,
+    CONF_ROOMS,
     CONF_ROOM_TYPE,
     DOMAIN,
     HISTORY_DATA_VERSION,
@@ -39,7 +40,10 @@ from .const import (
     ROOM_TYPE_LOFT,
 )
 from .history_migration import HistoryMigrator, migration_manifest
-from .thermal_math import is_valid_temperature_value
+from .thermal_math import (
+    is_valid_indoor_temperature_value,
+    is_valid_temperature_value,
+)
 
 
 @dataclass(slots=True)
@@ -52,7 +56,7 @@ class StreamBinding:
     entity_id: str
 
 
-def observation(state, role):
+def observation(state, role, room_type: str | None = None):
     """Reject invalid units and non-finite readings rather than guessing."""
     if state is None:
         return None
@@ -61,7 +65,12 @@ def observation(state, role):
         unit = state.attributes.get("unit_of_measurement")
         if role == "temperature":
             value = TemperatureConverter.convert(value, unit, "°C")
-            if not is_valid_temperature_value(value):
+            validator = (
+                is_valid_indoor_temperature_value
+                if room_type == "conditioned"
+                else is_valid_temperature_value
+            )
+            if not validator(value):
                 return None
         else:
             norm_unit = unit.strip().casefold() if isinstance(unit, str) else None
@@ -537,7 +546,10 @@ class RoomHistoryManager:
                 continue
             entry = er.async_get(self.hass).async_get(source["entity_id"])
             owned_entry = er.async_get(self.hass).async_get(binding.entity_id)
-            value = observation(state, binding.role)
+            room_type = self.config.get(CONF_ROOMS, {}).get(binding.room_id, {}).get(
+                CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED
+            )
+            value = observation(state, binding.role, room_type)
             recorder = get_instance(self.hass)
             included = (recorder.entity_filter is None or recorder.entity_filter(binding.entity_id)) and not (owned_entry and owned_entry.disabled)
             if value is None or source.get("pending") or not included or entry and entry.disabled:
@@ -792,7 +804,10 @@ class RoomHistoryManager:
                 or role not in room_roles(self.config["rooms"][room_id])
             ):
                 raise ValueError("invalid_selection")
-            if self._is_owned_entity(entity_id) or observation(self.hass.states.get(entity_id), role) is None:
+            room_type = self.config.get(CONF_ROOMS, {}).get(room_id, {}).get(
+                CONF_ROOM_TYPE, ROOM_TYPE_CONDITIONED
+            )
+            if self._is_owned_entity(entity_id) or observation(self.hass.states.get(entity_id), role, room_type) is None:
                 raise ValueError("invalid_source")
             source = self._source(entity_id, role)
             active_here = any(v.get("end") is None and self.data["streams"].get(v.get("stream"), {}).get("source_id") == source["id"]

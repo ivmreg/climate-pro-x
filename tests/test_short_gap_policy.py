@@ -182,6 +182,14 @@ def test_interpolation_rejects_quarantine_and_contaminated_endpoints():
     next(row for row in stats["owned.temp"] if row["start"] == before)["max"] = 999
     _, prepared = compose(stats, conf, data, UTC)
     assert not prepared["rooms"]["r"]["hlc_interpolated_temperature_hours"]
+    # Also reject indoor EMA decay tails (>45C or >8C isolated spike) as interpolation edges
+    next(row for row in stats["owned.temp"] if row["start"] == before).pop("max", None)
+    next(row for row in stats["owned.temp"] if row["start"] == before)["mean"] = 52.09
+    _, prepared = compose(stats, conf, data, UTC)
+    assert not prepared["rooms"]["r"]["hlc_interpolated_temperature_hours"]
+    next(row for row in stats["owned.temp"] if row["start"] == before)["mean"] = 44.03
+    _, prepared = compose(stats, conf, data, UTC)
+    assert not prepared["rooms"]["r"]["hlc_interpolated_temperature_hours"]
 
 
 def test_strict_comparison_uses_the_same_snapshot_and_is_exported():

@@ -1150,3 +1150,30 @@ async def test_loft_assignment_since_change_with_humidity_added(hass):
     assert active_hum["start"] == t_aug10
     validate_visits(manager2.data)
     await manager2.async_shutdown()
+
+
+def test_loft_ratio_prefers_cold_nights_over_warm_solar_roof_nights(thermal_math):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    rooms = [{}]
+    loft = {}
+    outdoor = {}
+    # 15 cold nights (t_out=4C, indoor=20C, dt=16K, loft=5.6C -> ratio=0.10)
+    for d in range(15):
+        for h in range(1, 6):
+            ts = int((start + timedelta(days=d, hours=h)).timestamp())
+            outdoor[ts] = 4.0
+            rooms[0][ts] = 20.0
+            loft[ts] = 5.6
+    # 15 warm nights (t_out=14C, indoor=21C, dt=7K > 6K, loft=19.6C -> ratio=0.80)
+    for d in range(15, 30):
+        for h in range(1, 6):
+            ts = int((start + timedelta(days=d, hours=h)).timestamp())
+            outdoor[ts] = 14.0
+            rooms[0][ts] = 21.0
+            loft[ts] = 19.6
+
+    res = thermal_math.loft_ratio(rooms, loft, outdoor, UTC, date(2026, 1, 1))
+    assert res is not None
+    assert res["cold_night_gate"] is True
+    assert res["ratio"] == pytest.approx(0.10)
+    assert res["iqr"] == pytest.approx(0.0)

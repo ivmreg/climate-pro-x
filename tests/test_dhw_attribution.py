@@ -507,3 +507,88 @@ def test_gas_rolling_window_anchors_to_latest_attributed_day(thermal_math):
     assert sparse_usage["dhw_kwh_per_day_30d"] is None
     assert sparse_usage["space_heating_kwh_per_day_30d"] is None
 
+
+def test_water_rate_requires_predictive_skill_over_constant_baseline(thermal_math):
+    days = _days(20)
+    outdoor = {d: 16.0 for d in days}
+    # Water varies widely while DHW gas is essentially uncorrelated noise -> r < 0.30
+    water = {d: 200.0 + (i % 5) * 80.0 for i, d in enumerate(days)}
+    q = {d: 10.0 + ((i + 2) % 3) * 0.5 for i, d in enumerate(days)}
+    diag: dict = {}
+    fit = thermal_math.fit_dhw_water_rate(
+        q, water, outdoor, set(days), SINCE, diagnostics=diag
+    )
+    assert fit is None
+    assert diag["status"] == "rejected"
+    assert "falling back to mains-scaled baseline" in diag["reason"]
+
+    # Positively correlated (r >= 0.30) but biased so water-rate RMSE > constant-baseline RMSE
+    water_2 = {d: 300.0 + i * 25.0 for i, d in enumerate(days)}
+    # Half of gas is fixed cooking/standby so proportional water*rate overshoots RMSE
+    q_2 = {d: 9.0 + 0.005 * water_2[d] for d in days}
+    diag_2: dict = {}
+    fit_2 = thermal_math.fit_dhw_water_rate(
+        q_2, water_2, outdoor, set(days), SINCE, diagnostics=diag_2
+    )
+    assert fit_2 is None
+    assert diag_2["status"] == "rejected"
+
+
+def test_zero_water_heating_days_use_idle_gas_and_away_low_gas_excluded_from_hlc(thermal_math):
+    days = _days(40)
+    baseline = {"kwh_per_day": 10.0, "outdoor_mean": 15.0, "idle_gas_kwh_per_day": 0.4}
+    water_rate = {"wh_per_litre_per_k": 0.5}
+    q = {d: 5.0 + 6.0 * (5.0 + i % 10) for i, d in enumerate(days)}
+    outdoor = {d: 10.0 - (i % 10) for i, d in enumerate(days)}
+    water = {d: 400.0 for d in days}
+    # Day 0: away with heating on (water=0, q=50); Day 1: away low gas (water=0, q=5)
+    water[days[0]] = 0.0
+    water[days[1]] = 0.0
+    q[days[1]] = 5.0
+    dt = {d: 20.0 - outdoor[d] for d in days}
+
+    attributed, quality = thermal_math.attribute_dhw_by_day(
+        q, outdoor, set(), baseline, water, water_rate
+    )
+    assert attributed[days[0]] == pytest.approx(0.4)
+    assert attributed[days[1]] == pytest.approx(0.4)
+    assert quality["idle_attribution_days"] == 2
+
+    # Without water_rate (baseline fallback), water==0 still uses idle_gas_kwh_per_day
+    attributed_fb, _ = thermal_math.attribute_dhw_by_day(
+        q, outdoor, set(), baseline, water, None
+    )
+    assert attributed_fb[days[0]] == pytest.approx(0.4)
+
+    # Low-water away day with low gas (days[1]) must be excluded from fit_hlc,
+    # while away day with space heating (days[0]) stays in.
+    diag: dict = {}
+    hlc = thermal_math.fit_hlc(
+        q, dt, SINCE, attributed, diagnostics=diag,
+        water_by_day=water, min_water_l=50.0, dhw_baseline_kwh=10.0,
+    )
+    assert hlc is not None
+    fitted_dates = {r["date"] for r in diag["fit_rows"]}
+    assert days[0].isoformat() in fitted_dates
+    assert days[1].isoformat() not in fitted_dates
+
+
+def test_fit_water_gas_detects_daily_batched_water_totals(thermal_math):
+    start = int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp())
+    gas_sum = {start - 3600: 0.0}
+    water_sum = {start - 3600: 0.0}
+    g = w = 0.0
+    for day in range(15):
+        for h in range(24):
+            ts = start + (day * 24 + h) * 3600
+            g += 0.4
+            if h == 23:
+                w += 350.0
+            gas_sum[ts] = g
+            water_sum[ts] = w
+    diag: dict = {}
+    res = thermal_math.fit_water_gas(gas_sum, water_sum, tz=TZ, diagnostics=diag)
+    assert res is None
+    assert diag["status"] == "rejected"
+    assert diag["reason"] == "water meter reports daily totals; hourly gas/water regression not applicable"
+
